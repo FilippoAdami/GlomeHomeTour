@@ -1,0 +1,54 @@
+{
+  "$id": "https://glomehometour.dev/schemas/coverage_summary.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour coverage_summary.json",
+  "description": "Promoted from mobile/android's DatasetFormat.summaryJson(). Frozen at 1.0.0 (Phase 1 acceptance-passed) -- do not add/rename/retype required fields without a new $id (see shared/schemas §2).",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "duration_s": { "type": "number" },
+    "coverage_fraction": { "type": "number" },
+    "voxel_size_m": { "type": "number" },
+    "parallax_min_deg": { "type": "number" },
+    "voxels": {
+      "type": "object",
+      "properties": {
+        "occupied": { "type": "integer" },
+        "parallax_verified": { "type": "integer" },
+        "free": { "type": "integer" },
+        "occluded": { "type": "integer" },
+        "grid_full": { "type": "boolean" }
+      },
+      "required": ["occupied", "parallax_verified", "free", "occluded", "grid_full"],
+      "additionalProperties": false
+    },
+    "frames": {
+      "type": "object",
+      "properties": {
+        "seen": { "type": "integer" },
+        "exported": { "type": "integer" }
+      },
+      "required": ["seen", "exported"],
+      "additionalProperties": false
+    },
+    "dropped": {
+      "type": "object",
+      "properties": {
+        "dark": { "type": "integer" },
+        "blown": { "type": "integer" },
+        "illumination_transition": { "type": "integer" },
+        "motion": { "type": "integer" },
+        "writer_queue": { "type": "integer" }
+      },
+      "required": ["dark", "blown", "illumination_transition", "motion", "writer_queue"],
+      "additionalProperties": false
+    },
+    "tracking_loss_events": { "type": "integer" },
+    "depth_source": { "type": "string" }
+  },
+  "required": [
+    "schema_version", "duration_s", "coverage_fraction", "voxel_size_m", "parallax_min_deg",
+    "voxels", "frames", "dropped", "tracking_loss_events", "depth_source"
+  ],
+  "additionalProperties": false
+}

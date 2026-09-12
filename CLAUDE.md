@@ -80,38 +80,87 @@ camera/AR decoupling are more reliable native than through cross-platform wrappe
 
 ## Repo Structure
 
+The mobile client is still in exploration: four parallel native Kotlin/ARCore variants
+coexist while the capture approach converges, instead of one `mobile/` app. Each has its own
+`README.md`/spec — read that first, don't assume behavior from a sibling variant.
+
 ```
 glome-home-tour/
-├── mobile/
-│   ├── ios/                 # Swift/ARKit app
-│   ├── android/             # Kotlin/ARCore app
-│   └── depth-guidance/      # shared spec for on-device depth guidance behavior
+├── mobile_2.0/               # 2D floor mapper: ARCore pose + sparse cloud -> occupancy grid minimap
+├── mobile_3.0/                # AR-Scan: refines mobile_3.0/projet.md, see mobile_3.0/SPEC.md for what's actually built
+├── mobile_depth_map/          # ZipDepth-guided capture (on-device depth HUD); has ios/ + depth-guidance/ spec stub
+├── mobile_sphere_capture/      # continuous-walk capture, panorama synthesis left to backend 3DGS pipeline
 ├── ml/
-│   └── depth-model/         # training/export/quantization for the on-device depth model
-│                             # (separate env from backend/ — export tooling, not ROCm)
+│   └── depth-model/           # training/export/quantization for the on-device depth model
+│                               # (separate env from backend/ — export tooling, not ROCm)
 ├── backend/
-│   ├── ingestion/           # frame extraction, pose/timestamp matching
+│   ├── ingestion/              # frame extraction, pose/timestamp matching
 │   ├── reconstruction/
 │   │   ├── rasterizer_hip/            # hand-authored HIP 2DGS rasterizer (ROCm/RDNA4)
 │   │   ├── training/                  # 2DGS optimization loop, density control
 │   │   └── rasterizer_torch_fallback/ # pure-PyTorch rasterizer, correctness oracle
-│   ├── floorplan/           # cross-section slicing, RANSAC, Manhattan regularization
-│   ├── panorama/            # viewpoint discovery, equirectangular synthesis
-│   ├── api/                 # job submission/status, asset packaging
-│   └── worker/              # queue consumer, GPU job runner
+│   ├── floorplan/               # cross-section slicing, RANSAC, Manhattan regularization
+│   ├── panorama/                 # viewpoint discovery, equirectangular synthesis
+│   ├── api/                       # job submission/status, asset packaging
+│   └── worker/                     # queue consumer, GPU job runner
 ├── web/
-│   ├── viewer/               # 2DGS Three.js web viewer
-│   └── minimap/               # 2D floor plan widget
+│   ├── viewer/                      # 2DGS Three.js web viewer
+│   └── minimap/                      # 2D floor plan widget
 ├── shared/
-│   └── schemas/              # pose JSON, floor-plan format, panorama manifest
-│                             # (does NOT include the mobile guidance point-cloud format —
-│                             # that stays intentionally separate, see mobile/depth-guidance/)
+│   └── schemas/                       # pose JSON, floor-plan format, panorama manifest
 └── docs/
 ```
 
-Each subsystem directory has its own `README.md` describing its scope; see those for
-implementation-level detail as code lands.
+Once one mobile variant is selected, it should be renamed to `mobile/` and the others archived
+or deleted — don't build new backend/schema assumptions around more than one surviving.
 
 ## Coding Conventions
 
 _This section will be filled in as conventions are established for this codebase (language/framework choices, formatting, testing, commit style, etc.)._
+
+## Working with Claude Code on this repo
+
+**Subagents:** spin one up (via the `Explore` or general-purpose agent) when a task needs
+broad, exploratory context-gathering that would otherwise bloat the main session — e.g.
+"how does mobile_depth_map's depth HUD interact with mobile_3.0's ARCore anchoring," tracing a
+schema across `shared/schemas` into both `backend/` and one of the `mobile_*` apps, or reviewing
+a diff with fresh eyes after implementing it. Don't spin one up for a single-file read, a
+one-command lookup, or anything you can answer in 1-2 tool calls — the round-trip overhead costs
+more than doing it inline. When a request naturally splits into independent pieces (e.g. audit
+`rasterizer_hip/` and `rasterizer_torch_fallback/` for drift, or check three `mobile_*` variants
+for the same bug), parallelize with multiple subagents rather than working through them serially.
+
+**Escalate to Opus:** if a task in this repo turns out to require reasoning through more than
+one of the following at once, say so explicitly and suggest switching to Opus instead of pushing
+through on Sonnet — HIP kernel correctness (wavefront/LDS/occupancy tradeoffs in
+`rasterizer_hip/`), VIO/SfM pose-refinement math, 3DGS/2DGS optimization or density-control
+logic, or any cross-subsystem architectural call (e.g. deciding which `mobile_*` variant becomes
+canonical, or redesigning `shared/schemas`). Routine CRUD, UI, glue code, and single-file bug
+fixes stay on Sonnet regardless of which subsystem they're in.
+
+**Suggest `/clear` on a topic switch:** if the next request targets a different subsystem or
+`mobile_*` variant than what the session has been working on, and prior context wouldn't help
+(no shared files/schema/bug), say so and suggest the user run `/clear` before proceeding rather
+than carrying the stale context forward.
+
+**`project_history.md` per app folder:** each `mobile_*/` (and any other actively-iterated
+subfolder, e.g. `backend/reconstruction/`) keeps a `project_history.md` at its root logging what
+was tried and the outcome, in order, one entry per attempt. Before starting work in that folder,
+read its `project_history.md` first so you don't repeat an approach already tried and rejected.
+At the end of a macro task (a meaningful chunk of work, not every small edit) in that folder,
+append an entry. Keep entries lean — no fuss:
+
+```md
+## 2026-08-28: <what was tried>
+Outcome: <worked / failed / abandoned> — <one-line why>
+```
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

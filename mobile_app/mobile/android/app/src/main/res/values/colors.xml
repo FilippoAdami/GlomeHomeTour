@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- One palette for the whole HUD, read from both the layout and MainActivity so the 2D overlay,
+     the button states and ArScanRenderer's 3D markers can't drift apart. Amber and cyan match
+     ArScanRenderer's MARKER_RGBA/OCCLUSION_MARKER_RGBA exactly: the arrow the operator follows and
+     the diamond it points at have to be the same colour or the cue reads as two separate things. -->
+<resources>
+    <color name="ink">#FF07090C</color>
+    <color name="scrim_strong">#CC000000</color>
+    <color name="scrim_soft">#00000000</color>
+    <color name="card">#B3121417</color>
+    <color name="card_stroke">#1FFFFFFF</color>
+    <color name="pill">#99000000</color>
+
+    <color name="text_primary">#FFFFFFFF</color>
+    <color name="text_secondary">#B3FFFFFF</color>
+    <color name="text_faint">#80FFFFFF</color>
+    <color name="text_diag">#997DD3FC</color>
+
+    <color name="track">#33FFFFFF</color>
+    <color name="ripple">#33FFFFFF</color>
+
+    <!-- Frontier: "you haven't looked here yet". Same amber as the 3D diamond. -->
+    <color name="amber">#FFF59E0B</color>
+    <color name="amber_fill">#E6F59E0B</color>
+    <!-- Occlusion: "something is hidden behind this". Same cyan as the 3D diamond. -->
+    <color name="cyan">#FF11B8D9</color>
+    <color name="cyan_fill">#E611B8D9</color>
+
+    <color name="action">#FF2F6BFF</color>
+    <color name="action_ready">#FF10B981</color>
+    <color name="action_disabled">#29FFFFFF</color>
+    <color name="warn">#F2C2410C</color>
+    <color name="danger">#FFF87171</color>
+</resources>

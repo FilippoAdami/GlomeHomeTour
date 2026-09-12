@@ -1,0 +1,58 @@
+{
+  "$id": "https://glomehometour.dev/schemas/panorama_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour panorama_manifest.json",
+  "description": "Net-new (Phase 2 §4). node positions are in floorplan.json's coordinate frame. neighbors must reference an existing node id -- checked by validate.py, not expressible as a schema pattern.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "units": { "type": "string", "const": "meters" },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "pattern": "^node_[a-zA-Z0-9_-]+$" },
+          "position": {
+            "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "number" }
+          },
+          "heading_deg": { "type": "number", "minimum": 0, "exclusiveMaximum": 360 },
+          "image": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string" },
+              "width": { "type": "integer", "enum": [2048, 4096, 8192] },
+              "height": { "type": "integer", "enum": [1024, 2048, 4096] },
+              "projection": { "type": "string", "const": "equirectangular" }
+            },
+            "required": ["path", "width", "height", "projection"],
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": { "properties": { "width": { "const": 2048 } }, "required": ["width"] },
+                "then": { "properties": { "height": { "const": 1024 } } }
+              },
+              {
+                "if": { "properties": { "width": { "const": 4096 } }, "required": ["width"] },
+                "then": { "properties": { "height": { "const": 2048 } } }
+              },
+              {
+                "if": { "properties": { "width": { "const": 8192 } }, "required": ["width"] },
+                "then": { "properties": { "height": { "const": 4096 } } }
+              }
+            ],
+            "$comment": "README §1/§5 'Synthetic 4K' -- width must be exactly 2x height (equirectangular ratio); enumerated as const if/then pairs since plain JSON Schema draft 2020-12 has no sibling-property arithmetic without $data extensions."
+          },
+          "neighbors": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^node_[a-zA-Z0-9_-]+$" }
+          }
+        },
+        "required": ["id", "position", "heading_deg", "image", "neighbors"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["schema_version", "units", "nodes"],
+  "additionalProperties": false
+}

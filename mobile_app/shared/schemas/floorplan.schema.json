@@ -1,0 +1,87 @@
+{
+  "$id": "https://glomehometour.dev/schemas/floorplan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour floorplan.json",
+  "description": "Net-new (Phase 2 §3). Coordinate frame: meters, gravity-aligned, origin at the entry-door loop-closure anchor pose (MainActivity.startPosition), +X/+Y the floor plane, +Z up. panorama_node_ids must exist as node ids in the paired panorama_manifest.json -- checked by validate.py, not expressible as a schema pattern.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "units": { "type": "string", "const": "meters" },
+    "origin_pose": {
+      "type": "object",
+      "properties": {
+        "tx": { "type": "number" },
+        "ty": { "type": "number" },
+        "tz": { "type": "number" },
+        "qx": { "type": "number" },
+        "qy": { "type": "number" },
+        "qz": { "type": "number" },
+        "qw": { "type": "number" }
+      },
+      "required": ["tx", "ty", "tz", "qx", "qy", "qz", "qw"],
+      "additionalProperties": false
+    },
+    "rooms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": ["string", "null"] },
+          "polygon": {
+            "type": "array",
+            "minItems": 3,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": { "type": "number" }
+            }
+          },
+          "area_sqm": { "type": "number", "minimum": 0 },
+          "walls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "string" },
+                "start": {
+                  "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" }
+                },
+                "end": {
+                  "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" }
+                },
+                "thickness_m": { "type": "number", "minimum": 0 },
+                "openings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": { "type": "string", "enum": ["door", "window"] },
+                      "offset_m": { "type": "number", "minimum": 0 },
+                      "width_m": { "type": "number", "minimum": 0 }
+                    },
+                    "required": ["type", "offset_m", "width_m"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["id", "start", "end"],
+              "additionalProperties": false,
+              "$comment": "openings[].offset_m + width_m <= wall length is a cross-property arithmetic constraint over start/end/openings, checked by validate.py rather than a schema keyword."
+            }
+          }
+        },
+        "required": ["id", "polygon", "area_sqm", "walls"],
+        "additionalProperties": false,
+        "$comment": "polygon is a closed ring with >=3 points (minItems enforced above); closure is implicit -- the last vertex connects back to the first, matching floorplan.example.json's 4-point unrepeated rectangle, not a GeoJSON-style repeated first/last point."
+      }
+    },
+    "panorama_node_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^node_[a-zA-Z0-9_-]+$" }
+    }
+  },
+  "required": ["schema_version", "units", "origin_pose", "rooms", "panorama_node_ids"],
+  "additionalProperties": false
+}

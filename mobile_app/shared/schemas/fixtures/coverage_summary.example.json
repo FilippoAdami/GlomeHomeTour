@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0.0",
+  "duration_s": 90.0,
+  "coverage_fraction": 0.87,
+  "voxel_size_m": 0.1,
+  "parallax_min_deg": 25.0,
+  "voxels": {
+    "occupied": 10,
+    "parallax_verified": 9,
+    "free": 100,
+    "occluded": 5,
+    "grid_full": false
+  },
+  "frames": {
+    "seen": 2700,
+    "exported": 300
+  },
+  "dropped": {
+    "dark": 4,
+    "blown": 1,
+    "illumination_transition": 12,
+    "motion": 30,
+    "writer_queue": 2
+  },
+  "tracking_loss_events": 1,
+  "depth_source": "depth16"
+}

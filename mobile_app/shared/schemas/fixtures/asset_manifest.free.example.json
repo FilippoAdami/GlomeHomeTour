@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0.0",
+  "listing_id": "abc123",
+  "tier": "free",
+  "floorplan": "floorplan.json",
+  "flythrough_video": "flythrough_1080p.mp4"
+}

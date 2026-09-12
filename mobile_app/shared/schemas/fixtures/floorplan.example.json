@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0.0",
+  "units": "meters",
+  "origin_pose": { "tx": 0.0, "ty": 0.0, "tz": 0.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0 },
+  "rooms": [
+    {
+      "id": "room_0",
+      "label": null,
+      "polygon": [[0.0, 0.0], [4.2, 0.0], [4.2, 3.5], [0.0, 3.5]],
+      "area_sqm": 14.7,
+      "walls": [
+        {
+          "id": "wall_0",
+          "start": [0.0, 0.0],
+          "end": [4.2, 0.0],
+          "thickness_m": 0.12,
+          "openings": [
+            { "type": "door", "offset_m": 1.1, "width_m": 0.9 }
+          ]
+        },
+        {
+          "id": "wall_1",
+          "start": [4.2, 0.0],
+          "end": [4.2, 3.5]
+        }
+      ]
+    }
+  ],
+  "panorama_node_ids": ["node_0", "node_1"]
+}

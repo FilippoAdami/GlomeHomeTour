@@ -1,0 +1,466 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The GLSurfaceView is added programmatically at index 0 (MainActivity.startTracking), so ARCore
+     session creation can't race the camera-permission dialog, same reason as the sibling apps.
+
+     Everything else here is a HUD over that camera feed, laid out as two insets-aware columns
+     (top: state, bottom: what to do next) rather than as absolutely-positioned overlays. Absolute
+     margins were the previous approach and they collided: the warning banner landed on the
+     guidance arrow, and the white-balance sliders on the button. Flow layout can't. -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:keepScreenOn="true">
+
+
+    <!-- ============ top column: where the scan stands ============ -->
+    <LinearLayout
+        android:id="@+id/topColumn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="vertical"
+        android:elevation="8dp">
+
+        <LinearLayout
+            android:id="@+id/topBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:background="@drawable/scrim_top"
+            android:paddingHorizontal="16dp"
+            android:paddingTop="10dp"
+            android:paddingBottom="12dp"
+            android:gravity="center_vertical">
+
+            <!-- Left stats column -->
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginEnd="12dp"
+                android:orientation="vertical">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <!-- Tracking health as a colour -->
+                    <View
+                        android:id="@+id/trackingDot"
+                        android:layout_width="8dp"
+                        android:layout_height="8dp"
+                        android:layout_marginEnd="6dp"
+                        android:background="@drawable/dot" />
+
+                    <TextView
+                        android:id="@+id/phaseText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/text_primary"
+                        android:textSize="12sp"
+                        android:fontFamily="sans-serif-medium"
+                        android:letterSpacing="0.10"
+                        android:text="READY" />
+
+                    <TextView
+                        android:id="@+id/timerText"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:textColor="@color/text_faint"
+                        android:textSize="12sp"
+                        android:fontFamily="sans-serif-medium"
+                        android:text="" />
+
+                    <!-- On-device diagnostics button -->
+                    <TextView
+                        android:id="@+id/infoButton"
+                        android:layout_width="26dp"
+                        android:layout_height="26dp"
+                        android:background="@drawable/pill"
+                        android:gravity="center"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="13sp"
+                        android:fontFamily="sans-serif-medium"
+                        android:contentDescription="Show capture diagnostics"
+                        android:text="i" />
+                </LinearLayout>
+
+                <!-- Coverage progress row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:id="@+id/coverageValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/text_primary"
+                        android:textSize="22sp"
+                        android:fontFamily="sans-serif-medium"
+                        android:includeFontPadding="false"
+                        android:text="0%" />
+
+                    <TextView
+                        android:id="@+id/coverageLabel"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="8dp"
+                        android:textColor="@color/text_faint"
+                        android:textSize="10sp"
+                        android:letterSpacing="0.06"
+                        android:singleLine="true"
+                        android:ellipsize="end"
+                        android:includeFontPadding="false"
+                        android:text="DENSITY: 0/500 PTS" />
+                </LinearLayout>
+
+                <ProgressBar
+                    android:id="@+id/progressBar"
+                    style="?android:attr/progressBarStyleHorizontal"
+                    android:layout_width="match_parent"
+                    android:layout_height="6dp"
+                    android:layout_marginTop="8dp"
+                    android:progressDrawable="@drawable/progress_coverage"
+                    android:max="100"
+                    android:progress="0" />
+            </LinearLayout>
+
+            <!-- Right: Real-time Bird's-Eye Mini-Map -->
+            <com.glomehometour.arscan.MiniMapView
+                android:id="@+id/miniMapView"
+                android:layout_width="112dp"
+                android:layout_height="112dp"
+                android:visibility="gone" />
+        </LinearLayout>
+
+        <!-- Single warning slot: sits comfortably below topBar without overlapping miniMap -->
+        <TextView
+            android:id="@+id/warnBanner"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginHorizontal="20dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/warn_card"
+            android:paddingHorizontal="20dp"
+            android:paddingVertical="12dp"
+            android:gravity="center"
+            android:lineSpacingExtra="3dp"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
+            android:fontFamily="sans-serif-medium"
+            android:visibility="gone"
+            android:text="" />
+    </LinearLayout>
+
+    <!-- README section 6 step 2's white-balance reticle: tells the operator where to point. -->
+    <View
+        android:id="@+id/reticle"
+        android:layout_width="170dp"
+        android:layout_height="170dp"
+        android:layout_gravity="center"
+        android:layout_marginBottom="170dp"
+        android:background="@drawable/reticle"
+        android:visibility="gone" />
+
+    <!-- ============ guidance cues ============
+         Each arrow carries its own caption, so the legend sits on the cue instead of in a text
+         block elsewhere on screen: in the field the marker read as an unexplained coloured shape
+         when the two were separated. Only the arrow rotates; the caption stays upright. -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:elevation="10dp">
+
+        <LinearLayout
+            android:id="@+id/frontierGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:visibility="gone">
+
+            <com.glomehometour.arscan.GuidanceArrowView
+                android:id="@+id/arrowView"
+                android:layout_width="104dp"
+                android:layout_height="104dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/pill"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="6dp"
+                android:textColor="@color/amber"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:text="Not scanned yet" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/occlusionGroup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="26dp"
+            android:orientation="vertical"
+            android:gravity="center_horizontal"
+            android:visibility="gone">
+
+            <com.glomehometour.arscan.GuidanceArrowView
+                android:id="@+id/occlusionArrowView"
+                android:layout_width="78dp"
+                android:layout_height="78dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/pill"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="6dp"
+                android:textColor="@color/cyan"
+                android:textSize="13sp"
+                android:fontFamily="sans-serif-medium"
+                android:text="Hidden — walk around" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- ============ bottom column: what to do next ============ -->
+    <LinearLayout
+        android:id="@+id/bottomColumn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:background="@drawable/scrim_bottom"
+        android:paddingHorizontal="20dp"
+        android:paddingTop="30dp"
+        android:paddingBottom="18dp"
+        android:elevation="12dp">
+
+        <!-- The three open risks from SPEC section 1.3 are all read off this panel on-device;
+             hidden until the info button asks for it. -->
+        <TextView
+            android:id="@+id/diagText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/card"
+            android:padding="12dp"
+            android:textColor="@color/text_diag"
+            android:fontFamily="monospace"
+            android:textSize="10sp"
+            android:lineSpacingExtra="2dp"
+            android:visibility="gone"
+            android:text="" />
+
+        <!-- README section 6 step 3: level indicator for the 30-45 deg downward tilt. -->
+        <LinearLayout
+            android:id="@+id/tiltCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/card"
+            android:orientation="vertical"
+            android:paddingHorizontal="18dp"
+            android:paddingVertical="16dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textColor="@color/text_faint"
+                    android:textSize="11sp"
+                    android:letterSpacing="0.08"
+                    android:text="CAMERA ANGLE" />
+
+                <TextView
+                    android:id="@+id/tiltValue"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:letterSpacing="0.08"
+                    android:text="" />
+            </LinearLayout>
+
+            <com.glomehometour.arscan.TiltGaugeView
+                android:id="@+id/tiltGauge"
+                android:layout_width="match_parent"
+                android:layout_height="24dp"
+                android:layout_marginTop="12dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textColor="@color/text_faint"
+                    android:textSize="11sp"
+                    android:text="Level" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/text_faint"
+                    android:textSize="11sp"
+                    android:text="Straight down" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- README section 6 step 2's white-balance trim. The auto grey-world proposal
+             (MainActivity.whiteBalanceGains) is the starting point; these only nudge it, and each
+             track is drawn as its own axis gradient so the control explains itself. Centre =
+             "trust the auto proposal as-is". Two axes, same as a camera app's Temp/Tint: a
+             red/blue-only slider can never reach a green- or magenta-lit room. -->
+        <LinearLayout
+            android:id="@+id/wbCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            android:background="@drawable/card"
+            android:orientation="vertical"
+            android:paddingHorizontal="18dp"
+            android:paddingVertical="16dp"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_faint"
+                android:textSize="11sp"
+                android:letterSpacing="0.08"
+                android:text="COLOR BALANCE" />
+
+            <SeekBar
+                android:id="@+id/wbSlider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:paddingHorizontal="0dp"
+                android:progressDrawable="@drawable/slider_track_temp"
+                android:thumb="@drawable/slider_thumb"
+                android:splitTrack="false"
+                android:maxHeight="8dp"
+                android:minHeight="8dp"
+                android:contentDescription="Cool to warm"
+                android:max="100"
+                android:progress="50" />
+
+            <SeekBar
+                android:id="@+id/wbTintSlider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:paddingHorizontal="0dp"
+                android:progressDrawable="@drawable/slider_track_tint"
+                android:thumb="@drawable/slider_thumb"
+                android:splitTrack="false"
+                android:maxHeight="8dp"
+                android:minHeight="8dp"
+                android:contentDescription="Green to magenta"
+                android:max="100"
+                android:progress="50" />
+
+            <TextView
+                android:id="@+id/wbResetButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/pill"
+                android:paddingHorizontal="14dp"
+                android:paddingVertical="7dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp"
+                android:fontFamily="sans-serif-medium"
+                android:text="Reset to auto" />
+        </LinearLayout>
+
+        <!-- The primary instruction. It used to live in a 12sp monospace corner box mixed in with
+             ISO/shutter numbers, which made the single most important line on screen the least
+             legible one. -->
+        <LinearLayout
+            android:id="@+id/instructionCard"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@drawable/card"
+            android:orientation="vertical"
+            android:paddingHorizontal="18dp"
+            android:paddingVertical="16dp">
+
+            <TextView
+                android:id="@+id/instructionTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary"
+                android:textSize="17sp"
+                android:fontFamily="sans-serif-medium"
+                android:text="Getting ready…" />
+
+            <TextView
+                android:id="@+id/instructionBody"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp"
+                android:lineSpacingExtra="2dp"
+                android:text="" />
+        </LinearLayout>
+
+        <Button
+            android:id="@+id/primaryButton"
+            android:layout_width="match_parent"
+            android:layout_height="58dp"
+            android:layout_marginTop="14dp"
+            android:background="@drawable/btn_pill"
+            android:foreground="@drawable/btn_ripple"
+            android:stateListAnimator="@null"
+            android:textColor="@color/text_primary"
+            android:textSize="17sp"
+            android:textAllCaps="false"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.01"
+            android:text="Start scan" />
+
+        <!-- Why the button is unavailable, when it is. A dead button with no explanation was the
+             previous behaviour: taps were silently swallowed. -->
+        <TextView
+            android:id="@+id/hintText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:textColor="@color/text_faint"
+            android:textSize="13sp"
+            android:visibility="gone"
+            android:text="" />
+    </LinearLayout>
+
+</FrameLayout>

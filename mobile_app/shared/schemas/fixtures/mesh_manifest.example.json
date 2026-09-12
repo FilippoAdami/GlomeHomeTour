@@ -1,0 +1,86 @@
+{
+  "schema_version": "1.0.0",
+  "scene_id": "listing_test_scan_001",
+  "units": "meters",
+  "coordinate_system": "+Y_UP_-Z_FORWARD",
+  "total_triangles": 12540,
+  "total_vertices": 6320,
+  "scene_bounds": {
+    "min_point": [-3.5, 0.0, -4.2],
+    "max_point": [3.5, 2.8, 1.2],
+    "center": [0.0, 1.4, -1.5],
+    "extents": [7.0, 2.8, 5.4]
+  },
+  "assets": {
+    "scene_glb": "cad_export/scene.glb",
+    "scene_gltf": "cad_export/scene.gltf",
+    "floorplan_3d_dxf": "cad_export/floorplan_3d.dxf",
+    "scene_ifc": "cad_export/scene.ifc"
+  },
+  "nodes": [
+    {
+      "name": "Architecture",
+      "category": "architecture",
+      "instance_id": "arch_shell_001",
+      "polygon_count": 8200,
+      "vertex_count": 4120,
+      "transform_matrix": [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "bounding_box": {
+        "min_point": [-3.5, 0.0, -4.2],
+        "max_point": [3.5, 2.8, 1.2],
+        "center": [0.0, 1.4, -1.5],
+        "extents": [7.0, 2.8, 5.4]
+      },
+      "cad_layer": "A-WALL",
+      "material": {
+        "albedo_texture": "textures/arch_albedo.png",
+        "roughness_texture": "textures/arch_roughness.png",
+        "metallic_texture": "textures/arch_metallic.png",
+        "normal_texture": "textures/arch_normal.png",
+        "base_color_factor": [0.9, 0.9, 0.9, 1.0],
+        "roughness_factor": 0.8,
+        "metallic_factor": 0.05,
+        "double_sided": false
+      },
+      "mesh_path": null,
+      "children": []
+    },
+    {
+      "name": "Furniture/LivingRoom/Sofa_001",
+      "category": "furniture",
+      "instance_id": "obj_001",
+      "polygon_count": 4340,
+      "vertex_count": 2200,
+      "transform_matrix": [
+        [1.0, 0.0, 0.0, 0.5],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, -2.1],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "bounding_box": {
+        "min_point": [-0.6, 0.0, -0.45],
+        "max_point": [0.6, 0.85, 0.45],
+        "center": [0.0, 0.425, 0.0],
+        "extents": [1.2, 0.85, 0.9]
+      },
+      "cad_layer": "FF-FURN",
+      "material": {
+        "albedo_texture": "textures/sofa_001_albedo.png",
+        "roughness_texture": "textures/sofa_001_roughness.png",
+        "metallic_texture": "textures/sofa_001_metallic.png",
+        "normal_texture": "textures/sofa_001_normal.png",
+        "base_color_factor": [0.35, 0.45, 0.65, 1.0],
+        "roughness_factor": 0.9,
+        "metallic_factor": 0.0,
+        "double_sided": false
+      },
+      "mesh_path": null,
+      "children": []
+    }
+  ]
+}

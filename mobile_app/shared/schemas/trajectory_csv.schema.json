@@ -1,0 +1,22 @@
+{
+  "$id": "https://glomehometour.dev/schemas/trajectory_csv.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour trajectory.csv row",
+  "description": "One row of mobile/android's DatasetWriter trajectory.csv, promoted from DatasetFormat.trajectoryLine()/TRAJECTORY_HEADER. The CSV header string itself is the version marker for this format (see shared/schemas §2) -- there is no schema_version property because a CSV row has no JSON envelope to carry one; validate.py checks the header line against DatasetFormat.TRAJECTORY_HEADER verbatim instead.",
+  "csv_header": "timestamp_ns,tx,ty,tz,qx,qy,qz,qw,tracking,exported",
+  "type": "object",
+  "properties": {
+    "timestamp_ns": { "type": "integer", "minimum": 0 },
+    "tx": { "type": "number" },
+    "ty": { "type": "number" },
+    "tz": { "type": "number" },
+    "qx": { "type": "number" },
+    "qy": { "type": "number" },
+    "qz": { "type": "number" },
+    "qw": { "type": "number" },
+    "tracking": { "type": "string" },
+    "exported": { "type": "integer", "enum": [0, 1] }
+  },
+  "required": ["timestamp_ns", "tx", "ty", "tz", "qx", "qy", "qz", "qw", "tracking", "exported"],
+  "additionalProperties": false
+}

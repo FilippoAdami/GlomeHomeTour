@@ -1,0 +1,149 @@
+{
+  "$id": "https://glomehometour.dev/schemas/mesh_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour mesh_manifest.json",
+  "description": "Net-new (Phase 1 §1.2). Schema contract for segmented PBR CAD/BIM 3D mesh output packages. Defines scene graph hierarchy, metric bounding boxes, polygon and vertex statistics, PBR texture atlas maps, and CAD/BIM layer definitions.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "scene_id": { "type": "string" },
+    "units": { "type": "string", "const": "meters" },
+    "coordinate_system": { "type": "string", "const": "+Y_UP_-Z_FORWARD" },
+    "total_triangles": { "type": "integer", "minimum": 0 },
+    "total_vertices": { "type": "integer", "minimum": 0 },
+    "scene_bounds": {
+      "$ref": "#/$defs/BoundingBox3D"
+    },
+    "assets": {
+      "type": "object",
+      "properties": {
+        "scene_glb": { "type": "string" },
+        "scene_gltf": { "type": "string" },
+        "floorplan_3d_dxf": { "type": "string" },
+        "scene_ifc": { "type": "string" }
+      },
+      "required": ["scene_glb"],
+      "additionalProperties": false
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MeshNode"
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "scene_id",
+    "units",
+    "coordinate_system",
+    "total_triangles",
+    "total_vertices",
+    "scene_bounds",
+    "assets",
+    "nodes"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "BoundingBox3D": {
+      "type": "object",
+      "properties": {
+        "min_point": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" }
+        },
+        "max_point": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" }
+        },
+        "center": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" }
+        },
+        "extents": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number", "minimum": 0 }
+        }
+      },
+      "required": ["min_point", "max_point", "center", "extents"],
+      "additionalProperties": false
+    },
+    "PBRMaterial": {
+      "type": "object",
+      "properties": {
+        "albedo_texture": { "type": ["string", "null"] },
+        "roughness_texture": { "type": ["string", "null"] },
+        "metallic_texture": { "type": ["string", "null"] },
+        "normal_texture": { "type": ["string", "null"] },
+        "base_color_factor": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "roughness_factor": { "type": "number", "minimum": 0, "maximum": 1 },
+        "metallic_factor": { "type": "number", "minimum": 0, "maximum": 1 },
+        "double_sided": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "MeshNode": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "category": {
+          "type": "string",
+          "enum": ["architecture", "furniture", "appliance", "structural", "fixture", "unclassified"]
+        },
+        "instance_id": { "type": ["string", "null"] },
+        "polygon_count": { "type": "integer", "minimum": 0 },
+        "vertex_count": { "type": "integer", "minimum": 0 },
+        "transform_matrix": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": { "type": "number" }
+          }
+        },
+        "bounding_box": {
+          "$ref": "#/$defs/BoundingBox3D"
+        },
+        "cad_layer": { "type": ["string", "null"] },
+        "material": {
+          "oneOf": [
+            { "$ref": "#/$defs/PBRMaterial" },
+            { "type": "null" }
+          ]
+        },
+        "mesh_path": { "type": ["string", "null"] },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MeshNode"
+          }
+        }
+      },
+      "required": [
+        "name",
+        "category",
+        "polygon_count",
+        "vertex_count",
+        "transform_matrix",
+        "bounding_box"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- White HUD text has to stay legible over an arbitrary camera image; a gradient does that
+     without a hard band edge across the preview. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <gradient
+        android:angle="270"
+        android:startColor="@color/scrim_strong"
+        android:endColor="@color/scrim_soft" />
+</shape>

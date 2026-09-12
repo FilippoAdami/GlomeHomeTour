@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- README section 6 step 2's white-balance reticle: says *where* to point, which a slider alone
+     can't. Outline only; the operator has to see the wall they're metering. -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <corners android:radius="20dp" />
+    <stroke android:width="2dp" android:color="@color/text_secondary" />
+</shape>

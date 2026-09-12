@@ -1,0 +1,41 @@
+{
+  "$id": "https://glomehometour.dev/schemas/asset_manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour asset_manifest.json",
+  "description": "Net-new (Phase 2 §5). The manifest web/viewer and web/minimap fetch first; ties splat scene, floor plan, and panorama manifest into one package reference with README §7 tier gating.",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "listing_id": { "type": "string" },
+    "tier": { "type": "string", "enum": ["free", "pro"] },
+    "splat_scene": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "compressed_bytes": { "type": "integer", "minimum": 0, "maximum": 26214400 },
+        "format": { "type": "string" }
+      },
+      "required": ["path", "compressed_bytes", "format"],
+      "additionalProperties": false
+    },
+    "floorplan": { "type": "string" },
+    "panorama_manifest": { "type": "string" },
+    "flythrough_video": { "type": "string" }
+  },
+  "required": ["schema_version", "listing_id", "tier", "floorplan"],
+  "additionalProperties": false,
+  "if": {
+    "properties": { "tier": { "const": "free" } },
+    "required": ["tier"]
+  },
+  "then": {
+    "required": ["flythrough_video"],
+    "not": {
+      "anyOf": [{ "required": ["splat_scene"] }, { "required": ["panorama_manifest"] }]
+    }
+  },
+  "else": {
+    "required": ["splat_scene", "panorama_manifest"],
+    "not": { "required": ["flythrough_video"] }
+  }
+}

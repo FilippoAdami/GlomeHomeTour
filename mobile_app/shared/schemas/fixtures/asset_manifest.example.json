@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "listing_id": "abc123",
+  "tier": "pro",
+  "splat_scene": {
+    "path": "scene.splat",
+    "compressed_bytes": 21400000,
+    "format": "ply-gaussian-v1"
+  },
+  "floorplan": "floorplan.json",
+  "panorama_manifest": "panorama_manifest.json"
+}

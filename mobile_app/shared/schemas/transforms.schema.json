@@ -1,0 +1,54 @@
+{
+  "$id": "https://glomehometour.dev/schemas/transforms.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour transforms.json",
+  "description": "NeRF/instant-ngp style export of the accepted keyframes, promoted from mobile/android's DatasetFormat.transformsJson(). Frozen at 1.0.0 (Phase 1 acceptance-passed) -- do not add/rename/retype required fields without a new $id (see shared/schemas §2).",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "camera_model": { "type": "string", "const": "OPENCV" },
+    "fl_x": { "type": "number" },
+    "fl_y": { "type": "number" },
+    "cx": { "type": "number" },
+    "cy": { "type": "number" },
+    "w": { "type": "integer", "minimum": 1 },
+    "h": { "type": "integer", "minimum": 1 },
+    "camera_angle_x": { "type": "number" },
+    "k1": { "type": "number" },
+    "k2": { "type": "number" },
+    "p1": { "type": "number" },
+    "p2": { "type": "number" },
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "file_path": { "type": "string", "pattern": "^images/" },
+          "timestamp_ns": { "type": "integer", "minimum": 0 },
+          "fl_x": { "type": "number" },
+          "fl_y": { "type": "number" },
+          "cx": { "type": "number" },
+          "cy": { "type": "number" },
+          "transform_matrix": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 4,
+              "items": { "type": "number" }
+            }
+          }
+        },
+        "required": ["file_path", "timestamp_ns", "fl_x", "fl_y", "cx", "cy", "transform_matrix"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schema_version", "camera_model", "fl_x", "fl_y", "cx", "cy", "w", "h",
+    "camera_angle_x", "k1", "k2", "p1", "p2", "frames"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The track *is* the axis label: a warm-to-cool gradient tells the operator what dragging does
+     before they drag it. No progress layer, because centre means "trust the auto grey-world read", so a
+     filled bar growing from the left would imply a wrong mental model (more = better). -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@android:id/background">
+        <shape android:shape="rectangle">
+            <corners android:radius="100dp" />
+            <gradient android:startColor="#6FA8FF" android:endColor="#FFB86B" />
+        </shape>
+    </item>
+</layer-list>
