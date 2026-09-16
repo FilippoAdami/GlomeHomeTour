@@ -349,3 +349,100 @@ optimization has no metric prior to anchor to. Visual inspection pending.
 **Also added:** raw (pre-quality-gate) frame staging in `run_sliding_window_reconstruction.py`
 (`GS_input/images_raw/`), completing a reusable 3-tier dataset (raw / quality-filtered /
 depth-selected) alongside the existing `images/` and `images_depth_selected/` folders.
+
+## 2026-09-14: Replaced the in-house 2DGS implementation with the standalone 2DGS project
+Outcome: worked (merge only, not yet trained end-to-end) — the whole stage was swapped for the
+battle-tested standalone 2DGS codebase, copied in verbatim (no refactoring, per the merge rules).
+
+Deleted: `model.py`, `trainer.py`, `dataset.py`, `losses.py`, `density_control.py`,
+`rasterizer_interface.py`, `run_scene_training.py`, `rasterizer_hip/`,
+`rasterizer_torch_fallback/`, `tests/`, `implementation_plan.md`, `__init__.py`.
+Copied in: `train.py`, `render.py`, `metrics.py`, `train_room.py`, `arguments/`,
+`gaussian_renderer/`, `scene/`, `utils/`, `lpipsPyTorch/`,
+`submodules/diff-surfel-rasterization/` (HIP kernels) and `submodules/simple-knn/`.
+
+Consequence worth knowing: the hand-authored `rasterizer_hip/` kernels and the pure-PyTorch
+fallback oracle are **gone**, superseded by `diff-surfel-rasterization`. Root `CLAUDE.md`,
+`AGENTS.md` and the root `README.md` still describe the old hand-authored-kernel architecture
+and are now stale — not updated here because the merge brief scoped doc updates to
+`backend/README.md`.
+
+Four modules with no counterpart in the merged code (`compressor.py`, `pbr_shader.py`,
+`planar_reflections.py`, `export_standard_ply.py`) were moved to `04_2DGS_refinment/` rather
+than deleted; they do not import cleanly yet (see that folder's README).
+
+Two things that bit during the merge, both now documented in `README.md`:
+- Both native extensions must be installed with `pip --no-build-isolation`; an isolated PEP 517
+  env cannot see the ROCm torch wheel and the builds fail with `No module named 'torch'`.
+- `simple-knn` is required despite its only `distCUDA2` call site being commented out — the
+  import at `scene/gaussian_model.py:20` is live and breaks the whole `scene` package without it.
+
+Not done, deliberately: stage 3's depth priors are still unconsumed. The merged code has no
+depth loader and no depth loss; wiring `depth_maps/*.npy` and `{scene}_surfels.ply` into
+training is a separate follow-up task. Note `Scene.__init__` prefers a `sparse/` folder when one
+exists, so stage 2's COLMAP `points3D.ply` will silently win over stage 3's surfel cloud.
+
+## 2026-09-14: step 5 wires the depth cloud in and trains progressively
+`step_train.py` closes the gap flagged in the entry above. The loader preference
+is not fought: step 4's cloud is **copied over** `sparse/0/points3D.ply`, with
+COLMAP's kept beside it as `points3D_colmap.ply`. That copy is the entire
+mechanism by which depth priors reach training — no loader change.
+
+Four stages at `-r 8/4/2/1` to cumulative iterations 2,333 / 4,667 / 7,000 /
+10,000, chained through `--start_checkpoint chkpnt<N>.pth` (train.py restores
+`first_iter` from the checkpoint, so targets must be cumulative). Densification
+scaled from the 30k defaults to `densify_from_iter=167`,
+`densify_until_iter=5000`, `opacity_reset_interval=1000`.
+
+No `images_2/4/8` folders are generated, deliberately: `loadCam` already applies
+`-r` when loading each camera, so the folders would be ~4 GB of duplicated JPEG
+for no gain. Each stage is a subprocess (train.py has only a `__main__` block)
+and gets `PYTHONPATH` via `pipeline_paths.subprocess_env()`.
+
+Outcome: implemented and import-clean; **not yet run end-to-end** — step 2 was
+still bundle-adjusting the 1400-frame Bedroom2 capture when this was written, so
+steps 3-5 have not executed on real data.
+
+## 2026-09-15: Sensor Saturation Masking & Asymmetric Multi-View Evidence Culling (TIDI-GS)
+
+- **Optical Bloom / Glare Masking:**
+  - Implemented dynamic sensor saturation detection `compute_saturation_mask` in `utils/loss_utils.py` identifying blown-out pixels ($\max(R,G,B) \ge \tau_{\text{sat}}$ with low chroma difference $\le 0.15$).
+  - Implemented `masked_l1_loss` and `masked_ssim`, zeroing out photometric gradient on saturated light sources during training so the optimizer smoothly interpolates ceilings and walls without constructing 3D hairballs.
+  - Excluded saturated pixels from `normal_loss`, `dist_loss`, and `multiview_photometric_loss`.
+- **Asymmetric Multi-View Homography Loss (Free-Space Veto):**
+  - Updated `multiview_photometric_loss` in `utils/multiview_loss.py` with asymmetric consensus formulation: $\mathcal{L}_{\text{mv}} = (1 - w_{\text{veto}}) \cdot \text{mean}(\mathcal{L}_k) + w_{\text{veto}} \cdot \max(\mathcal{L}_k)$ ($w_{\text{veto}} = 0.5$).
+  - Prevents unobstructed side views observing empty space from being diluted by narrow-baseline views sharing the reflection or glare.
+- **Observation-Count / View-Evidence Pruning (TIDI-GS style):**
+  - Added per-Gaussian frustum and contribution tracking in `scene/gaussian_model.py` (`frustum_counter`, `observation_counter`, `seen_frustum_mask`, `seen_contrib_mask`) with camera UID deduplication.
+  - In `densify_and_prune`, automatically culls monocular floaters: primitives visible in $\ge 8$ camera frustums but only actively contributing in $\le 2$ views after iteration 1500.
+- **Decoupled Pruning and Densification:**
+  - Added `allow_densification` parameter to `GaussianModel.densify_and_prune`.
+  - In `train.py`, pruning runs every 100 iterations continuously across all stages, purging low-opacity surfels ($< 0.05$) and floaters, while cloning/splitting is strictly restricted to the densification window (`densify_from_iter < iteration < densify_until_iter`).
+  - Ensures periodic opacity resets (at iterations 2,000 and 4,000) actively purge non-recovering dead surfels in Phase 1 instead of carrying them for 6,000 iterations.
+- **Verification:**
+  - Authored comprehensive test suite `backend/tests/test_2dgs_training_filters.py` (8/8 tests passing).
+  - Validated depth priors and surfel cloud initialization test suite `backend/tests/test_depth_initialization.py` (10/10 tests passing).
+
+
+
+## 2026-09-15: ROCm matmul bug in depth_to_normal; dynamic gaussian budget
+`utils/point_utils.py:21` used `points @ intrins.inverse().T @ c2w[:3,:3].T` with
+N = W*H. At 1920x1080 (N = 2.07M) the documented gfx1200 gemm bug would have left
+~75% of the normal map silently zeroed at the final full-res stage — no error, just a
+quietly wrong `lambda_normal` gradient after hours of training. Coarse stages (r>=2)
+sit under 2**19 so this only bit stage 4. Re-introduced `_rotate()` (the canonical copy
+in `rasterizer_interface.py` was deleted) locally in `point_utils.py`.
+
+`max_gaussians` is no longer a hardcoded 1M: default is now -1 = derive at train start
+as `min(1.5 * init_points, 4.5M)`, so the growth budget tracks the voxel grid's density
+instead of contradicting it. 4.5M is the 16 GB ceiling; 1.5x pairs with the 3M
+initialization cap in step 4.
+Outcome: worked — 87/87 backend tests pass. Step 5 deliberately not run yet.
+
+## 2026-09-15: Enabled TrackGS Pose Refinement Exclusively in Stage 4 (1080p)
+- **Architecture & Scoping:** Configured `step_train.py` to enable TrackGS Lie-algebra $\mathfrak{se}(3)$ camera pose refinement (`--refine_poses_during_training`) exclusively in **Stage 4** (full native 1080p resolution, iterations 6,000–10,000).
+- **Geometric Invariance & Prior Preservation:** Stages 1–3 ($r=8, 4, 2$, iterations 0–6,000) keep camera extrinsics strictly locked to their metric COLMAP coordinates. This ensures that the global room geometry settles firmly against the multi-view Depth Anything v3 (DA3) metric point cloud priors without gauge drift.
+- **Tightly Regularized Polish:** In Stage 4, camera pose optimization runs with a conservative learning rate `--pose_lr 0.0001` (1e-4) paired with strong 3D landmark track reprojection regularization `--lambda_track 0.1` anchored to COLMAP's triangulated point cloud. This absorbs sub-pixel handheld frame-to-frame jitter and rolling shutter sync offsets, boosting high-frequency texture sharpness without warping the global metric trajectory.
+- **CLI Customization:** Exposed `--no-pose-refine`, `--pose-lr`, and `--lambda-track` in `step_train.py`.
+- **Verification:** All 87 unit tests passing (`pytest backend/tests/`).
+

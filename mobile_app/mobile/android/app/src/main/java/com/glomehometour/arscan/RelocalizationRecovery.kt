@@ -34,6 +34,107 @@ object RelocalizationRecovery {
     }
 
     /**
+     * True if two independently-computed transforms are close enough to be "the same" alignment.
+     * Used to require a candidate to be rediscovered on a second pass before it's trusted -- one
+     * lucky triangle match or one noisy ID-based fit isn't enough on its own.
+     */
+    fun isSimilarTransform(a: RigidTransform, b: RigidTransform): Boolean {
+        val dtx = a.tx - b.tx; val dty = a.ty - b.ty; val dtz = a.tz - b.tz
+        if (dtx * dtx + dty * dty + dtz * dtz > 0.0009f) return false // > 3cm apart
+        val rotDiff = abs(a.r00 - b.r00) + abs(a.r01 - b.r01) + abs(a.r02 - b.r02) +
+            abs(a.r10 - b.r10) + abs(a.r11 - b.r11) + abs(a.r12 - b.r12) +
+            abs(a.r20 - b.r20) + abs(a.r21 - b.r21) + abs(a.r22 - b.r22)
+        return rotDiff < 0.3f
+    }
+
+    /**
+     * Tries the free, unambiguous ID-based correspondences first (see
+     * `FeatureParallaxTracker.matchById`) and only falls back to blind triangle-congruence RANSAC
+     * when there aren't enough of them to fix a rigid transform.
+     */
+    fun estimateAlignmentPreferId(
+        idMatchCount: Int,
+        idCurrentX: FloatArray, idCurrentY: FloatArray, idCurrentZ: FloatArray,
+        idLandmarkX: FloatArray, idLandmarkY: FloatArray, idLandmarkZ: FloatArray,
+        currentPoints: FloatArray,
+        currentNumPoints: Int,
+        camX: Float, camY: Float, camZ: Float,
+        landmarkX: FloatArray,
+        landmarkY: FloatArray,
+        landmarkZ: FloatArray,
+        landmarkCount: Int,
+    ): RigidTransform? {
+        if (idMatchCount >= 3) {
+            val fromId = solveFromIdMatches(
+                idMatchCount, idCurrentX, idCurrentY, idCurrentZ, idLandmarkX, idLandmarkY, idLandmarkZ,
+            )
+            if (fromId != null) return fromId
+        }
+        return estimateAlignment(
+            currentPoints, currentNumPoints, camX, camY, camZ,
+            landmarkX, landmarkY, landmarkZ, landmarkCount,
+        )
+    }
+
+    private fun solveFromIdMatches(
+        n: Int,
+        curX: FloatArray, curY: FloatArray, curZ: FloatArray,
+        landX: FloatArray, landY: FloatArray, landZ: FloatArray,
+    ): RigidTransform? {
+        // Pick the two matches farthest apart, then the one farthest off that line, so the triple
+        // used to fix rotation isn't a degenerate near-collinear cluster.
+        var i0 = 0; var i1 = 1
+        var bestD = 0f
+        for (i in 0 until n) for (j in i + 1 until n) {
+            val d = dist(curX[i], curY[i], curZ[i], curX[j], curY[j], curZ[j])
+            if (d > bestD) { bestD = d; i0 = i; i1 = j }
+        }
+        if (bestD < 0.20f) return null // matched points too clustered to fix a rotation reliably
+
+        var i2 = -1
+        var bestArea = 0f
+        val ux = curX[i1] - curX[i0]; val uy = curY[i1] - curY[i0]; val uz = curZ[i1] - curZ[i0]
+        for (k in 0 until n) {
+            if (k == i0 || k == i1) continue
+            val vx = curX[k] - curX[i0]; val vy = curY[k] - curY[i0]; val vz = curZ[k] - curZ[i0]
+            val cx = uy * vz - uz * vy; val cy = uz * vx - ux * vz; val cz = ux * vy - uy * vx
+            val area = sqrt(cx * cx + cy * cy + cz * cz)
+            if (area > bestArea) { bestArea = area; i2 = k }
+        }
+        if (i2 < 0 || bestArea < 0.02f) return null
+
+        val pSrc = arrayOf(
+            floatArrayOf(landX[i0], landY[i0], landZ[i0]),
+            floatArrayOf(landX[i1], landY[i1], landZ[i1]),
+            floatArrayOf(landX[i2], landY[i2], landZ[i2]),
+        )
+        val pDst = arrayOf(
+            floatArrayOf(curX[i0], curY[i0], curZ[i0]),
+            floatArrayOf(curX[i1], curY[i1], curZ[i1]),
+            floatArrayOf(curX[i2], curY[i2], curZ[i2]),
+        )
+        val candidate = solve3PointRigid(pSrc, pDst) ?: return null
+
+        // Correspondences are exact here (matched by ID), so validate directly against every
+        // matched pair instead of a nearest-neighbour search.
+        val transformed = FloatArray(3)
+        var inliers = 0
+        var residualSum = 0f
+        for (i in 0 until n) {
+            candidate.transformPoint(landX[i], landY[i], landZ[i], transformed)
+            val dx = transformed[0] - curX[i]; val dy = transformed[1] - curY[i]; val dz = transformed[2] - curZ[i]
+            val d = sqrt(dx * dx + dy * dy + dz * dz)
+            if (d < 0.08f) {
+                inliers++
+                residualSum += d
+            }
+        }
+        if (inliers < 3 || (residualSum / inliers) >= 0.06f) return null
+
+        return candidate.copy(inliers = inliers, meanResidualM = residualSum / inliers)
+    }
+
+    /**
      * Attempts to find a rigid alignment transformation between currently observed new features
      * [currentPoints] (4 floats per point: x, y, z, confidence) and historical landmarks near camera.
      */
@@ -60,6 +161,20 @@ object RelocalizationRecovery {
             }
         }
         if (nearLCount < 6) return null
+
+        // Triangle matching below is O(n^3) in the near-landmark count; an already-scanned area
+        // can easily put hundreds of landmarks within 3.5m, which would hang the render thread
+        // for seconds. Cap the set searched for candidate triangles -- inlier scoring afterwards
+        // still checks every near landmark, so alignment quality is unaffected.
+        val maxMatchLandmarks = 40
+        val matchCount = minOf(nearLCount, maxMatchLandmarks)
+        val matchIndices = IntArray(matchCount)
+        // Evenly stride through the near set instead of truncating, so matching still sees
+        // landmarks spread across the whole nearby cluster rather than just the first ones found.
+        val stride = nearLCount.toFloat() / matchCount
+        for (m in 0 until matchCount) {
+            matchIndices[m] = lIndices[(m * stride).toInt()]
+        }
 
         // 2. Select spatially distinct current candidate points within 3.5m
         val maxC = 32
@@ -119,15 +234,15 @@ object RelocalizationRecovery {
             var foundMatch = false
             var l1 = -1; var l2 = -1; var l3 = -1
 
-            for (i in 0 until nearLCount) {
-                val idxI = lIndices[i]
-                for (j in (i + 1) until nearLCount) {
-                    val idxJ = lIndices[j]
+            for (i in 0 until matchCount) {
+                val idxI = matchIndices[i]
+                for (j in (i + 1) until matchCount) {
+                    val idxJ = matchIndices[j]
                     val ld12 = dist(landmarkX[idxI], landmarkY[idxI], landmarkZ[idxI], landmarkX[idxJ], landmarkY[idxJ], landmarkZ[idxJ])
                     if (abs(ld12 - d12) > tol) continue
 
-                    for (k in (j + 1) until nearLCount) {
-                        val idxK = lIndices[k]
+                    for (k in (j + 1) until matchCount) {
+                        val idxK = matchIndices[k]
                         val ld23 = dist(landmarkX[idxJ], landmarkY[idxJ], landmarkZ[idxJ], landmarkX[idxK], landmarkY[idxK], landmarkZ[idxK])
                         val ld31 = dist(landmarkX[idxK], landmarkY[idxK], landmarkZ[idxK], landmarkX[idxI], landmarkY[idxI], landmarkZ[idxI])
 
@@ -250,6 +365,13 @@ object RelocalizationRecovery {
         val r20 = f1z * e1x + f2z * e2x + n2z * n1x
         val r21 = f1z * e1y + f2z * e2y + n2z * n1y
         val r22 = f1z * e1z + f2z * e2z + n2z * n1z
+
+        // Edge-length-only triangle matching can't tell a rotation from its mirror image:
+        // reject improper (reflection) solutions, det(R) should be ~+1 for a real rigid motion.
+        val det = r00 * (r11 * r22 - r12 * r21) -
+            r01 * (r10 * r22 - r12 * r20) +
+            r02 * (r10 * r21 - r11 * r20)
+        if (det < 0f) return null
 
         val tx = mxD - (r00 * mxS + r01 * myS + r02 * mzS)
         val ty = myD - (r10 * mxS + r11 * myS + r12 * mzS)

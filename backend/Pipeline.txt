@@ -1,0 +1,16 @@
+Entire pipeline trial run
+00_ingestion [V]
+    -.zip extraction & /current_scene/ folder creation [V]
+    - images filtering for blur and exposure issues [V]
+    - images rotation to match portrait view [V]
+01_poses_refinment [V]
+    - transforms.json to colmap /sparse/0 folder [V]
+    - unusable frames and poses removal (unregistered + Sampson filter) [V]
+    - sparse cloud voxel dedup + outliers removal [V]
+    - human-inspectable diagnostics [V]
+02_depth_estimation
+    - track covisibility keyframe selection [V] 
+    - DA3 multiview depth estimation (N=6 K=3 res=756x420 - 13.4min) [V]
+    - RGB-Guided Edge Filtering & RANSAC scale-shift alignment [V]
+    - Hybrid Dual-Guided Surfel Backprojection (Overexposure Masking + Cross-View Carving)
+    - Normal Tube Collapse ( 1.5 cm Normal-Aligned Deduplication) [V]

@@ -6,12 +6,19 @@ Runs asynchronous RQ jobs on the ROCm host with automatic VRAM cleanup.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
-from mesh_generation.pipeline import MeshGenerationPipeline
-from mesh_generation.types import MeshPipelineConfig
-from mesh_generation.io_adapter import load_splats_ply, load_transforms_json
+_backend_dir = Path(__file__).resolve().parents[2]
+if str(_backend_dir) not in sys.path:
+    sys.path.insert(0, str(_backend_dir))
+from Utilities.pipeline_paths import bootstrap
+bootstrap()
+
+from pipeline import MeshGenerationPipeline
+from mesh_types import MeshPipelineConfig
+from io_adapter import load_splats_ply, load_transforms_json
 
 
 def generate_cad_mesh_task(

@@ -1,0 +1,3 @@
+NEXT IMPLEMENTATION IDEAS:
+ONLY IF CURRENT SETUP FAILS REMOVING ARTIFACTS: Implement Ray-Space Free-Space Carving
+---------------------------------------------------------------------------------

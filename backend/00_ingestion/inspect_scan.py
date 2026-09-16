@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """GlomeHomeTour Backend: Scan Package Inspection & Step 1 Verification Tool.
 
-Runs Step 1 (Ingestion, Quality Gate, Pose Synchronization, and SfM Refinement)
-on any capture ZIP archive or directory, printing detailed diagnostics.
+Runs Step 1 (Ingestion, Quality Gate, Pose Synchronization) on any capture ZIP
+archive or directory, printing detailed diagnostics. Pose refinement now lives
+in stage 2 (``01_poses_refinment/convert_transforms_to_colmap.py``).
 
 Usage:
     python backend/inspect_scan.py backend/scenes/bedroom.zip
@@ -19,7 +20,7 @@ from pathlib import Path
 backend_dir = Path(__file__).resolve().parents[1]
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
-from pipeline_paths import bootstrap
+from Utilities.pipeline_paths import bootstrap
 bootstrap()
 
 import numpy as np
@@ -28,7 +29,6 @@ from keyframe_selector import DynamicKeyframeSelector, estimate_scene_depths
 from package_loader import load_package
 from pose_aligner import PoseAligner
 from quality_gate import QualityGate
-from sfm_refinement import HybridSfMRefiner
 from depth_priors import (
     DepthPriorEstimator,
     GlobalDepthGraphOptimizer,
@@ -48,11 +48,6 @@ def main():
         type=int,
         default=1,
         help="Evaluate every N-th frame for faster inspection (default: 1 = evaluate all frames).",
-    )
-    parser.add_argument(
-        "--skip-sfm",
-        action="store_true",
-        help="Skip bundle adjustment step (for quick quality & pose check).",
     )
     parser.add_argument(
         "--blur-thresh",
@@ -185,7 +180,7 @@ def main():
     print("-" * 70)
 
     # 1. Package Loading
-    print("\n[1/4] Loading and validating capture package against shared/schemas/...")
+    print("\n[1/3] Loading and validating capture package against shared/schemas/...")
     t0 = time.time()
     try:
         pkg = load_package(pkg_path)
@@ -214,7 +209,7 @@ def main():
         print(f"\n[Note] Running with stride={args.stride}: evaluating {len(eval_keyframes)} / {len(pkg.keyframes)} keyframes.")
 
     # 2. Quality Gate Evaluation
-    print("\n[2/4] Running Desktop Quality Gate (Blur, Exposure, Texture)...")
+    print("\n[2/3] Running Desktop Quality Gate (Blur, Exposure, Texture)...")
     t1 = time.time()
     gate = QualityGate(blur_threshold=args.blur_thresh)
     gate_res = gate.evaluate(eval_keyframes)
@@ -234,7 +229,7 @@ def main():
         sys.exit(1)
 
     # 3. Pose Synchronization
-    print("\n[3/4] Running Sub-ms Timestamp Synchronization & Quaternion SLERP...")
+    print("\n[3/3] Running Sub-ms Timestamp Synchronization & Quaternion SLERP...")
     t2 = time.time()
     aligner = PoseAligner(pkg.trajectory)
     synced_keyframes = aligner.synchronize_keyframes(gate_res.accepted_keyframes)
@@ -249,30 +244,12 @@ def main():
     print(f"    - Last pose translation:  [x={last_pose[0,3]:.2f}, y={last_pose[1,3]:.2f}, z={last_pose[2,3]:.2f}]")
     print(f"    - Net endpoint distance:  {walked_dist:.2f} meters")
 
-    # 4. Hybrid SfM Refinement
-    if not args.skip_sfm:
-        print("\n[4/4] Running Hybrid VIO+SfM Refinement on sample keyframes...")
-        t3 = time.time()
-        # Run bundle adjustment on first 10 synchronized keyframes for quick verification
-        sfm_sample = synced_keyframes[:10]
-        refiner = HybridSfMRefiner(min_matches=10)
-        sfm_res = refiner.refine(intr, sfm_sample, max_nfev=30)
-        sfm_time = time.time() - t3
-        print(f" -> Finished in {sfm_time:.2f}s:")
-        print(f"    - Triangulated 3D points: {sfm_res.num_points_3d}")
-        print(f"    - Visual observations:    {sfm_res.num_observations}")
-        if sfm_res.num_observations > 0:
-            print(f"    - Reprojection error:     {sfm_res.reprojection_error_initial:.2f}px -> {sfm_res.reprojection_error_final:.2f}px")
-        print(f"    - Distortion coefficients: k1={sfm_res.refined_distortion[0]:.4f}, k2={sfm_res.refined_distortion[1]:.4f}")
-    else:
-        print("\n[4/4] Skipped SfM refinement (--skip-sfm passed).")
-
-    # 5. Step 2: Depth Estimation & Surfel Cloud Initialization
+    # 4. Step 2: Depth Estimation & Surfel Cloud Initialization
     if args.run_depth:
         print("\n" + "=" * 70)
         print(" STEP 2: GEOMETRIC DEPTH PRIORS & MULTI-VIEW RECONSTRUCTION")
         print("=" * 70)
-        print("[5/5] Estimating depth priors and initializing 2D Gaussian surfels...")
+        print("[+] Estimating depth priors and initializing 2D Gaussian surfels...")
         t4 = time.time()
 
         # Cache directory for precomputed depth and confidence maps

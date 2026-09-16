@@ -9,8 +9,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, "backend")
-sys.path.insert(0, "backend/third_party/depth_anything_3/src")
-from pipeline_paths import bootstrap
+sys.path.insert(0, "backend/Utilities/third_party/depth_anything_3/src")
+from Utilities.pipeline_paths import bootstrap
 bootstrap()
 
 from package_loader import PackageLoader

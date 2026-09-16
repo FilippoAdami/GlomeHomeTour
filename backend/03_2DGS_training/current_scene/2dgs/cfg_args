@@ -1,0 +1,1 @@
+Namespace(sh_degree=3, source_path='/home/monday/Desktop/GlomeHomeTour/backend/03_2DGS_training/current_scene', model_path='current_scene/2dgs', images='images', resolution=8, white_background=False, random_background=True, data_device='cuda', eval=False, render_items=['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature'])

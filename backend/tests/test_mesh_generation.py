@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 import torch
 
-from mesh_generation.types import (
+from mesh_types import (
     BoundingBox3D,
     InstanceCluster,
     MeshManifest,
@@ -35,7 +35,7 @@ from mesh_generation.types import (
     PBRMaterial,
     SurfelCloudTorch,
 )
-from mesh_generation.io_adapter import (
+from io_adapter import (
     CameraIntrinsicsTorch,
     KeyframePoseTorch,
     TransformsDataset,
@@ -310,7 +310,7 @@ def test_device_transfer_and_vram_cleanup():
 
 def test_geometric_architecture_segmentation():
     """Test geometric surface normal filter for separating floor, ceiling, wall, and furniture."""
-    from mesh_generation.segmentation import GeometricArchitectureFilter
+    from segmentation import GeometricArchitectureFilter
 
     cloud = create_mock_surfel_cloud(
         num_surfels=1200,
@@ -344,7 +344,7 @@ def test_geometric_architecture_segmentation():
 def test_semantic_instance_segmenter_pipeline():
     """Test multi-view projection and foreground instance clustering."""
     import tempfile
-    from mesh_generation.segmentation import SemanticInstanceSegmenter
+    from segmentation import SemanticInstanceSegmenter
 
     cloud = create_mock_surfel_cloud(
         num_surfels=1500,
@@ -382,7 +382,7 @@ def test_semantic_instance_segmenter_pipeline():
 
 def test_manhattan_planar_snapping():
     """Test orthogonal 90-degree Manhattan plane fitting and zero angular deviation."""
-    from mesh_generation.planar_snapping import ManhattanPlanarRANSAC
+    from planar_snapping import ManhattanPlanarRANSAC
 
     cloud = create_mock_surfel_cloud(
         num_surfels=1500,
@@ -414,8 +414,8 @@ def test_manhattan_planar_snapping():
 
 def test_architectural_infill_and_watertight_shell():
     """Test void detection, inpaint surfels, and watertight manifold shell extraction."""
-    from mesh_generation.segmentation import GeometricArchitectureFilter
-    from mesh_generation.architectural_infill import ArchitecturalInfillEngine
+    from segmentation import GeometricArchitectureFilter
+    from architectural_infill import ArchitecturalInfillEngine
 
     cloud = create_mock_surfel_cloud(
         num_surfels=2000,
@@ -454,7 +454,7 @@ def test_architectural_infill_and_watertight_shell():
 
 def test_prototype_cluster_deduplication():
     """Verify that identical furniture items (e.g. 4 chairs + 2 tables) are de-duplicated into 2 prototypes."""
-    from mesh_generation.prototype_cluster import PrototypeClusterEngine
+    from prototype_cluster import PrototypeClusterEngine
 
     # 4 identical blue dining chairs at different room locations
     chair_indices = list(range(0, 100))
@@ -524,8 +524,8 @@ def test_prototype_cluster_deduplication():
 
 def test_canonical_view_renderer():
     """Verify that CanonicalViewRenderer outputs clean 4-view projection images."""
-    from mesh_generation.object_reconstruction import CanonicalViewRenderer
-    from mesh_generation.prototype_cluster import PrototypeGroup
+    from object_reconstruction import CanonicalViewRenderer
+    from prototype_cluster import PrototypeGroup
 
     cloud = create_mock_surfel_cloud(num_surfels=500, device="cpu")
     bbox = cloud.compute_bounding_box()
@@ -549,12 +549,12 @@ def test_canonical_view_renderer():
 
 def test_pixal3d_reconstruction_and_obb_alignment():
     """Test Pixal3D reconstruction engine and OBB instance cloning."""
-    from mesh_generation.object_reconstruction import (
+    from object_reconstruction import (
         CanonicalViewRenderer,
         OBBAligner,
         Pixal3DReconstructionEngine,
     )
-    from mesh_generation.prototype_cluster import PrototypeGroup
+    from prototype_cluster import PrototypeGroup
 
     cloud = create_mock_surfel_cloud(num_surfels=500, device="cpu")
     bbox = BoundingBox3D(
@@ -612,7 +612,7 @@ def test_pixal3d_reconstruction_and_obb_alignment():
 
 def test_uv_unwrapping_and_atlas_bounds():
     """Verify non-overlapping UV atlas unwrap in [0, 1]x[0, 1]."""
-    from mesh_generation.texture_baking import UVAtlasUnwrapper
+    from texture_baking import UVAtlasUnwrapper
     import trimesh
 
     box = trimesh.creation.box(extents=[1.0, 2.0, 1.5])
@@ -629,7 +629,7 @@ def test_uv_unwrapping_and_atlas_bounds():
 
 def test_pbr_texture_baking_and_material_export():
     """Verify PBR texture baking (Albedo, Roughness, Metallic, Normal) and map saving."""
-    from mesh_generation.texture_baking import PBRTextureBaker
+    from texture_baking import PBRTextureBaker
     import tempfile
     import trimesh
 
@@ -660,7 +660,7 @@ def test_pbr_texture_baking_and_material_export():
 
 def test_scene_assembler_and_cad_exports():
     """Verify complete SceneAssembler export: .glb, .dxf, .ifc, and mesh_manifest.json validation."""
-    from mesh_generation.scene_assembler import SceneAssembler
+    from scene_assembler import SceneAssembler
     from jsonschema import Draft202012Validator
     import tempfile
     import trimesh
@@ -725,7 +725,7 @@ def test_scene_assembler_and_cad_exports():
 
 def test_surfel_projection_kernel_oracle():
     """Verify Wave32 surfel projection kernel oracle against camera intrinsics."""
-    from mesh_generation.kernels.surfel_projection import project_surfels_frustum_torch
+    from kernels.surfel_projection import project_surfels_frustum_torch
 
     # Point directly in front of camera at Z = -2.0m (OpenGL depth = +2.0m)
     pos = torch.tensor([[0.0, 0.0, -2.0]], dtype=torch.float32)
@@ -752,7 +752,7 @@ def test_surfel_projection_kernel_oracle():
 
 def test_end_to_end_mesh_generation_pipeline():
     """Test full end-to-end MeshGenerationPipeline on synthetic room data."""
-    from mesh_generation.pipeline import MeshGenerationPipeline
+    from pipeline import MeshGenerationPipeline
     import tempfile
 
     cloud = create_mock_surfel_cloud(
@@ -807,7 +807,7 @@ def test_end_to_end_mesh_generation_pipeline():
 def test_worker_task_execution():
     """Verify asynchronous worker task generate_cad_mesh_task."""
     import tempfile
-    from worker.tasks import generate_cad_mesh_task
+    from Utilities.worker.tasks import generate_cad_mesh_task
 
     cloud = create_mock_surfel_cloud(num_surfels=800, device="cpu")
 

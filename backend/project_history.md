@@ -339,3 +339,40 @@ poses and missed the Y flip — it now pitches the cameras). Suite: **58 passed*
    - All 21 reconstruction and training unit tests passing.
    - Output manifests and formats strictly conform to shared interchange schemas.
 
+## 2026-09-14: end-to-end pipeline, one entry point, every step resumable
+Implemented `IntegrationPlan.md`: `run_pipeline.py` takes a compressed capture and
+runs extract -> quality filter -> COLMAP -> depth keyframe filter -> depth
+estimation -> 2DGS training inside a temporary `current_scene/` workspace. Every
+step is independently runnable, independently resumable, and logs its own metrics.
+
+New shared foundation in `Utilities/`:
+- `scene_io.py` — the single owner of "read/modify/write a scene folder".
+  `split_scene()` / `merge_back()` move frames with their camera entry and
+  **never renumber basenames**, which is what keeps depth maps, COLMAP image
+  names and stats keys valid across steps.
+- `pipeline_step.py` — `StepContext` writes `<name>_log.txt`, `<name>_stats.json`
+  and a `pipeline_state.json` record; `is_done()` additionally requires the
+  step's outputs to still exist, so a hand-deleted output is not skipped over.
+- `pipeline_paths.py` — gained `stage_paths()` / `subprocess_env()`; subprocessed
+  stage scripts (the COLMAP converter, `train.py`) import bare stage module names
+  and a fresh interpreter inherits none of the parent's sys.path.
+
+Governing rule throughout: **nothing is deleted mid-pipeline.** Rejected frames
+are moved to per-step discard folders, each itself a loadable scene.
+`current_scene/` is not auto-deleted even on success — the trained scene is the
+only copy and lives inside it, so the run prints a message instead. That is a
+deliberate deviation from the plan, which called for deleting on success.
+
+Per-step notes are in each stage's own `project_history.md`. The one change worth
+repeating here: DA3 is no longer handed ARCore poses. The COLMAP pass now always
+runs first and COLMAP already stores OpenCV world-to-camera, so `depth_priors.py`
+converts nothing and the three legacy callers convert for themselves.
+
+Outcome: steps 0-1 verified on the real 1431-frame Bedroom2 capture (267 MB;
+extract 1.6 s, quality gate 19 s, 1400 kept). Step 2 verified as far as COLMAP's
+global bundle adjustment. Steps 3-5 are implemented and import-clean but **not
+yet run on real data**. Tests cover the structural guarantees
+(`test_pipeline_steps.py`), the pose-convention regression
+(`test_colmap_poses_to_da3.py`) and step 3's new track covisibility
+(`test_step_filter_depth.py`) — 12 assertions-based tests, all passing.
+

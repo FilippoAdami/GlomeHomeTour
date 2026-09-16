@@ -10,21 +10,37 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
-    "torch>=2.3.0",
+    # torch/torchvision are intentionally floored, not pinned: this machine runs
+    # the ROCm 7.1 wheels from AMD's index (torch==2.13.0+rocm7.1), which are not
+    # on PyPI. A plain `pip install torch` pulls the CUDA build and will not run
+    # here. Stage 3 (02_depth_estimation / Depth Anything 3) is validated against
+    # this exact torch build -- do not downgrade it to match the 2DGS project's
+    # older 2.10.0+rocm7.0 pin.
+    "torch>=2.13.0",
     "torchvision",
-    "numpy>=1.24.0",
-    "scipy>=1.11.0",
+    "numpy>=2.5.2",
+    "scipy>=1.18.1",
     "opencv-python-headless>=4.8.0",
-    "scikit-image>=0.21.0",
+    "scikit-image>=0.26.0",
     "shapely>=2.0.0",
     "jsonschema>=4.21.0",
     "fastapi>=0.110.0",
     "uvicorn>=0.28.0",
     "redis>=5.0.0",
     "rq>=1.15.0",
-    "plyfile>=1.0.0",
+    "plyfile>=1.1.5",
     "pydantic>=2.6.0",
-    "pillow>=10.0.0",
+    "pillow>=11.3.0",
+    "tqdm>=4.70.0",
+    # --- merged in from the standalone 2DGS project (stages 2 & 4) ---
+    "matplotlib>=3.11.1",   # pose-drift / 3D-trajectory diagnostic plots
+    "open3d>=0.19.0",       # densify_pointcloud.py, render.py + utils/mesh_utils.py TSDF path
+    "mediapy>=1.2.0",       # utils/render_utils.py video writing (imported at module load)
+    "trimesh>=4.3.2",       # mesh export (also already used by 05_2DGS_to_mesh)
+    # No PyPI `lpips`: metrics.py uses the vendored `lpipsPyTorch/` package instead.
+    # Rasterizer is NOT on PyPI. Build from the vendored source after install:
+    #   pip install 03_2DGS_training/submodules/diff-surfel-rasterization
+    # COLMAP is a system binary (4.3.0.dev0, HIP build), not a pip dependency.
 ]
 
 [project.optional-dependencies]
@@ -35,7 +51,10 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["ingestion*", "reconstruction*", "floorplan*", "panorama*", "worker*", "api*"]
+# Numbered pipeline-stage dirs (00_ingestion, 01_poses_refinment, ...) aren't valid
+# dotted package names, so they're used via PYTHONPATH + pipeline_paths.bootstrap(),
+# not as installable subpackages. Only dotted-name subpackages go here.
+include = ["floorplan*", "panorama*", "api*", "Utilities*"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

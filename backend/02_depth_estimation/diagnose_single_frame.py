@@ -24,9 +24,9 @@ import numpy as np
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
-from pipeline_paths import bootstrap
+from Utilities.pipeline_paths import bootstrap
 bootstrap()
-_da3_src = _backend_dir / "third_party" / "depth_anything_3" / "src"
+_da3_src = _backend_dir / "Utilities" / "third_party" / "depth_anything_3" / "src"
 if _da3_src.is_dir() and str(_da3_src) not in sys.path:
     sys.path.insert(0, str(_da3_src))
 

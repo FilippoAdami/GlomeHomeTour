@@ -1,4 +1,4 @@
-"""Unit tests for backend/reconstruction/ depth priors and surfel initialization."""
+"""Unit tests for backend/02_depth_estimation/ depth priors and surfel initialization."""
 
 import math
 import tempfile
@@ -8,18 +8,21 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from ingestion.package_loader import CameraIntrinsics, Keyframe
-from reconstruction.depth_priors import (
+from package_loader import CameraIntrinsics, Keyframe
+from depth_priors import (
     DepthPriorEstimator,
     GlobalDepthGraphOptimizer,
     GlobalDepthGraphResult,
     MetricDepthAligner,
     compute_surface_normals,
 )
-from reconstruction.initialization import (
+from initialization import (
     SurfelCloud,
     SurfelCloudInitializer,
     build_orthonormal_tangent_frame,
+    compute_overexposed_mask,
+    filter_multiview_consistency,
+    global_cross_view_freespace_carving,
 )
 
 
@@ -264,3 +267,244 @@ def test_surfel_cloud_initialization_and_ply_export(mock_intrinsics: CameraIntri
     np.testing.assert_allclose(loaded_cloud.scales_2d, cloud.scales_2d, atol=1e-5)
     np.testing.assert_allclose(loaded_cloud.colors_rgb, cloud.colors_rgb, atol=1e-2)
     np.testing.assert_allclose(loaded_cloud.opacities, cloud.opacities, atol=1e-5)
+
+
+def test_surfel_cloud_from_random():
+    """SurfelCloud.from_random produces a valid point cloud confined to bbox."""
+    bbox_min = np.array([-2.0, -1.0, -3.0], dtype=np.float32)
+    bbox_max = np.array([2.0, 3.0, 1.0], dtype=np.float32)
+    cloud = SurfelCloud.from_random(bbox_min, bbox_max, num_points=5000, seed=0)
+
+    assert len(cloud) == 5000
+    assert np.all(cloud.positions >= bbox_min) and np.all(cloud.positions <= bbox_max)
+    normal_lengths = np.linalg.norm(cloud.normals, axis=-1)
+    np.testing.assert_allclose(normal_lengths, 1.0, atol=1e-4)
+    assert cloud.opacities.shape == (5000,)
+    assert np.all((cloud.opacities > 0.0) & (cloud.opacities <= 1.0))
+
+
+# ==============================================================================
+# 4. Saturated Pixel Masking & Epipolar Free-Space Filter Tests
+# ==============================================================================
+
+def test_compute_overexposed_mask():
+    h, w = 60, 80
+    # Create image with diffuse white wall (238, 238, 238)
+    img = np.full((h, w, 3), 238, dtype=np.uint8)
+
+    # Add saturated light fixture core (255, 255, 252)
+    img[20:25, 20:25] = [255, 255, 252]
+
+    # Add vibrant saturated red object (255, 20, 20) - should NOT be treated as optical bloom
+    img[40:45, 40:45] = [255, 20, 20]
+
+    mask_no_dilate = compute_overexposed_mask(img, min_threshold=250, dilation_kernel_size=0)
+    # The light fixture core must be masked
+    assert np.all(mask_no_dilate[20:25, 20:25])
+    # Diffuse white wall must NOT be masked
+    assert not np.any(mask_no_dilate[0:15, 0:15])
+    # Vibrant red object must NOT be masked (chroma difference is high)
+    assert not np.any(mask_no_dilate[40:45, 40:45])
+
+    # Test dilation
+    mask_dilated = compute_overexposed_mask(img, min_threshold=250, dilation_kernel_size=5)
+    assert np.sum(mask_dilated) > np.sum(mask_no_dilate)
+    # Surrounding halo of the bulb is masked by dilation
+    assert mask_dilated[19, 20]
+
+    # Test dim image (no overexposure)
+    dim_img = np.full((h, w, 3), 150, dtype=np.uint8)
+    dim_mask = compute_overexposed_mask(dim_img, min_threshold=250)
+    assert not np.any(dim_mask)
+
+
+def test_filter_multiview_consistency_freespace(mock_intrinsics: CameraIntrinsics):
+    h, w = mock_intrinsics.h, mock_intrinsics.w
+
+    # Camera 0 at origin (0, 0, 0), OpenGL convention (facing -Z)
+    c2w_0 = np.eye(4, dtype=np.float64)
+    # Camera 1 translated along X by 0.35m (side view with clear baseline)
+    c2w_1 = np.eye(4, dtype=np.float64)
+    c2w_1[0, 3] = 0.35
+
+    kf0 = Keyframe("c0.jpg", 0, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_0, lambda: None)
+    kf1 = Keyframe("c1.jpg", 1, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_1, lambda: None)
+
+    # Depth maps: flat wall at distance 4.0 meters
+    depth0 = np.full((h, w), 4.0, dtype=np.float32)
+    depth1 = np.full((h, w), 4.0, dtype=np.float32)
+
+    # 3 points defined in world space:
+    # Point 0: True surface point on the wall at (0.0, 0.0, -4.0)
+    # Point 1: Floating phantom point in empty space at (0.0, 0.0, -1.5)
+    # Point 2: Point behind the wall at (0.0, 0.0, -6.0) (occluded from camera 1)
+    pts_world = np.array([
+        [0.0, 0.0, -4.0],
+        [0.0, 0.0, -1.5],
+        [0.0, 0.0, -6.0],
+    ], dtype=np.float32)
+
+    # Run filter with free-space carving enabled and min_consensus=1
+    mask = filter_multiview_consistency(
+        pts_world=pts_world,
+        current_idx=0,
+        keyframes=[kf0, kf1],
+        depth_maps=[depth0, depth1],
+        intrinsics=mock_intrinsics,
+        min_consensus=1,
+        enable_freespace_filter=True,
+        max_freespace_violations=0,
+    )
+
+    # Point 0 is on the surface (agrees in both views) -> kept
+    assert mask[0] == True
+    # Point 1 is a floating point in empty air (camera 1 sees 4.0m wall through it) -> CULLED!
+    assert mask[1] == False
+
+    # Point 2 is behind the wall; with min_consensus=0 (only free-space check active):
+    mask_freespace_only = filter_multiview_consistency(
+        pts_world=pts_world,
+        current_idx=0,
+        keyframes=[kf0, kf1],
+        depth_maps=[depth0, depth1],
+        intrinsics=mock_intrinsics,
+        min_consensus=0,
+        enable_freespace_filter=True,
+        max_freespace_violations=0,
+    )
+    # Point 0: valid (not in empty space)
+    assert mask_freespace_only[0] == True
+    # Point 1: culled (empty space violation)
+    assert mask_freespace_only[1] == False
+    # Point 2: occluded behind wall (proj_z = 6.0 > obs_depth = 4.0), NOT an empty space violation
+    assert mask_freespace_only[2] == True
+
+
+def test_surfel_initialization_with_filters(mock_intrinsics: CameraIntrinsics):
+    h, w = mock_intrinsics.h, mock_intrinsics.w
+
+    # Image with saturated patch
+    img_arr = np.full((h, w, 3), 180, dtype=np.uint8)
+    img_arr[100:150, 100:150] = [255, 255, 255]  # Blown-out optical bloom
+    img = Image.fromarray(img_arr)
+
+    c2w_0 = np.eye(4, dtype=np.float64)
+    c2w_1 = np.eye(4, dtype=np.float64)
+    c2w_1[0, 3] = 0.3
+
+    kf0 = Keyframe("f0.jpg", 0, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_0, lambda: img)
+    kf1 = Keyframe("f1.jpg", 1, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_1, lambda: img)
+
+    depth0 = np.full((h, w), 2.5, dtype=np.float32)
+    depth1 = np.full((h, w), 2.5, dtype=np.float32)
+
+    init_filtered = SurfelCloudInitializer(
+        target_surfels=2000,
+        voxel_downsample_m=0.05,
+        enable_saturation_mask=True,
+        saturation_min_threshold=250,
+        enable_freespace_filter=True,
+    )
+    cloud_filtered = init_filtered.initialize_from_keyframes(
+        [kf0, kf1],
+        [depth0, depth1],
+        mock_intrinsics,
+    )
+
+    init_unfiltered = SurfelCloudInitializer(
+        target_surfels=2000,
+        voxel_downsample_m=0.05,
+        enable_saturation_mask=False,
+        enable_freespace_filter=False,
+    )
+    cloud_unfiltered = init_unfiltered.initialize_from_keyframes(
+        [kf0, kf1],
+        [depth0, depth1],
+        mock_intrinsics,
+    )
+
+    # Unfiltered cloud contains saturated white points (1.0)
+    assert np.max(cloud_unfiltered.colors_rgb) > 0.95
+    # Filtered cloud pruned saturated bloom, so maximum color is bounded by diffuse wall intensity
+    assert np.max(cloud_filtered.colors_rgb) <= (185.0 / 255.0)
+
+    # For a single keyframe containing a bloom patch, point count is strictly reduced
+    single_filt = init_filtered.initialize_from_keyframes([kf0], [depth0], mock_intrinsics)
+    single_unfilt = init_unfiltered.initialize_from_keyframes([kf0], [depth0], mock_intrinsics)
+    assert len(single_filt) < len(single_unfilt)
+
+
+
+def test_voxel_grid_coarsens_instead_of_random_thinning(mock_intrinsics):
+    """Over budget, the initializer re-voxelises at a coarser grid rather than dropping points."""
+    h, w = mock_intrinsics.h, mock_intrinsics.w
+    img = Image.fromarray(np.full((h, w, 3), 128, dtype=np.uint8))
+    mat = np.eye(4, dtype=np.float32)
+    kf = Keyframe("img0.jpg", 100, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                  mock_intrinsics.cx, mock_intrinsics.cy, mat, lambda: img)
+    depth = np.full((h, w), 2.0, dtype=np.float32)
+
+    initializer = SurfelCloudInitializer(
+        max_surfels=1_000,
+        voxel_downsample_m=0.005,
+    )
+    cloud = initializer.initialize_from_keyframes([kf], [depth], mock_intrinsics)
+
+    assert len(cloud) <= 1_000
+    assert initializer.applied_voxel_size_m > 0.005
+    # Surfels must grow with the coarsened cell, else the surface develops holes.
+    assert cloud.scales_2d.max() <= 0.8 * initializer.applied_voxel_size_m + 1e-6
+    assert cloud.scales_2d.max() > 0.016
+
+
+def test_global_cross_view_freespace_carving(mock_intrinsics: CameraIntrinsics):
+    """Test global cross-view carving removes floating phantom points."""
+    h, w = mock_intrinsics.h, mock_intrinsics.w
+
+    c2w_0 = np.eye(4, dtype=np.float64)
+    c2w_1 = np.eye(4, dtype=np.float64)
+    c2w_1[0, 3] = 0.5  # 50cm lateral baseline
+
+    kf0 = Keyframe("f0.jpg", 0, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_0, lambda: None)
+    kf1 = Keyframe("f1.jpg", 1, mock_intrinsics.fl_x, mock_intrinsics.fl_y,
+                   mock_intrinsics.cx, mock_intrinsics.cy, c2w_1, lambda: None)
+
+    # Both views observe a wall at 3.0m
+    depth0 = np.full((h, w), 3.0, dtype=np.float32)
+    depth1 = np.full((h, w), 3.0, dtype=np.float32)
+
+    # Point 0: True surface point at z = -3.0
+    # Point 1: Phantom floating point at z = -1.5 (violates 3.0m depth in both views)
+    pts = np.array([
+        [0.0, 0.0, -3.0],
+        [0.0, 0.0, -1.5],
+    ], dtype=np.float32)
+    normals = np.array([
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+    colors = np.array([
+        [0.5, 0.5, 0.5],
+        [1.0, 0.0, 0.0],
+    ], dtype=np.float32)
+
+    carved_pts, carved_norms, carved_cols = global_cross_view_freespace_carving(
+        pts_world=pts,
+        normals_world=normals,
+        colors_rgb=colors,
+        keyframes=[kf0, kf1],
+        depth_maps=[depth0, depth1],
+        intrinsics=mock_intrinsics,
+        max_violations=1,
+        margin_m=0.04,
+        subsample_kfs=1,
+    )
+
+    assert len(carved_pts) == 1
+    assert np.allclose(carved_pts[0], [0.0, 0.0, -3.0])
+

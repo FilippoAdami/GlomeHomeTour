@@ -11,7 +11,7 @@ import io
 import json
 import os
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
@@ -58,13 +58,13 @@ class CameraIntrinsics:
 @dataclass
 class Keyframe:
     file_path: str
-    timestamp_ns: int
-    fl_x: float
-    fl_y: float
-    cx: float
-    cy: float
-    transform_matrix: np.ndarray  # (4, 4) float64
-    image_loader: Callable[[], Image.Image]
+    timestamp_ns: int = 0
+    fl_x: float = 0.0
+    fl_y: float = 0.0
+    cx: float = 0.0
+    cy: float = 0.0
+    transform_matrix: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))  # (4, 4) float64
+    image_loader: Callable[[], Image.Image] = field(default_factory=lambda: (lambda: Image.new("RGB", (1, 1))))
 
     def load_image(self) -> Image.Image:
         """Load and return PIL Image for this keyframe."""

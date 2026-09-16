@@ -12,7 +12,7 @@ before starting work, don't just skim `README.md`:
   most detailed record of *why* things are the way they are. Dense/math-heavy; grep for
   the subsystem you're touching rather than reading linearly.
 - `backend/project_history.md` — milestone-level summary of the same work.
-- `backend/ingestion/project_history.md`, `backend/reconstruction/project_history.md` —
+- `backend/00_ingestion/project_history.md`, `backend/03_2DGS_training/project_history.md` —
   per-folder logs per the root CLAUDE.md convention. Append an entry here after a macro
   task in that folder.
 
@@ -30,7 +30,7 @@ before starting work, don't just skim `README.md`:
   ROCm 7.1 a float32 `(N, 3) @ (3, 3)` silently leaves every output row from index 524,288
   (2**19) onward as zeros — the BLAS kernel's grid only covers the first 2**19 rows. No error,
   no NaN. Use the elementwise column form (`_rotate()` in
-  `reconstruction/training/rasterizer_interface.py`); it is exact at any N and faster for k=3.
+  `03_2DGS_training/rasterizer_interface.py`); it is exact at any N and faster for k=3.
   This is why primitive counts above ~524k used to render empty frames.
 - `MIOPEN_USER_DB_PATH` must point somewhere writable outside the sandboxed home config
   path (currently `/tmp/miopen`) or MIOpen kernel compilation silently aborts.
@@ -39,10 +39,10 @@ before starting work, don't just skim `README.md`:
   process — this pattern is already threaded through `depth_priors.py`, preserve it if you
   touch the inference loops.
 
-## Depth Anything 3 (`third_party/depth_anything_3/`)
+## Depth Anything 3 (`Utilities/third_party/depth_anything_3/`)
 
 This is a vendored upstream clone (has its own `.git/`, own `pyproject.toml`), not code
-written for this project — read `third_party/depth_anything_3/src/depth_anything_3/api.py`
+written for this project — read `Utilities/third_party/depth_anything_3/src/depth_anything_3/api.py`
 directly for ground truth on what `inference()` actually does rather than trusting
 `history.md`'s summary. Key fact worth knowing before changing anything in
 `reconstruction/depth_priors.py`: DA3 estimates its **own** camera poses internally per

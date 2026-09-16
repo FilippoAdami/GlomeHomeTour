@@ -54,6 +54,7 @@ object DatasetFormat {
     fun transformsJson(
         fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int,
         frames: List<Keyframe>,
+        k1: Float? = null, k2: Float? = null,
     ): String = buildString {
         append("{\n")
         append("  \"schema_version\": \"1.0.0\",\n")
@@ -62,9 +63,10 @@ object DatasetFormat {
         append("  \"cx\": ${f(cx)},\n  \"cy\": ${f(cy)},\n")
         append("  \"w\": $width,\n  \"h\": $height,\n")
         append("  \"camera_angle_x\": ${f(2.0 * atan(width / (2.0 * fx)))},\n")
-        // ARCore's pinhole intrinsics carry no distortion terms; emitted as zeros so downstream
-        // tools that require the keys don't have to special-case us.
-        append("  \"k1\": 0.0,\n  \"k2\": 0.0,\n  \"p1\": 0.0,\n  \"p2\": 0.0,\n")
+        // k1/k2 are Android's LENS_DISTORTION kappa_0/kappa_1 (rational model), used as an
+        // approximate seed for OpenCV's plumb-bob model -- not an exact undistortion. p1/p2
+        // stay 0: Android's model has no tangential term. Null on API <28/no characteristic.
+        append("  \"k1\": ${f(k1 ?: 0f)},\n  \"k2\": ${f(k2 ?: 0f)},\n  \"p1\": 0.0,\n  \"p2\": 0.0,\n")
         append("  \"frames\": [\n")
         frames.forEachIndexed { i, frame ->
             append("    {\"file_path\": \"images/${frame.fileName}\", \"timestamp_ns\": ${frame.timestampNs}, ")

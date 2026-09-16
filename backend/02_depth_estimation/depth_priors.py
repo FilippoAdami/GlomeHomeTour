@@ -40,7 +40,7 @@ if hasattr(torch, "quantile"):
     torch.quantile = _rocm_safe_torch_quantile
 
 # Ensure third_party depth_anything_3 is importable
-_da3_path = Path(__file__).resolve().parent.parent / "third_party" / "depth_anything_3" / "src"
+_da3_path = Path(__file__).resolve().parent.parent / "Utilities" / "third_party" / "depth_anything_3" / "src"
 if _da3_path.is_dir() and str(_da3_path) not in sys.path:
     sys.path.insert(0, str(_da3_path))
 
@@ -54,7 +54,7 @@ def arcore_c2w_to_da3_w2c(extrinsics: np.ndarray) -> np.ndarray:
 
     DA3 both conditions its camera encoder on, and Umeyama-fits its metric scale
     against, OpenCV-convention *world-to-camera* matrices (see `_normalize_extrinsics`
-    and `_align_to_input_extrinsics_intrinsics` in third_party/.../api.py). Handing it
+    and `_align_to_input_extrinsics_intrinsics` in Utilities/third_party/.../api.py). Handing it
     raw ARCore c2w poses instead measured 5-30 cm adjacent-view disagreement and a ~5x
     oversized scene, against 0.7-1.5 cm once converted.
     """
@@ -97,12 +97,16 @@ class DepthPriorEstimator:
         min_depth: float = 0.2,
         max_depth: float = 15.0,
         max_invalid_depth_frac: float = 0.05,
+        process_res: int = 504,
+        process_res_method: str = "upper_bound_resize",
     ):
         self.model_name = model_name
         self.use_fp16 = use_fp16
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.max_invalid_depth_frac = max_invalid_depth_frac
+        self.process_res = process_res
+        self.process_res_method = process_res_method
 
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -124,12 +128,6 @@ class DepthPriorEstimator:
         # NaN or absurd (median 2.4e5 m), and combined with the warm-up below the HIP
         # queue aborts with HSA_STATUS_ERROR_ILLEGAL_INSTRUCTION. Upstream DA3's cli.py
         # and gradio_app.py set it unconditionally — don't import those entry points.
-
-        if torch.cuda.is_available():
-            try:
-                torch.cuda.set_per_process_memory_fraction(0.85, 0)
-            except Exception:
-                pass
 
         # 1. Try Depth Anything 3 (Multi-view / Nested Giant)
         try:
@@ -289,19 +287,27 @@ class DepthPriorEstimator:
     ) -> tuple[list[np.ndarray], Optional[list[np.ndarray]]]:
         """Estimate multi-view geometrically consistent depth maps and confidence maps.
 
-        `extrinsics` are ARCore/OpenGL camera-to-world poses, as carried by
-        `Keyframe.transform_matrix`; they are converted to DA3's OpenCV
-        world-to-camera convention here, at the one point every caller funnels through.
+        `extrinsics` are OpenCV **world-to-camera** poses -- exactly what DA3 wants,
+        and exactly what COLMAP stores. The pipeline runs a COLMAP pass before depth
+        estimation (see `02_depth_estimation/colmap_poses_to_da3.py`), so poses arrive
+        already in the right convention and no conversion happens here.
+
+        Callers holding raw ARCore/OpenGL camera-to-world poses (as carried by
+        `Keyframe.transform_matrix`) must convert first with
+        `arcore_c2w_to_da3_w2c()`; passing a c2w through unconverted is the
+        documented 5-30 cm / ~5x-oversized-scene failure mode.
         """
         if self._use_da3 and self._da3_model is not None:
             try:
-                w2c = arcore_c2w_to_da3_w2c(extrinsics) if extrinsics is not None else None
+                w2c = np.asarray(extrinsics, dtype=np.float32) if extrinsics is not None else None
                 with torch.inference_mode():
                     pred = self._da3_model.inference(
                         list(images),
                         extrinsics=w2c,
                         intrinsics=intrinsics,
                         align_to_input_ext_scale=True,
+                        process_res=getattr(self, "process_res", 756),
+                        process_res_method=getattr(self, "process_res_method", "upper_bound_resize"),
                     )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -358,6 +364,7 @@ class DepthPriorEstimator:
         overlap: int = 2,
         cache_dir: Optional[Union[str, Path]] = None,
         progress_callback: Optional[Any] = None,
+        process_res: Optional[int] = None,
     ) -> tuple[list[np.ndarray], Optional[list[np.ndarray]], Optional[list[np.ndarray]]]:
         """Estimate multi-view geometrically consistent depth maps across long sequences
 
@@ -371,11 +378,15 @@ class DepthPriorEstimator:
             overlap: Overlap K between adjacent chunks (default: 2; can be set to 3 for median ensembling).
             cache_dir: Optional directory to cache and resume intermediate chunk predictions.
             progress_callback: Optional callable(chunk_idx, total_chunks) -> None.
+            process_res: Optional resolution override for DA3 inference (e.g. 504, 1008, 1920).
 
         Returns:
             Tuple of (fused_depths, fused_confs, uncertainty_maps).
         """
         import gc
+        if process_res is not None:
+            self.process_res = process_res
+
         m_total = len(images)
         if m_total == 0:
             return [], None, None
@@ -403,11 +414,11 @@ class DepthPriorEstimator:
         if cache_path is not None:
             cache_path.mkdir(parents=True, exist_ok=True)
 
-        # Compute sequence identity hash to prevent stale cache collisions across different keyframe selections
+        # Compute sequence identity hash to prevent stale cache collisions across different keyframe selections or resolutions
         if extrinsics is not None:
-            seq_sig = np.ascontiguousarray(extrinsics[:, :3, 3].astype(np.float32)).tobytes()
+            seq_sig = np.ascontiguousarray(extrinsics[:, :3, 3].astype(np.float32)).tobytes() + f"_res{self.process_res}".encode()
         else:
-            seq_sig = f"{m_total}_{chunk_size}_{overlap}".encode()
+            seq_sig = f"{m_total}_{chunk_size}_{overlap}_res{self.process_res}".encode()
         seq_hash = hashlib.md5(seq_sig).hexdigest()[:8]
 
         num_chunks = len(windows)
@@ -455,13 +466,13 @@ class DepthPriorEstimator:
                         for i in range(len(c_list)):
                             if c_list[i] is not None:
                                 save_dict[f"conf_{i}"] = c_list[i]
-                    np.savez_compressed(chunk_cache_file, **save_dict)
+                    np.savez(chunk_cache_file, **save_dict)
 
-                # Compositor safety: empty PyTorch cache and yield execution
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                time.sleep(0.18)
+                # Periodic GPU memory cleanup
+                if (c_idx + 1) % 25 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             if progress_callback:
                 progress_callback(c_idx + 1, num_chunks)
@@ -511,7 +522,10 @@ class DepthPriorEstimator:
             fused_depths.append(np.clip(f_d, self.min_depth, self.max_depth))
             uncertainties.append(u_d)
 
-            if has_any_conf and len(confs) > 0:
+            if has_any_conf:
+                # Always append once per frame -- fused_confs must stay index-aligned
+                # with fused_depths, even for a frame whose windows all returned no
+                # confidence, or every later frame silently pairs with the wrong map.
                 valid_c = [c for c in confs if c is not None]
                 if valid_c:
                     fused_confs.append(np.mean(np.stack(valid_c, axis=0), axis=0).astype(np.float32))
@@ -524,9 +538,13 @@ class DepthPriorEstimator:
         """Estimate metric depth map (H, W) in meters from an RGB image array (H, W, 3)."""
         h, w = image_rgb.shape[:2]
 
-        if self._use_da3 and self._da3_model is not None:
+        if getattr(self, "_use_da3", False) and getattr(self, "_da3_model", None) is not None:
             try:
-                pred = self._da3_model.inference([image_rgb])
+                pred = self._da3_model.inference(
+                    [image_rgb],
+                    process_res=getattr(self, "process_res", 756),
+                    process_res_method=getattr(self, "process_res_method", "upper_bound_resize"),
+                )
                 d = pred.depth[0]
                 if d.shape != (h, w):
                     d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -536,10 +554,10 @@ class DepthPriorEstimator:
             except Exception:
                 pass
 
-        if not self._is_mock and self._model is not None:
+        if not getattr(self, "_is_mock", True) and getattr(self, "_model", None) is not None:
             try:
                 inputs = self._processor(images=image_rgb, return_tensors="pt").to(self.device)
-                if self.use_fp16 and self.device != "cpu":
+                if getattr(self, "use_fp16", False) and self.device != "cpu":
                     inputs = {k: v.half() if v.dtype == torch.float32 else v for k, v in inputs.items()}
                 with torch.no_grad():
                     outputs = self._model(**inputs)
@@ -569,6 +587,76 @@ class DepthPriorEstimator:
         depth = base_depth + 0.3 * (1.0 - smooth)
 
         return np.clip(depth, self.min_depth, self.max_depth).astype(np.float32)
+
+
+def guided_filter_depth(
+    depth_map: np.ndarray,
+    rgb_guide: np.ndarray,
+    radius: int = 5,
+    eps: float = 1e-3,
+    min_depth: float = 0.2,
+    max_depth: float = 15.0,
+) -> np.ndarray:
+    """Fast RGB-guided depth filtering to align depth edges to color contours
+
+    and smooth planar surface ripples using an O(1) box-filter implementation.
+    """
+    if depth_map.ndim != 2:
+        raise ValueError(f"depth_map must be 2D, got shape {depth_map.shape}")
+
+    h, w = depth_map.shape
+    if rgb_guide.ndim == 3:
+        if rgb_guide.shape[:2] != (h, w):
+            rgb_guide = cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_LINEAR)
+        guide_gray = cv2.cvtColor(rgb_guide, cv2.COLOR_RGB2GRAY)
+    else:
+        if rgb_guide.shape != (h, w):
+            rgb_guide = cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_LINEAR)
+        guide_gray = rgb_guide
+
+    if guide_gray.dtype == np.uint8:
+        guide_f = guide_gray.astype(np.float32) / 255.0
+    else:
+        guide_f = guide_gray.astype(np.float32)
+        if guide_f.max() > 1.0:
+            guide_f = guide_f / 255.0
+
+    d_f = depth_map.astype(np.float32)
+    invalid_mask = ~np.isfinite(d_f) | (d_f <= 0.0)
+    if np.all(invalid_mask):
+        return depth_map
+
+    if np.any(invalid_mask):
+        valid_vals = d_f[~invalid_mask]
+        med = float(np.nanmedian(valid_vals)) if len(valid_vals) > 0 else 2.0
+        d_f = np.nan_to_num(d_f, nan=med, posinf=max_depth, neginf=min_depth)
+
+    ksize = (2 * radius + 1, 2 * radius + 1)
+
+    # Box-filter computations for linear coefficients a and b
+    mean_I = cv2.boxFilter(guide_f, cv2.CV_32F, ksize)
+    mean_p = cv2.boxFilter(d_f, cv2.CV_32F, ksize)
+    mean_Ip = cv2.boxFilter(guide_f * d_f, cv2.CV_32F, ksize)
+    cov_Ip = mean_Ip - mean_I * mean_p
+
+    mean_II = cv2.boxFilter(guide_f * guide_f, cv2.CV_32F, ksize)
+    var_I = mean_II - mean_I * mean_I
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize)
+
+    q = mean_a * guide_f + mean_b
+
+    q = np.clip(q, min_depth, max_depth).astype(np.float32)
+
+    # Preserve original invalid positions if any
+    if np.any(invalid_mask):
+        q[invalid_mask] = depth_map[invalid_mask]
+
+    return q
 
 
 class MetricDepthAligner:
@@ -689,6 +777,59 @@ class MetricDepthAligner:
         rmse = float(np.sqrt(np.mean((a_mat[:, 0] * best_s + best_t - z_gt) ** 2)))
 
         return aligned_depth, best_s, best_t, rmse
+
+
+def anchor_depths_to_sparse_points(
+    depth_maps: Sequence[np.ndarray],
+    keyframes: Sequence[Keyframe],
+    intrinsics: CameraIntrinsics,
+    sparse_points_3d: np.ndarray,
+    min_inliers: int = 8,
+    scale_range: tuple[float, float] = (0.8, 1.25),
+    max_shift_m: float = 0.35,
+) -> tuple[list[np.ndarray], dict[str, float]]:
+    """Anchor dense depth maps against triangulated COLMAP sparse 3D landmarks
+
+    using robust RANSAC scale-shift fitting via MetricDepthAligner.
+    Only updates depth maps whose fitted scale and shift are within plausible bounds
+    with sufficient inlier corroboration.
+    """
+    aligner = MetricDepthAligner()
+    aligned_depths: list[np.ndarray] = []
+    scales: list[float] = []
+    shifts: list[float] = []
+    rmses: list[float] = []
+    anchored_count = 0
+
+    for dmap, kf in zip(depth_maps, keyframes):
+        c2w = kf.transform_matrix
+        aligned, s, t, rmse = aligner.align(
+            mono_depth=dmap,
+            sparse_points_3d=sparse_points_3d,
+            camera_pose_c2w=c2w,
+            intrinsics=intrinsics,
+        )
+        if scale_range[0] <= s <= scale_range[1] and abs(t) <= max_shift_m:
+            aligned_depths.append(aligned)
+            scales.append(s)
+            shifts.append(t)
+            rmses.append(rmse)
+            anchored_count += 1
+        else:
+            aligned_depths.append(dmap)
+            scales.append(1.0)
+            shifts.append(0.0)
+            rmses.append(0.0)
+
+    stats = {
+        "anchored_frames": anchored_count,
+        "total_frames": len(depth_maps),
+        "anchored_fraction": round(anchored_count / max(1, len(depth_maps)), 3),
+        "median_scale": round(float(np.median(scales)), 4),
+        "median_shift_m": round(float(np.median(shifts)), 4),
+        "mean_rmse_m": round(float(np.mean(rmses)), 4),
+    }
+    return aligned_depths, stats
 
 
 def compute_surface_normals(
@@ -864,9 +1005,17 @@ class GlobalDepthGraphOptimizer:
                 R_ji = R_j.T @ R_i
                 t_ji = R_j.T @ (t_i - t_j)
 
-                # Optical flow tracking
-                p0 = cv2.goodFeaturesToTrack(gray_images[i], maxCorners=800, qualityLevel=0.01, minDistance=10)
-                if p0 is None or len(p0) < 10:
+                # Optical flow tracking (combining high-contrast corners + dense floor grid)
+                p0_corners = cv2.goodFeaturesToTrack(gray_images[i], maxCorners=600, qualityLevel=0.01, minDistance=10)
+                grid_v, grid_u = np.mgrid[int(h * 0.60):int(h * 0.90):18, int(w * 0.15):int(w * 0.85):25]
+                p0_floor = np.column_stack([grid_u.ravel(), grid_v.ravel()]).astype(np.float32).reshape(-1, 1, 2)
+
+                if p0_corners is not None and len(p0_corners) > 0:
+                    p0 = np.vstack([p0_corners, p0_floor])
+                else:
+                    p0 = p0_floor
+
+                if len(p0) < 10:
                     continue
 
                 p1, st, _ = cv2.calcOpticalFlowPyrLK(gray_images[i], gray_images[j], p0, None, winSize=(21, 21), maxLevel=3)
@@ -977,11 +1126,35 @@ class GlobalDepthGraphOptimizer:
                 if loop_count >= 8:
                     num_loop_edges += 1
 
-        # 3. Anchor Frame 0 Constraint (s_0 = 1.0, t_0 = 0.0)
+        # 3. Global Ground-Plane Prior Constraints (locks floor height to common horizontal plane)
+        cam_y = translations[:, 1]
+        estimated_floor_y = float(np.median(cam_y) - 1.45)
+        floor_w = 1.0
+
+        for k in range(n_frames):
+            R_k = poses[k][:3, :3]
+            t_k = poses[k][:3, 3]
+            d_map = raw_depth_maps[k]
+
+            for v_f in np.linspace(h * 0.70, h * 0.90, 5).astype(int):
+                for u_f in np.linspace(w * 0.20, w * 0.80, 5).astype(int):
+                    r_k = np.array([(u_f - cx) / fx, -(v_f - cy) / fy, -1.0])
+                    ray_world = R_k @ r_k
+                    if ray_world[1] < -0.20:
+                        d_plane = float((estimated_floor_y - t_k[1]) / ray_world[1])
+                        obs_d = float(d_map[v_f, u_f])
+                        if 0.4 < obs_d < 8.0 and abs(obs_d - d_plane) < 0.40:
+                            rows.extend([row_idx, row_idx])
+                            cols.extend([2 * k, 2 * k + 1])
+                            data.extend([float(floor_w * obs_d), float(floor_w * 1.0)])
+                            b_vec.append(float(floor_w * d_plane))
+                            row_idx += 1
+
+        # 4. Anchor Frame 0 Constraint (s_0 = 1.0, t_0 = 0.0)
         rows.append(row_idx); cols.append(0); data.append(float(self.anchor_weight)); b_vec.append(float(self.anchor_weight * 1.0)); row_idx += 1
         rows.append(row_idx); cols.append(1); data.append(float(self.anchor_weight)); b_vec.append(0.0); row_idx += 1
 
-        # 4. Soft Prior Regularization for all frames
+        # 5. Soft Prior Regularization for all frames
         for k in range(n_frames):
             rows.append(row_idx); cols.append(2 * k); data.append(float(self.reg_scale_weight)); b_vec.append(float(self.reg_scale_weight * 1.0)); row_idx += 1
             rows.append(row_idx); cols.append(2 * k + 1); data.append(float(self.reg_shift_weight)); b_vec.append(0.0); row_idx += 1

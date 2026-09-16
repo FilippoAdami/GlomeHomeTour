@@ -122,7 +122,7 @@ class QualityGate:
     def __init__(
         self,
         blur_threshold: Optional[float] = None,     # optional absolute detail floor
-        relative_blur_threshold: float = 0.45,      # fraction of scene-median sharpness
+        relative_blur_threshold: float = 0.35,      # fraction of scene-median sharpness
         max_reject_fraction: float = 0.20,          # safety valve, see _apply_reject_cap
         dark_threshold: float = 12.0,               # mean luminance floor
         blown_threshold: float = 250.0,             # mean luminance ceiling

@@ -46,7 +46,7 @@ Guidance and project rules for Antigravity when working in the GlomeHomeTour cod
    - Any backend output must validate against `shared/schemas/*.schema.json` via `python shared/schemas/validate.py`.
    - Never break field types or naming in `transforms.json`, `trajectory.csv`, `coverage_summary.json`, `floorplan.json`, `panorama_manifest.json`, or `asset_manifest.json`.
 4. **Per-Folder Project History:**
-   - Actively iterated subfolders (e.g. `backend/reconstruction/`, `mobile/`, `shared/schemas/`) maintain a `project_history.md`. Append entries upon completing macro milestones.
+   - Actively iterated subfolders (e.g. `backend/03_2DGS_training/`, `mobile/`, `shared/schemas/`) maintain a `project_history.md`. Append entries upon completing macro milestones.
 5. **Subagents & Model Routing:**
    - Use `research` subagents for extensive file searches and broad codebase queries.
    - Escalate to higher-reasoning models for HIP kernel wavefront/LDS memory tuning, SfM bundle adjustment math, and 2DGS density control algorithms.

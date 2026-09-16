@@ -196,7 +196,7 @@ Standardizing on a guided video walkthrough allows clear feature separation base
   - Room depth horizon is dynamically derived per scan using statistical surface distribution ($Q_{0.98} + 1.5 \cdot \text{MAD}$), auto-scaling from compact rooms ($4.13\text{m}$ for bedroom) to grand hotel lobbies ($25\text{m}+$) without any hardcoded thresholds.
 - **Occlusion-Aware Multi-View Consensus (`min_consensus=1`):**
   - Prunes floating artifacts and non-surface rays by reprojecting 3D points into neighboring camera frustums, while safely preserving uniquely viewed ceiling and corner patches to guarantee continuous, hole-free reconstructions.
-- **Native ROCm/HIP 2DGS Material & Density Training Pipeline (`backend/reconstruction/`):**
+- **Native ROCm/HIP 2DGS Material & Density Training Pipeline (`backend/03_2DGS_training/`):**
   - Hand-authored C++/HIP differentiable 2DGS rasterizer (`rasterizer_hip`) leveraging AMD RDNA4 Wave32 SIMD execution and LDS shared memory caching, reducing per-step training time from $>1500\text{ms}$ to $\approx 27\text{ms}-80\text{ms}$ and bounding VRAM under $1.5\text{ GB}$.
   - **4-Stage Progressive Multi-Scale Schedule:** 270p (warmup, iters 1–200) $\to$ 540p (structural densification, iters 201–700) $\to$ 720p (material separation, iters 701–1500) $\to$ 1080p native (specular roughness & fine details, iters 1501–3000).
   - **MLS-Compliant Compressed Bundle & Canonical 3DGS PLY:** Serializes LightGaussian-compressed `walkthrough_2dgs.zip` ($\le 25\text{ MB}$ payload limit) and canonical standard 3DGS PLY (`bedroom_standard_3dgs.ply`) for immediate browser/SuperSplat inspection.
@@ -223,5 +223,5 @@ When adding new research papers, mathematical techniques, or open-source depende
 * **Academic Papers:** Add to `bibliography/papers.md` using the standard layout: `Title (Year) [Venue] - Authors`, followed by a 1-paragraph description, a 1-paragraph Glome usage breakdown, and an ArXiv/web link.
 * **Techniques:** Add to `bibliography/Techniques.md` under `Active & Integrated` if incorporated into source code, or under `Evaluated & Compared` with a `**` prefix if tested as a benchmark/alternative.
 * **Projects & Libraries:** Add to `bibliography/Projects.md` with official repository links and a justification paragraph detailing why the library was selected over alternatives.
-* **Contract Integrity:** Keep references synchronized with `project_history.md` logs in active subsystem folders (`mobile/android/`, `backend/ingestion/`, `backend/reconstruction/`).
+* **Contract Integrity:** Keep references synchronized with `project_history.md` logs in active subsystem folders (`mobile/android/`, `backend/00_ingestion/`, `backend/03_2DGS_training/`).
 

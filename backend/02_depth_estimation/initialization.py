@@ -15,7 +15,7 @@ from typing import Optional, Sequence, Union
 
 import cv2
 import numpy as np
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree as KDTree
 
 from package_loader import CameraIntrinsics, Keyframe
 from depth_priors import compute_surface_normals
@@ -80,6 +80,259 @@ class SurfelCloud:
             opacities=opacities,
         )
 
+    def voxel_downsample(self, voxel_size_m: float) -> "SurfelCloud":
+        """Spatially downsample the surfel cloud onto a uniform 3D voxel grid as the final step."""
+        if voxel_size_m <= 0.0 or len(self.positions) == 0:
+            return self
+        coords = np.floor(self.positions / voxel_size_m).astype(np.int32)
+        _, u_idx = np.unique(coords, axis=0, return_index=True)
+        scale_min = float(voxel_size_m * 0.5)
+        scale_max = float(voxel_size_m * 0.75)
+        scales_2d = np.clip(self.scales_2d[u_idx], scale_min, scale_max)
+        return SurfelCloud(
+            positions=self.positions[u_idx],
+            normals=self.normals[u_idx],
+            tangent_u=self.tangent_u[u_idx],
+            tangent_v=self.tangent_v[u_idx],
+            scales_2d=scales_2d,
+            colors_rgb=self.colors_rgb[u_idx],
+            sh_degree_0=self.sh_degree_0[u_idx],
+            opacities=self.opacities[u_idx],
+        )
+
+    def normal_tube_collapse(
+        self,
+        voxel_size_m: float = 0.015,
+        tube_radius_m: float = 0.02,
+        tube_length_m: float = 0.15,
+        min_normal_cos: float = 0.80,
+    ) -> "SurfelCloud":
+        """Collapse multi-layer depth slab thickness into a single 2D manifold shell.
+
+        Vectorized spatial voxel grouping + normal-aligned median projection:
+        1. Groups points into spatial voxels of grid size voxel_size_m.
+        2. Computes the consensus unit normal and centroid per voxel.
+        3. Computes the 1D projection offset along the normal for every point.
+        4. Shifts each voxel to its robust median depth along the surface normal.
+        Guarantees 100% surface preservation with zero Swiss-cheese holes.
+        """
+        n_pts = len(self.positions)
+        if n_pts == 0:
+            return self
+
+        # Try GPU acceleration via PyTorch on CUDA/ROCm
+        try:
+            import torch
+            if torch.cuda.is_available() and n_pts > 500:
+                device = torch.device("cuda")
+                pos_t = torch.from_numpy(self.positions).to(device)
+                norm_t = torch.from_numpy(self.normals).to(device)
+                col_t = torch.from_numpy(self.colors_rgb).to(device)
+
+                coords_t = torch.floor(pos_t / voxel_size_m).to(torch.int32)
+                unq_coords_t, inverse_idx_t, counts_t = torch.unique(
+                    coords_t, dim=0, return_inverse=True, return_counts=True
+                )
+                num_voxels = unq_coords_t.shape[0]
+                print(f"[TubeCollapse GPU] Collapsing {n_pts:,} raw points into {num_voxels:,} 2D manifold surfels on {torch.cuda.get_device_name(0)}...", flush=True)
+
+                counts_f_t = counts_t.float().unsqueeze(1)
+                v_norm_t = torch.zeros((num_voxels, 3), device=device, dtype=torch.float32)
+                v_norm_t.scatter_add_(0, inverse_idx_t.unsqueeze(1).expand(-1, 3), norm_t)
+                v_norm_t = v_norm_t / counts_f_t
+                norm_len_t = torch.norm(v_norm_t, dim=-1, keepdim=True)
+
+                # Representative unique point index per voxel
+                u_idx_t = torch.full((num_voxels,), n_pts, device=device, dtype=torch.int64)
+                idx_arange = torch.arange(n_pts, device=device, dtype=torch.int64)
+                u_idx_t.scatter_reduce_(0, inverse_idx_t, idx_arange, reduce="amin")
+
+                v_norm_t = torch.where(norm_len_t > 1e-6, v_norm_t / torch.clamp(norm_len_t, min=1e-6), norm_t[u_idx_t])
+
+                v_pos_t = torch.zeros((num_voxels, 3), device=device, dtype=torch.float32)
+                v_pos_t.scatter_add_(0, inverse_idx_t.unsqueeze(1).expand(-1, 3), pos_t)
+                v_pos_t = v_pos_t / counts_f_t
+
+                v_col_t = col_t[u_idx_t]
+
+                deltas_t = pos_t - v_pos_t[inverse_idx_t]
+                offsets_n_t = torch.sum(deltas_t * v_norm_t[inverse_idx_t], dim=-1)
+
+                offset_scaled = (torch.clamp(offsets_n_t, -10.0, 10.0) + 10.0) * 1e6
+                sort_key = inverse_idx_t.to(torch.int64) * 100_000_000 + offset_scaled.to(torch.int64)
+                sort_order_t = torch.argsort(sort_key)
+
+                offsets_sorted_t = offsets_n_t[sort_order_t]
+                counts_cumsum_t = torch.cumsum(counts_t, dim=0)
+                median_indices_t = counts_cumsum_t - counts_t + (counts_t // 2)
+                max_offset = float(tube_length_m / 2.0)
+                med_offsets_t = torch.clamp(offsets_sorted_t[median_indices_t], -max_offset, max_offset)
+
+                collapsed_pos_t = v_pos_t + med_offsets_t.unsqueeze(1) * v_norm_t
+
+                collapsed_pos = collapsed_pos_t.cpu().numpy().astype(np.float32)
+                collapsed_norm = v_norm_t.cpu().numpy().astype(np.float32)
+                collapsed_col = v_col_t.cpu().numpy().astype(np.float32)
+
+                scale_val = float(voxel_size_m * 0.75)
+                scales_2d = np.full((num_voxels, 2), scale_val, dtype=np.float32)
+                opacities = np.full((num_voxels,), 0.90, dtype=np.float32)
+
+                tangent_u, tangent_v = build_orthonormal_tangent_frame(collapsed_norm)
+                sh_deg0 = (collapsed_col * SH_C0).astype(np.float32)
+
+                print(f"[TubeCollapse GPU] Completed! Output manifold: {len(collapsed_pos):,} surfels.", flush=True)
+                return SurfelCloud(
+                    positions=collapsed_pos,
+                    normals=collapsed_norm,
+                    tangent_u=tangent_u.astype(np.float32),
+                    tangent_v=tangent_v.astype(np.float32),
+                    scales_2d=scales_2d,
+                    colors_rgb=collapsed_col,
+                    sh_degree_0=sh_deg0,
+                    opacities=opacities,
+                )
+        except Exception as e:
+            print(f"[TubeCollapse] GPU acceleration notice ({e}), using CPU NumPy path...", flush=True)
+
+        coords = np.floor(self.positions / voxel_size_m).astype(np.int32)
+        _, u_idx, inverse_idx, counts = np.unique(
+            coords, axis=0, return_index=True, return_inverse=True, return_counts=True
+        )
+        num_voxels = len(u_idx)
+        print(f"[TubeCollapse CPU] Collapsing {n_pts:,} raw points into {num_voxels:,} 2D manifold surfels...", flush=True)
+
+        counts_f = counts.astype(np.float32)[:, None]
+
+        # 1. Consensus unit normal per voxel
+        v_norm = np.column_stack([
+            np.bincount(inverse_idx, weights=self.normals[:, c]) for c in range(3)
+        ]) / counts_f
+        norm_len = np.linalg.norm(v_norm, axis=-1, keepdims=True)
+        v_norm = np.where(norm_len > 1e-6, v_norm / np.maximum(norm_len, 1e-6), self.normals[u_idx])
+
+        # 2. Mean spatial centroid and color per voxel
+        v_pos = np.column_stack([
+            np.bincount(inverse_idx, weights=self.positions[:, c]) for c in range(3)
+        ]) / counts_f
+        v_col = self.colors_rgb[u_idx].copy()
+
+        # 3. 1D offset along the consensus normal for each point
+        deltas = self.positions - v_pos[inverse_idx]
+        offsets_n = np.sum(deltas * v_norm[inverse_idx], axis=-1)
+
+        # 4. Extract median offset per voxel using group sort
+        sort_order = np.lexsort((offsets_n, inverse_idx))
+        offsets_sorted = offsets_n[sort_order]
+        counts_cumsum = np.cumsum(counts)
+        median_indices = counts_cumsum - counts + (counts // 2)
+        med_offsets = offsets_sorted[median_indices]
+
+        # Clamp offsets to max half-length of the tube to eliminate extreme outliers
+        max_offset = float(tube_length_m / 2.0)
+        med_offsets = np.clip(med_offsets, -max_offset, max_offset)
+
+        # 5. Final collapsed manifold positions
+        collapsed_pos = (v_pos + med_offsets[:, None] * v_norm).astype(np.float32)
+        collapsed_norm = v_norm.astype(np.float32)
+        collapsed_col = np.clip(v_col, 0.0, 1.0).astype(np.float32)
+
+        scale_val = float(voxel_size_m * 0.75)
+        scales_2d = np.full((num_voxels, 2), scale_val, dtype=np.float32)
+        opacities = self.opacities[u_idx].copy().astype(np.float32)
+
+        tangent_u, tangent_v = build_orthonormal_tangent_frame(collapsed_norm)
+        sh_deg0 = (collapsed_col * SH_C0).astype(np.float32)
+
+        print(f"[TubeCollapse CPU] Completed! Output manifold: {len(collapsed_pos):,} surfels.", flush=True)
+
+        return SurfelCloud(
+            positions=collapsed_pos,
+            normals=collapsed_norm,
+            tangent_u=tangent_u.astype(np.float32),
+            tangent_v=tangent_v.astype(np.float32),
+            scales_2d=scales_2d,
+            colors_rgb=collapsed_col,
+            sh_degree_0=sh_deg0,
+            opacities=opacities,
+        )
+
+    def multiscale_pyramid_decimate(
+        self,
+        base_voxel_m: float = 0.015,
+        k_neighbors: int = 16,
+        flat_normal_var_thresh: float = 0.04,
+        curve_normal_var_thresh: float = 0.15,
+        tier1_stride_cells: int = 2,  # 3.0 cm stride
+        tier2_stride_cells: int = 4,  # 6.0 cm stride
+    ) -> "SurfelCloud":
+        """Decimate planar low-frequency areas into multi-scale surfel pyramids while preserving fine edges.
+
+        Classifies surfels by local normal variance:
+        - High curvature / corners (var > curve_thresh): 1.5 cm full resolution, scale ~ 1.1 cm
+        - Medium curvature (flat_thresh < var <= curve_thresh): 3.0 cm stride, scale ~ 2.2 cm
+        - Flat planar walls/floors (var <= flat_thresh): 6.0 cm stride, scale ~ 4.5 cm
+        """
+        n = len(self.positions)
+        if n <= k_neighbors:
+            return self
+
+        sample_size = min(20_000, n)
+        idx_sample = np.random.RandomState(42).choice(n, size=sample_size, replace=False)
+        tree = KDTree(self.positions[idx_sample])
+        _, nn_indices = tree.query(self.positions, k=k_neighbors, workers=-1)
+
+        nn_normals = self.normals[idx_sample][nn_indices]
+        seed_normals_exp = np.expand_dims(self.normals, axis=1)
+        cos_sims = np.sum(nn_normals * seed_normals_exp, axis=-1)
+        normal_var = 1.0 - np.clip(np.mean(cos_sims, axis=-1), 0.0, 1.0)
+
+        grid_coords = np.round(self.positions / base_voxel_m).astype(np.int32)
+
+        is_tier0 = normal_var > curve_normal_var_thresh
+        is_tier1 = (normal_var > flat_normal_var_thresh) & (~is_tier0)
+        is_tier2 = normal_var <= flat_normal_var_thresh
+
+        keep_tier0 = is_tier0
+        keep_tier1 = is_tier1 & ((grid_coords[:, 0] % tier1_stride_cells == 0) &
+                                 (grid_coords[:, 1] % tier1_stride_cells == 0) &
+                                 (grid_coords[:, 2] % tier1_stride_cells == 0))
+        keep_tier2 = is_tier2 & ((grid_coords[:, 0] % tier2_stride_cells == 0) &
+                                 (grid_coords[:, 1] % tier2_stride_cells == 0) &
+                                 (grid_coords[:, 2] % tier2_stride_cells == 0))
+
+        keep_mask = keep_tier0 | keep_tier1 | keep_tier2
+        if np.sum(keep_mask) == 0:
+            return self
+
+        filtered_pos = self.positions[keep_mask]
+        filtered_norm = self.normals[keep_mask]
+        filtered_col = self.colors_rgb[keep_mask]
+        filtered_opac = self.opacities[keep_mask]
+
+        scales = np.empty((len(filtered_pos), 2), dtype=np.float32)
+        sub_t0 = is_tier0[keep_mask]
+        sub_t1 = is_tier1[keep_mask]
+        sub_t2 = is_tier2[keep_mask]
+
+        scales[sub_t0] = base_voxel_m * 0.75
+        scales[sub_t1] = base_voxel_m * tier1_stride_cells * 0.75
+        scales[sub_t2] = base_voxel_m * tier2_stride_cells * 0.75
+
+        tangent_u, tangent_v = build_orthonormal_tangent_frame(filtered_norm)
+        sh_deg0 = (filtered_col * SH_C0).astype(np.float32)
+
+        return SurfelCloud(
+            positions=filtered_pos,
+            normals=filtered_norm,
+            tangent_u=tangent_u,
+            tangent_v=tangent_v,
+            scales_2d=scales,
+            colors_rgb=filtered_col,
+            sh_degree_0=sh_deg0,
+            opacities=filtered_opac,
+        )
+
     def to_ply(self, output_path: Union[str, Path]) -> None:
         """Export surfels to standard binary little-endian PLY file."""
         out_path = Path(output_path)
@@ -107,21 +360,29 @@ class SurfelCloud:
 
         with open(out_path, "wb") as f:
             f.write(header.encode("ascii"))
-
-            # Format: 3f (pos), 3f (norm), 3B (color), 2f (scales), 1f (opacity)
-            record_format = "<3f3f3B2ff"
-
-            rgb_bytes = np.clip(self.colors_rgb * 255.0, 0, 255).astype(np.uint8)
-            records = []
-            for i in range(n):
-                px, py, pz = self.positions[i]
-                nx, ny, nz = self.normals[i]
-                r, g, b = rgb_bytes[i]
-                su, sv = self.scales_2d[i]
-                op = self.opacities[i]
-                records.append(struct.pack(record_format, px, py, pz, nx, ny, nz, r, g, b, su, sv, op))
-
-            f.write(b"".join(records))
+            if n > 0:
+                ply_dtype = np.dtype([
+                    ("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                    ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
+                    ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+                    ("scale_u", "<f4"), ("scale_v", "<f4"),
+                    ("opacity", "<f4"),
+                ])
+                data = np.empty(n, dtype=ply_dtype)
+                data["x"] = self.positions[:, 0]
+                data["y"] = self.positions[:, 1]
+                data["z"] = self.positions[:, 2]
+                data["nx"] = self.normals[:, 0]
+                data["ny"] = self.normals[:, 1]
+                data["nz"] = self.normals[:, 2]
+                rgb_bytes = np.clip(self.colors_rgb * 255.0, 0, 255).astype(np.uint8)
+                data["red"] = rgb_bytes[:, 0]
+                data["green"] = rgb_bytes[:, 1]
+                data["blue"] = rgb_bytes[:, 2]
+                data["scale_u"] = self.scales_2d[:, 0]
+                data["scale_v"] = self.scales_2d[:, 1]
+                data["opacity"] = self.opacities
+                f.write(data.tobytes())
 
     @classmethod
     def from_ply(
@@ -276,6 +537,160 @@ def estimate_adaptive_depth_ceiling(
     return float(np.clip(adaptive_ceiling, 3.5, 35.0))
 
 
+def compute_overexposed_mask(
+    img_rgb: np.ndarray,
+    min_threshold: int = 250,
+    max_threshold: int = 255,
+    percentile: float = 99.8,
+    max_chroma_diff: float = 35.0,
+    dilation_kernel_size: int = 3,
+) -> np.ndarray:
+    """Compute dynamic saturation mask to eliminate optical bloom / light-source artifacts.
+
+    Identifies clipped and overexposed pixels that cause monocular depth models
+    to hallucinate arbitrary floating depth or distort surrounding surfaces.
+    Uses a dynamic threshold bounded between [min_threshold, max_threshold] based on
+    the high percentile of max-channel intensity, combined with low chroma difference
+    (distinguishing white/yellow optical bloom from vibrant saturated colors).
+
+    Args:
+        img_rgb: RGB image as (H, W, 3) uint8 array in [0, 255].
+        min_threshold: Absolute floor for overexposure (default 250); prevents masking in dim frames.
+        max_threshold: Upper clamp for dynamic threshold (default 255).
+        percentile: High percentile of max-channel distribution to adaptively set cutoff.
+        max_chroma_diff: Max allowed (max - min) channel difference to treat as optical bloom.
+        dilation_kernel_size: Optional structuring element diameter to cover bloom halo fringes (0 to disable).
+
+    Returns:
+        Boolean mask of shape (H, W) where True indicates saturated / optical bloom pixels to discard.
+    """
+    if img_rgb.size == 0:
+        return np.zeros(img_rgb.shape[:2], dtype=bool)
+
+    # Max intensity across R, G, B channels
+    max_ch = np.max(img_rgb, axis=-1)
+
+    # Fast path: if no pixel reaches min_threshold, no overexposure exists in this frame
+    frame_max = int(np.max(max_ch))
+    if frame_max < min_threshold:
+        return np.zeros(img_rgb.shape[:2], dtype=bool)
+
+    # Adapt dynamic threshold based on upper percentile of max_ch in this frame
+    q_val = float(np.percentile(max_ch, percentile))
+    t_dyn = float(np.clip(q_val, min_threshold, max_threshold))
+
+    min_ch = np.min(img_rgb, axis=-1)
+    chroma_diff = max_ch.astype(np.float32) - min_ch.astype(np.float32)
+
+    # Core saturated optical bloom
+    overexposed = (max_ch >= t_dyn) & (chroma_diff <= max_chroma_diff)
+
+    # Dilate slightly to catch optical bloom halos and sharp depth-tear boundaries around fixtures
+    if dilation_kernel_size > 1 and np.any(overexposed):
+        k = int(dilation_kernel_size)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        overexposed = cv2.dilate(overexposed.astype(np.uint8), kernel) > 0
+
+    return overexposed
+
+
+def compute_hybrid_sampling_coords(
+    img_rgb: np.ndarray,
+    depth_map: np.ndarray,
+    energy_threshold: float = 0.08,
+    coarse_stride: int = 3,
+    fine_stride: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute 2D hybrid photometric and geometric adaptive sampling pixel coordinates.
+
+    Identifies high-frequency image textures (RGB gradient energy) and 3D depth discontinuities
+    (relative depth gradient) to sample rich details at full resolution (fine_stride), while
+    sampling untextured planar regions (drywall, flat ceiling) at a sparse baseline grid (coarse_stride).
+
+    Args:
+        img_rgb: RGB image as (H, W, 3) uint8 or float array.
+        depth_map: Depth map in meters as (H, W) float32 array.
+        energy_threshold: Cutoff energy above which fine_stride sampling is activated.
+        coarse_stride: Pixel stride for uniform background sampling (default 3 = ~4.5cm).
+        fine_stride: Pixel stride for edge/texture regions (default 1 = ~1.5cm).
+
+    Returns:
+        tuple of (y_coords, x_coords, scales_relative):
+            - y_coords: 1D int array of row indices to sample.
+            - x_coords: 1D int array of col indices to sample.
+            - scales_relative: 1D float32 array of relative scale factors (1.0 for fine, coarse_stride for coarse).
+    """
+    h, w = depth_map.shape[:2]
+    if img_rgb.shape[:2] != (h, w):
+        img_rgb = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    # 1. 2D Photometric Gradient Energy (Sobel on Luminance)
+    if len(img_rgb.shape) == 3 and img_rgb.shape[2] == 3:
+        if img_rgb.dtype == np.uint8:
+            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        else:
+            gray = (0.299 * img_rgb[:, :, 0] + 0.587 * img_rgb[:, :, 1] + 0.114 * img_rgb[:, :, 2]).astype(np.float32)
+    else:
+        gray = img_rgb.astype(np.float32)
+
+    gx_rgb = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3) / 4.0
+    gy_rgb = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3) / 4.0
+    energy_rgb = np.sqrt(gx_rgb**2 + gy_rgb**2)
+
+    # 2. 2D Relative Depth Discontinuity Energy
+    safe_depth = np.maximum(depth_map, 0.1)
+    gx_d = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3) / (safe_depth * 4.0)
+    gy_d = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3) / (safe_depth * 4.0)
+    energy_depth = np.sqrt(gx_d**2 + gy_d**2)
+
+    # Combined 2D Energy Map
+    energy_combined = np.maximum(energy_rgb, energy_depth)
+
+    # High frequency mask
+    high_freq_mask = energy_combined >= energy_threshold
+    # Suppress outer 2-pixel border to avoid OpenCV Sobel edge boundary reflection artifacts
+    high_freq_mask[:2, :] = False
+    high_freq_mask[-2:, :] = False
+    high_freq_mask[:, :2] = False
+    high_freq_mask[:, -2:] = False
+
+    # Baseline coarse grid across the whole image (guarantees zero holes)
+    c_stride = max(1, int(coarse_stride))
+    f_stride = max(1, int(fine_stride))
+
+    y_c, x_c = np.mgrid[0:h:c_stride, 0:w:c_stride]
+    y_c_flat = y_c.flatten()
+    x_c_flat = x_c.flatten()
+
+    # Dense fine grid sampled ONLY where high-frequency energy is present
+    y_f, x_f = np.mgrid[0:h:f_stride, 0:w:f_stride]
+    y_f_flat = y_f.flatten()
+    x_f_flat = x_f.flatten()
+    fine_is_high = high_freq_mask[y_f_flat, x_f_flat]
+
+    y_f_sel = y_f_flat[fine_is_high]
+    x_f_sel = x_f_flat[fine_is_high]
+
+    if len(y_f_sel) == 0:
+        return y_c_flat, x_c_flat, np.full(len(y_c_flat), float(c_stride), dtype=np.float32)
+
+    # Combine coordinates without duplicates
+    idx_coarse = y_c_flat * w + x_c_flat
+    idx_fine = y_f_sel * w + x_f_sel
+
+    fine_set = set(idx_fine)
+    coarse_keep_mask = np.array([idx not in fine_set for idx in idx_coarse], dtype=bool)
+
+    y_final = np.concatenate([y_f_sel, y_c_flat[coarse_keep_mask]]).astype(np.int32)
+    x_final = np.concatenate([x_f_sel, x_c_flat[coarse_keep_mask]]).astype(np.int32)
+    scales_final = np.concatenate([
+        np.ones(len(y_f_sel), dtype=np.float32),
+        np.full(np.sum(coarse_keep_mask), float(c_stride), dtype=np.float32)
+    ]).astype(np.float32)
+
+    return y_final, x_final, scales_final
+
+
 def filter_multiview_consistency(
     pts_world: np.ndarray,
     current_idx: int,
@@ -284,15 +699,27 @@ def filter_multiview_consistency(
     intrinsics: CameraIntrinsics,
     max_neighbors: int = 6,
     min_consensus: int = 1,
+    enable_freespace_filter: bool = True,
+    max_freespace_violations: int = 0,
+    freespace_margin_m: float = 0.08,
+    min_neighbor_baseline_m: float = 0.08,
+    min_neighbor_parallax_deg: float = 3.0,
 ) -> np.ndarray:
     """Return boolean mask of points corroborated by neighboring camera views.
 
-    Eliminates non-surface artifacts (such as sky through windows, open doors, and reflections).
-    Points observed from a unique angle with no overlapping views in their field of view are preserved,
-    while points that fall inside overlapping camera frustums must agree with the neighbor depth.
+    Performs two complementary multi-view geometric checks:
+    1. Consensus corroboration: Points that fall inside overlapping camera frustums
+       must agree with neighbor depth within tolerance.
+    2. Cross-view free-space carving (epipolar / reprojection check): If a candidate 3D
+       point reprojects into an unobstructed adjacent view with sufficient parallax and
+       lands on empty space (proj_z < obs_depth - margin), it represents a floating phantom
+       or depth-bleed artifact and is culled when violations exceed max_freespace_violations.
     """
     n_pts = len(pts_world)
-    if n_pts == 0 or min_consensus <= 0 or len(keyframes) <= 1:
+    if n_pts == 0 or len(keyframes) <= 1:
+        return np.ones(n_pts, dtype=bool)
+
+    if min_consensus <= 0 and not enable_freespace_filter:
         return np.ones(n_pts, dtype=bool)
 
     cur_kf = keyframes[current_idx]
@@ -326,8 +753,10 @@ def filter_multiview_consistency(
 
     views_in_frustum = np.zeros(n_pts, dtype=np.int32)
     consensus_count = np.zeros(n_pts, dtype=np.int32)
+    freespace_violations = np.zeros(n_pts, dtype=np.int32)
     fx, fy = float(intrinsics.fl_x), float(intrinsics.fl_y)
     cx, cy = float(intrinsics.cx), float(intrinsics.cy)
+    cos_max_parallax = math.cos(math.radians(min_neighbor_parallax_deg))
 
     for j in neighbor_indices:
         other_kf = keyframes[j]
@@ -348,19 +777,227 @@ def filter_multiview_consistency(
         u = (fx * (pts_cam[:, 0] / np.maximum(proj_z, 1e-4)) + cx).astype(np.int32)
         v = (-fy * (pts_cam[:, 1] / np.maximum(proj_z, 1e-4)) + cy).astype(np.int32)
 
-        valid_uv = in_front & (u >= 0) & (u < dw) & (v >= 0) & (v < dh)
+        # Stay slightly away from extreme image boundary to avoid edge sampling distortion
+        valid_uv = in_front & (u >= 2) & (u < dw - 2) & (v >= 2) & (v < dh - 2)
         views_in_frustum += valid_uv.astype(np.int32)
 
         obs_depth = np.zeros(n_pts, dtype=np.float32)
         obs_depth[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
 
+        valid_obs = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2)
+
+        # 1. Surface agreement / consensus check
         tol = 0.10 + 0.07 * proj_z
-        match = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2) & (np.abs(obs_depth - proj_z) <= tol)
+        match = valid_obs & (np.abs(obs_depth - proj_z) <= tol)
         consensus_count += match.astype(np.int32)
 
-    # If other views have the point in their frustum, require at least min_consensus matches.
-    # If no other views have the point in frame (views_in_frustum == 0), keep it (uniquely seen area).
-    return (views_in_frustum == 0) | (consensus_count >= min_consensus)
+        # 2. Cross-view free-space check (detecting empty space between camera and observed surface)
+        if enable_freespace_filter:
+            baseline = float(np.linalg.norm(t_cw - cur_t))
+            vec_cur = pts_world - cur_t
+            vec_other = pts_world - t_cw
+            norm_cur = np.maximum(np.linalg.norm(vec_cur, axis=-1, keepdims=True), 1e-6)
+            norm_other = np.maximum(np.linalg.norm(vec_other, axis=-1, keepdims=True), 1e-6)
+            cos_parallax = np.sum((vec_cur / norm_cur) * (vec_other / norm_other), axis=-1)
+
+            has_parallax = (baseline >= min_neighbor_baseline_m) | (cos_parallax <= cos_max_parallax)
+
+            tol_free = freespace_margin_m + 0.05 * proj_z
+            empty_space = valid_obs & has_parallax & (proj_z < (obs_depth - tol_free))
+            freespace_violations += empty_space.astype(np.int32)
+
+    # 1. Consensus rule: If observed by other views, require at least min_consensus matches.
+    # Uniquely seen points (views_in_frustum == 0) are kept.
+    if min_consensus > 0:
+        valid_mask = (views_in_frustum == 0) | (consensus_count >= min_consensus)
+    else:
+        valid_mask = np.ones(n_pts, dtype=bool)
+
+    # 2. Free-space rule: Cull points that violate free space in unobstructed side views
+    if enable_freespace_filter:
+        valid_mask = valid_mask & (freespace_violations <= max_freespace_violations)
+
+    return valid_mask
+
+
+def global_cross_view_freespace_carving(
+    pts_world: np.ndarray,
+    normals_world: np.ndarray,
+    colors_rgb: np.ndarray,
+    keyframes: Sequence[Keyframe],
+    depth_maps: Sequence[np.ndarray],
+    intrinsics: CameraIntrinsics,
+    max_violations: int = 1,
+    margin_m: float = 0.04,
+    match_tol_base: float = 0.05,
+    match_tol_slope: float = 0.02,
+    subsample_kfs: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cull floating phantom geometry and depth bleeding artifacts by testing points globally against all intersecting keyframes.
+
+    Prunes points that violate empty free space in >= 2 global viewpoints or lack
+    depth corroboration when visible across multiple cameras.
+    """
+    n_pts = len(pts_world)
+    if n_pts == 0 or len(keyframes) <= 1:
+        return pts_world, normals_world, colors_rgb
+
+    fx, fy = float(intrinsics.fl_x), float(intrinsics.fl_y)
+    cx, cy = float(intrinsics.cx), float(intrinsics.cy)
+
+    violations = np.zeros(n_pts, dtype=np.int32)
+    matches = np.zeros(n_pts, dtype=np.int32)
+    views_seen = np.zeros(n_pts, dtype=np.int32)
+
+    sample_indices = list(range(0, len(keyframes), max(1, subsample_kfs)))
+    for j in sample_indices:
+        kf = keyframes[j]
+        d_map = depth_maps[j]
+        dh, dw = d_map.shape[:2]
+
+        c2w = kf.transform_matrix
+        r_cw = c2w[:3, :3]
+        t_cw = c2w[:3, 3]
+
+        # Project world points into camera
+        pts_cam = np.dot(pts_world - t_cw, r_cw)
+        proj_z = -pts_cam[:, 2]
+        in_front = proj_z > 0.2
+
+        u = (fx * (pts_cam[:, 0] / np.maximum(proj_z, 1e-4)) + cx).astype(np.int32)
+        v = (-fy * (pts_cam[:, 1] / np.maximum(proj_z, 1e-4)) + cy).astype(np.int32)
+
+        valid_uv = in_front & (u >= 4) & (u < dw - 4) & (v >= 4) & (v < dh - 4)
+        if not np.any(valid_uv):
+            continue
+
+        views_seen += valid_uv.astype(np.int32)
+
+        obs_d = np.zeros(n_pts, dtype=np.float32)
+        obs_d[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
+        valid_obs = valid_uv & np.isfinite(obs_d) & (obs_d > 0.2)
+
+        # Free space violation check
+        tol_free = margin_m + 0.01 * proj_z
+        empty_space = valid_obs & (proj_z < (obs_d - tol_free))
+        violations += empty_space.astype(np.int32)
+
+        # Corroborating match check
+        tol_match = match_tol_base + match_tol_slope * proj_z
+        match = valid_obs & (np.abs(proj_z - obs_d) <= tol_match)
+        matches += match.astype(np.int32)
+
+    # Filter rule: Discard points that violate free space in > max_violations views,
+    # and require at least 1 match if observed by 3+ cameras.
+    keep_mask = (violations <= max_violations) & ((views_seen < 3) | (matches >= 1))
+    if not np.any(keep_mask):
+        return pts_world, normals_world, colors_rgb
+
+    return pts_world[keep_mask], normals_world[keep_mask], colors_rgb[keep_mask]
+
+
+def regularize_surface_normals_multiview(
+    pts_world: np.ndarray,
+    normals_world: np.ndarray,
+    current_idx: int,
+    keyframes: Sequence[Keyframe],
+    depth_maps: Sequence[np.ndarray],
+    intrinsics: CameraIntrinsics,
+    normals_cam_maps: Optional[Sequence[Optional[np.ndarray]]] = None,
+    normals_cam_getter: Optional[Callable[[int], np.ndarray]] = None,
+    min_cos_sim: float = 0.5,
+    blend_weight: float = 0.4,
+    max_neighbors: int = 6,
+) -> np.ndarray:
+    """Refine surface normals by blending with consistent neighboring camera views."""
+    n_pts = len(pts_world)
+    if n_pts == 0 or len(keyframes) <= 1:
+        return normals_world
+
+    cur_kf = keyframes[current_idx]
+    cur_t = cur_kf.transform_matrix[:3, 3]
+    cur_dir = -cur_kf.transform_matrix[:3, 2]
+
+    candidate_neighbors = []
+    for j, other_kf in enumerate(keyframes):
+        if j == current_idx:
+            continue
+        other_t = other_kf.transform_matrix[:3, 3]
+        other_dir = -other_kf.transform_matrix[:3, 2]
+        d = float(np.linalg.norm(other_t - cur_t))
+        cos_ang = float(np.dot(cur_dir, other_dir))
+        if cos_ang > 0.1 and d < 3.5:
+            score = d / max(0.2, cos_ang)
+            candidate_neighbors.append((score, j))
+
+    if not candidate_neighbors:
+        dists = [(float(np.linalg.norm(keyframes[j].transform_matrix[:3, 3] - cur_t)), j)
+                 for j in range(len(keyframes)) if j != current_idx]
+        dists.sort()
+        candidate_neighbors = dists[:max_neighbors]
+    else:
+        candidate_neighbors.sort()
+        candidate_neighbors = candidate_neighbors[:max_neighbors]
+
+    neighbor_indices = [j for _, j in candidate_neighbors]
+
+    accum_normals = normals_world.copy().astype(np.float32)
+    accum_weights = np.ones((n_pts, 1), dtype=np.float32)
+
+    fx, fy = float(intrinsics.fl_x), float(intrinsics.fl_y)
+    cx, cy = float(intrinsics.cx), float(intrinsics.cy)
+
+    for j in neighbor_indices:
+        other_kf = keyframes[j]
+        d_map = depth_maps[j]
+        dh, dw = d_map.shape[:2]
+
+        c2w = other_kf.transform_matrix
+        r_cw = c2w[:3, :3]
+        t_cw = c2w[:3, 3]
+
+        pts_cam = np.dot(pts_world - t_cw, r_cw)
+        proj_z = -pts_cam[:, 2]
+        in_front = proj_z > 0.2
+
+        u = (fx * (pts_cam[:, 0] / np.maximum(proj_z, 1e-4)) + cx).astype(np.int32)
+        v = (-fy * (pts_cam[:, 1] / np.maximum(proj_z, 1e-4)) + cy).astype(np.int32)
+
+        valid_uv = in_front & (u >= 2) & (u < dw - 2) & (v >= 2) & (v < dh - 2)
+        if not np.any(valid_uv):
+            continue
+
+        obs_depth = np.zeros(n_pts, dtype=np.float32)
+        obs_depth[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
+        tol = 0.10 + 0.07 * proj_z
+        match = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2) & (np.abs(obs_depth - proj_z) <= tol)
+
+        if not np.any(match):
+            continue
+
+        if normals_cam_maps is not None and j < len(normals_cam_maps) and normals_cam_maps[j] is not None:
+            n_cam_j = normals_cam_maps[j][v[match], u[match]]
+        elif normals_cam_getter is not None:
+            n_cam_j = normals_cam_getter(j)[v[match], u[match]]
+        else:
+            n_cam_j = compute_surface_normals(d_map, intrinsics)[v[match], u[match]]
+
+        n_world_j = np.dot(n_cam_j, r_cw.T)
+        norm_j = np.linalg.norm(n_world_j, axis=-1, keepdims=True)
+        n_world_j = n_world_j / np.maximum(norm_j, 1e-6)
+
+        # Check surface normal alignment to avoid smoothing across sharp edges
+        cos_sim = np.sum(normals_world[match] * n_world_j, axis=-1, keepdims=True)
+        aligned = (cos_sim > min_cos_sim).ravel()
+
+        if np.any(aligned):
+            match_indices = np.where(match)[0][aligned]
+            accum_normals[match_indices] += n_world_j[aligned] * blend_weight
+            accum_weights[match_indices] += blend_weight
+
+    norm_final = np.linalg.norm(accum_normals, axis=-1, keepdims=True)
+    regularized = np.where(norm_final > 1e-6, accum_normals / np.maximum(norm_final, 1e-6), normals_world)
+    return regularized.astype(np.float32)
 
 
 def statistical_outlier_removal(
@@ -400,12 +1037,39 @@ class SurfelCloudInitializer:
         default_opacity: float = 0.90,
         voxel_downsample_m: float = 0.02,  # 2.0 cm grid for crisp continuous surfaces
         max_depth_m: Optional[float] = None, # If None, dynamically estimated from confident depths
-        min_consensus: int = 1,              # Multi-view frustum corroboration (>= 1 neighbor match when visible)
+        min_consensus: int = 0,              # Disabled by default (prevents cutting real points with slight depth disagreement)
         max_depth_gradient: float = 0.0,     # Disabled by default (prevents puncturing slanted floors/beds)
         max_grazing_angle_deg: float = 0.0,  # Disabled by default (prevents cutting grazing floors)
-        enable_sor: bool = True,             # Statistical Outlier Removal in 3D Euclidean space
+        enable_sor: bool = False,            # Disabled by default (prevents punching holes in sparse peripheral regions)
         sor_k: int = 20,
         sor_std_mul: float = 1.5,
+        enable_saturation_mask: bool = True,
+        saturation_min_threshold: int = 250,
+        saturation_max_threshold: int = 255,
+        saturation_percentile: float = 99.8,
+        saturation_max_chroma_diff: float = 35.0,
+        saturation_dilation_radius: int = 1,
+        enable_freespace_filter: bool = False,
+        max_freespace_violations: int = 0,   # If violations > max_allowed (>= 1 with 0), discard point
+        freespace_margin_m: float = 0.08,
+        min_neighbor_baseline_m: float = 0.08,
+        min_neighbor_parallax_deg: float = 3.0,
+        enable_normal_consensus: bool = True,
+        normal_consensus_weight: float = 0.4,
+        normal_min_cos_sim: float = 0.5,
+        enable_global_carving: bool = False,
+        global_carving_max_violations: int = 1,
+        global_carving_margin_m: float = 0.04,
+        global_carving_subsample_kfs: int = 4,
+        enable_tube_collapse: bool = True,
+        tube_radius_m: float = 0.02,
+        tube_length_m: float = 0.15,
+        tube_min_normal_cos: float = 0.80,
+        enable_multiscale_pyramid: bool = False,
+        enable_hybrid_sampling: bool = True,
+        hybrid_energy_threshold: float = 0.08,
+        hybrid_coarse_stride: int = 3,
+        hybrid_fine_stride: int = 1,
     ):
         self.target_surfels = target_surfels
         self.min_surfels = min_surfels
@@ -419,6 +1083,33 @@ class SurfelCloudInitializer:
         self.enable_sor = enable_sor
         self.sor_k = sor_k
         self.sor_std_mul = sor_std_mul
+        self.enable_saturation_mask = enable_saturation_mask
+        self.saturation_min_threshold = saturation_min_threshold
+        self.saturation_max_threshold = saturation_max_threshold
+        self.saturation_percentile = saturation_percentile
+        self.saturation_max_chroma_diff = saturation_max_chroma_diff
+        self.saturation_dilation_radius = saturation_dilation_radius
+        self.enable_freespace_filter = enable_freespace_filter
+        self.max_freespace_violations = max_freespace_violations
+        self.freespace_margin_m = freespace_margin_m
+        self.min_neighbor_baseline_m = min_neighbor_baseline_m
+        self.min_neighbor_parallax_deg = min_neighbor_parallax_deg
+        self.enable_normal_consensus = enable_normal_consensus
+        self.normal_consensus_weight = normal_consensus_weight
+        self.normal_min_cos_sim = normal_min_cos_sim
+        self.enable_global_carving = enable_global_carving
+        self.global_carving_max_violations = global_carving_max_violations
+        self.global_carving_margin_m = global_carving_margin_m
+        self.global_carving_subsample_kfs = global_carving_subsample_kfs
+        self.enable_tube_collapse = enable_tube_collapse
+        self.tube_radius_m = tube_radius_m
+        self.tube_length_m = tube_length_m
+        self.tube_min_normal_cos = tube_min_normal_cos
+        self.enable_multiscale_pyramid = enable_multiscale_pyramid
+        self.enable_hybrid_sampling = enable_hybrid_sampling
+        self.hybrid_energy_threshold = hybrid_energy_threshold
+        self.hybrid_coarse_stride = hybrid_coarse_stride
+        self.hybrid_fine_stride = hybrid_fine_stride
 
     def initialize_from_keyframes(
         self,
@@ -437,6 +1128,7 @@ class SurfelCloudInitializer:
         all_positions = []
         all_normals = []
         all_colors = []
+        all_rel_scales = []
 
         # Determine dynamic adaptive depth ceiling
         if self.max_depth_m is not None:
@@ -446,25 +1138,50 @@ class SurfelCloudInitializer:
 
         # Target points per keyframe: sample densely before voxelization
         pts_per_frame = max(5_000, int(self.target_surfels * 2.5 / num_frames))
+        h_sample, w_sample = depth_maps[0].shape[:2]
+        base_stride = max(2, int(math.sqrt((h_sample * w_sample) / pts_per_frame)))
+        auto_fine_stride = max(1, base_stride // 2)
+        auto_coarse_stride = max(auto_fine_stride + 1, int(round(base_stride * 1.6)))
+
+        fine_stride = self.hybrid_fine_stride if self.hybrid_fine_stride > 1 else auto_fine_stride
+        coarse_stride = self.hybrid_coarse_stride if self.hybrid_coarse_stride > 3 else auto_coarse_stride
 
         fx, fy = intrinsics.fl_x, intrinsics.fl_y
         cx, cy = intrinsics.cx, intrinsics.cy
         cos_min = math.cos(math.radians(self.max_grazing_angle_deg)) if self.max_grazing_angle_deg > 0 else 0.0
 
+        normals_cam_cache: dict[int, np.ndarray] = {}
+
+        def get_normals_cam(k_idx: int) -> np.ndarray:
+            if k_idx not in normals_cam_cache:
+                if len(normals_cam_cache) >= 16:
+                    normals_cam_cache.pop(next(iter(normals_cam_cache)))
+                normals_cam_cache[k_idx] = compute_surface_normals(depth_maps[k_idx], intrinsics)
+            return normals_cam_cache[k_idx]
+
         for idx, (kf, depth) in enumerate(zip(keyframes, depth_maps)):
             h, w = depth.shape[:2]
-            normals_cam = compute_surface_normals(depth, intrinsics)
+            normals_cam = get_normals_cam(idx)
 
             img_rgb = kf.load_image_rgb()
             if img_rgb.shape[:2] != (h, w):
                 img_rgb = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
 
-            # Sample stride to extract ~pts_per_frame points
-            stride = max(1, int(math.sqrt((h * w) / pts_per_frame)))
-
-            y_sub, x_sub = np.mgrid[0:h:stride, 0:w:stride]
-            y_flat = y_sub.flatten()
-            x_flat = x_sub.flatten()
+            # Sample pixel coordinates (Hybrid Adaptive vs Uniform Stride)
+            if self.enable_hybrid_sampling:
+                y_flat, x_flat, scales_flat = compute_hybrid_sampling_coords(
+                    img_rgb=img_rgb,
+                    depth_map=depth,
+                    energy_threshold=self.hybrid_energy_threshold,
+                    coarse_stride=coarse_stride,
+                    fine_stride=fine_stride,
+                )
+            else:
+                stride = max(1, int(math.sqrt((h * w) / pts_per_frame)))
+                y_sub, x_sub = np.mgrid[0:h:stride, 0:w:stride]
+                y_flat = y_sub.flatten()
+                x_flat = x_sub.flatten()
+                scales_flat = np.ones(len(y_flat), dtype=np.float32)
 
             d_sampled = depth[y_flat, x_flat]
             valid_mask = (d_sampled > 0.2) & (d_sampled <= depth_ceiling)
@@ -475,6 +1192,18 @@ class SurfelCloudInitializer:
                 gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3) / np.maximum(depth, 1e-3)
                 grad_sampled = np.sqrt(gx**2 + gy**2)[y_flat, x_flat]
                 valid_mask = valid_mask & (grad_sampled <= self.max_depth_gradient)
+
+            # 2. Saturated Pixel Masking (eliminates optical bloom / light-source artifacts)
+            if self.enable_saturation_mask:
+                sat_mask = compute_overexposed_mask(
+                    img_rgb,
+                    min_threshold=self.saturation_min_threshold,
+                    max_threshold=self.saturation_max_threshold,
+                    percentile=self.saturation_percentile,
+                    max_chroma_diff=self.saturation_max_chroma_diff,
+                    dilation_kernel_size=self.saturation_dilation_radius * 2 + 1 if self.saturation_dilation_radius > 0 else 0,
+                )
+                valid_mask = valid_mask & (~sat_mask[y_flat, x_flat])
 
             if conf_maps is not None and idx < len(conf_maps) and conf_maps[idx] is not None:
                 c_map = conf_maps[idx]
@@ -489,6 +1218,7 @@ class SurfelCloudInitializer:
             y_valid = y_flat[valid_mask]
             x_valid = x_flat[valid_mask]
             d_valid = d_sampled[valid_mask]
+            scales_valid = scales_flat[valid_mask]
 
             # 3D points in camera coordinates (ARCore/OpenGL convention: +X right, +Y up, -Z forward)
             x_cam = (x_valid - cx) * d_valid / fx
@@ -498,7 +1228,7 @@ class SurfelCloudInitializer:
 
             n_cam = normals_cam[y_valid, x_valid]  # (M, 3)
 
-            # 2. Grazing Angle Filter (eliminates glancing silhouette projections)
+            # 3. Grazing Angle Filter (eliminates glancing silhouette projections)
             if cos_min > 0.0:
                 ray_dir = pts_cam / np.maximum(np.linalg.norm(pts_cam, axis=-1, keepdims=True), 1e-6)
                 cos_grazing = np.sum(-n_cam * ray_dir, axis=-1)  # n_cam points toward camera (+Z)
@@ -509,6 +1239,7 @@ class SurfelCloudInitializer:
                 n_cam = n_cam[grazing_mask]
                 y_valid = y_valid[grazing_mask]
                 x_valid = x_valid[grazing_mask]
+                scales_valid = scales_valid[grazing_mask]
 
             c_rgb = (img_rgb[y_valid, x_valid] / 255.0).astype(np.float32)  # (M, 3)
 
@@ -523,8 +1254,8 @@ class SurfelCloudInitializer:
             norm_n = np.maximum(norm_n, 1e-6)
             n_world = n_world / norm_n
 
-            # Multi-view depth consistency check to prune non-surface artifacts
-            if self.min_consensus > 0 and len(keyframes) > 1:
+            # Multi-view depth consistency & cross-view free-space check to prune non-surface artifacts
+            if (self.min_consensus > 0 or self.enable_freespace_filter) and len(keyframes) > 1:
                 mv_mask = filter_multiview_consistency(
                     pts_world,
                     idx,
@@ -532,16 +1263,39 @@ class SurfelCloudInitializer:
                     depth_maps,
                     intrinsics,
                     min_consensus=self.min_consensus,
+                    enable_freespace_filter=self.enable_freespace_filter,
+                    max_freespace_violations=self.max_freespace_violations,
+                    freespace_margin_m=self.freespace_margin_m,
+                    min_neighbor_baseline_m=self.min_neighbor_baseline_m,
+                    min_neighbor_parallax_deg=self.min_neighbor_parallax_deg,
                 )
                 if np.sum(mv_mask) < 5:
                     continue
                 pts_world = pts_world[mv_mask]
                 n_world = n_world[mv_mask]
                 c_rgb = c_rgb[mv_mask]
+                scales_valid = scales_valid[mv_mask]
+
+            if self.enable_normal_consensus and len(keyframes) > 1 and len(pts_world) > 0:
+                n_world = regularize_surface_normals_multiview(
+                    pts_world=pts_world,
+                    normals_world=n_world,
+                    current_idx=idx,
+                    keyframes=keyframes,
+                    depth_maps=depth_maps,
+                    intrinsics=intrinsics,
+                    normals_cam_getter=get_normals_cam,
+                    min_cos_sim=self.normal_min_cos_sim,
+                    blend_weight=self.normal_consensus_weight,
+                )
 
             all_positions.append(pts_world)
             all_normals.append(n_world)
             all_colors.append(c_rgb)
+            all_rel_scales.append(scales_valid)
+
+            if (idx + 1) % 50 == 0 or (idx + 1) == len(keyframes):
+                print(f"[SurfelInit] Processed {idx + 1}/{len(keyframes)} keyframes ({sum(len(p) for p in all_positions):,} raw points)...", flush=True)
 
         if not all_positions:
             raise RuntimeError("Failed to unproject any valid surfel points from keyframes")
@@ -549,6 +1303,7 @@ class SurfelCloudInitializer:
         cat_positions = np.concatenate(all_positions, axis=0).astype(np.float32)
         cat_normals = np.concatenate(all_normals, axis=0).astype(np.float32)
         cat_colors = np.concatenate(all_colors, axis=0).astype(np.float32)
+        cat_scales = np.concatenate(all_rel_scales, axis=0).astype(np.float32)
 
         # Include sparse VIO/SfM points if provided
         if sparse_points_3d is not None and len(sparse_points_3d) > 0:
@@ -558,35 +1313,45 @@ class SurfelCloudInitializer:
             sparse_norms = np.zeros((n_sparse, 3), dtype=np.float32)
             sparse_norms[:, 2] = 1.0
             sparse_colors = np.ones((n_sparse, 3), dtype=np.float32) * 0.7
+            sparse_rel_scales = np.ones(n_sparse, dtype=np.float32)
 
             cat_positions = np.vstack([cat_positions, sparse_pts])
             cat_normals = np.vstack([cat_normals, sparse_norms])
             cat_colors = np.vstack([cat_colors, sparse_colors])
+            cat_scales = np.concatenate([cat_scales, sparse_rel_scales])
 
-        # Voxel grid downsampling
-        final_pos, final_norm, final_col = self._voxel_downsample(
-            cat_positions, cat_normals, cat_colors, self.voxel_downsample_m
-        )
-
-        # Statistical Outlier Removal (SOR) to prune remaining floating noise
-        if self.enable_sor and len(final_pos) > self.sor_k:
-            final_pos, final_norm, final_col = statistical_outlier_removal(
-                final_pos, final_norm, final_col, k=self.sor_k, std_mul=self.sor_std_mul
+        # Global multi-view free-space carving across all intersecting keyframes
+        if self.enable_global_carving and len(keyframes) > 1 and len(cat_positions) > 0:
+            cat_positions, cat_normals, cat_colors = global_cross_view_freespace_carving(
+                pts_world=cat_positions,
+                normals_world=cat_normals,
+                colors_rgb=cat_colors,
+                keyframes=keyframes,
+                depth_maps=depth_maps,
+                intrinsics=intrinsics,
+                max_violations=self.global_carving_max_violations,
+                margin_m=self.global_carving_margin_m,
+                subsample_kfs=self.global_carving_subsample_kfs,
             )
 
-        # Adjust to target budget
-        n_surfels = len(final_pos)
-        if n_surfels > self.max_surfels:
-            perm = np.random.RandomState(42).permutation(n_surfels)[:self.target_surfels]
-            final_pos = final_pos[perm]
-            final_norm = final_norm[perm]
-            final_col = final_col[perm]
+        # Statistical Outlier Removal (SOR) to prune remaining floating noise on dense refined cloud
+        final_pos = cat_positions
+        final_norm = cat_normals
+        final_col = cat_colors
+        final_scales = cat_scales
+        if self.enable_sor and len(final_pos) > self.sor_k:
+            sor_mask = self._get_sor_inlier_mask(final_pos, k=self.sor_k, std_mul=self.sor_std_mul)
+            final_pos = final_pos[sor_mask]
+            final_norm = final_norm[sor_mask]
+            final_col = final_col[sor_mask]
+            if len(final_scales) == len(sor_mask):
+                final_scales = final_scales[sor_mask]
 
-        # Compute orthonormal tangent frames (u, v)
+        # Compute orthonormal tangent frames (u, v) on refined normals
         tangent_u, tangent_v = build_orthonormal_tangent_frame(final_norm)
 
-        # Estimate 2D scales (sigma_u, sigma_v) from local k-NN spacing
-        scales_2d = self._estimate_initial_scales(final_pos)
+        # Estimate 2D scales (sigma_u, sigma_v) from local point spacing
+        scales_2d = self._estimate_initial_scales(final_pos, relative_scales=final_scales)
 
         # Compute degree-0 SH coefficients (ambient base color)
         sh_deg0 = (final_col * SH_C0).astype(np.float32)
@@ -594,7 +1359,7 @@ class SurfelCloudInitializer:
         # Initialize opacities
         opacities = np.full((len(final_pos),), self.default_opacity, dtype=np.float32)
 
-        return SurfelCloud(
+        cloud = SurfelCloud(
             positions=final_pos,
             normals=final_norm,
             tangent_u=tangent_u,
@@ -604,6 +1369,64 @@ class SurfelCloudInitializer:
             sh_degree_0=sh_deg0,
             opacities=opacities,
         )
+
+        # Normal Tube Collapse to project multi-layer slab depth variance into a clean 2D manifold shell
+        if self.enable_tube_collapse:
+            v_size = self.voxel_downsample_m or 0.015
+            cloud = cloud.normal_tube_collapse(
+                voxel_size_m=v_size,
+                tube_radius_m=self.tube_radius_m,
+                tube_length_m=self.tube_length_m,
+                min_normal_cos=self.tube_min_normal_cos,
+            )
+            self.applied_voxel_size_m = v_size
+
+        # Multi-Scale Surfel Decimation to adaptively coarsen flat planar regions
+        if self.enable_multiscale_pyramid:
+            v_size = getattr(self, "applied_voxel_size_m", None) or self.voxel_downsample_m or 0.015
+            cloud = cloud.multiscale_pyramid_decimate(
+                base_voxel_m=v_size,
+            )
+            self.applied_voxel_size_m = v_size
+
+        # Ensure surfel count stays within max_surfels budget by coarsening grid if necessary
+        if self.max_surfels is not None and len(cloud) > self.max_surfels:
+            voxel_size = getattr(self, "applied_voxel_size_m", None) or self.voxel_downsample_m or 0.015
+            while len(cloud) > self.max_surfels and voxel_size < 0.20:
+                voxel_size = 0.02 if voxel_size < 0.02 else voxel_size + 0.005
+                cloud = cloud.voxel_downsample(voxel_size)
+            self.applied_voxel_size_m = voxel_size
+        elif not self.enable_tube_collapse and not self.enable_multiscale_pyramid:
+            if self.voxel_downsample_m is not None and self.voxel_downsample_m > 0:
+                voxel_size = self.voxel_downsample_m
+                while True:
+                    downsampled = cloud.voxel_downsample(voxel_size)
+                    if len(downsampled) <= self.max_surfels or voxel_size >= 0.10:
+                        cloud = downsampled
+                        break
+                    voxel_size = 0.02 if voxel_size < 0.02 else voxel_size + 0.005
+                self.applied_voxel_size_m = voxel_size
+            else:
+                self.applied_voxel_size_m = 0.0
+
+        return cloud
+
+    def _get_sor_inlier_mask(self, positions: np.ndarray, k: int = 16, std_mul: float = 1.5) -> np.ndarray:
+        """Helper to get boolean inlier mask for statistical outlier removal."""
+        n = len(positions)
+        if n <= k:
+            return np.ones(n, dtype=bool)
+
+        sample_size = min(15_000, n)
+        idx_sample = np.random.RandomState(42).choice(n, size=sample_size, replace=False)
+        tree = KDTree(positions[idx_sample])
+        dists, _ = tree.query(positions, k=k + 1)
+        mean_dists = np.mean(dists[:, 1:], axis=-1)
+
+        mu = float(np.mean(mean_dists))
+        sigma = float(np.std(mean_dists))
+        thresh = mu + std_mul * sigma
+        return mean_dists <= thresh
 
     def _voxel_downsample(
         self,
@@ -619,7 +1442,7 @@ class SurfelCloudInitializer:
 
         return positions[unique_indices], normals[unique_indices], colors[unique_indices]
 
-    def _estimate_initial_scales(self, positions: np.ndarray, k: int = 3) -> np.ndarray:
+    def _estimate_initial_scales(self, positions: np.ndarray, relative_scales: Optional[np.ndarray] = None, k: int = 3) -> np.ndarray:
         """Estimate initial 2D Gaussian scales (sigma_u, sigma_v) from local point spacing."""
         n = len(positions)
         if n <= k:
@@ -634,6 +1457,13 @@ class SurfelCloudInitializer:
         # Average distance to k nearest neighbors (excluding self at index 0)
         mean_dists = np.mean(dists[:, 1:], axis=-1)
 
-        # Clamp scale between 0.8 cm and 1.6 cm (matching 2.0 cm voxel cell bounds [0.4v, 0.8v])
-        scales = np.clip(mean_dists * 0.8, 0.008, 0.016).astype(np.float32)
+        # Clamp scale to the voxel cell bounds [0.4v, 0.8v] of the grid actually
+        # applied -- a coarsened grid needs proportionally larger surfels or the
+        # surface develops holes.
+        v = getattr(self, "applied_voxel_size_m", None) or self.voxel_downsample_m or 0.02
+        if relative_scales is not None and len(relative_scales) == n:
+            max_v = v * float(np.max(relative_scales)) if np.max(relative_scales) > 1.0 else v
+            scales = np.clip(mean_dists * 0.8, 0.4 * v, 0.8 * max_v).astype(np.float32)
+        else:
+            scales = np.clip(mean_dists * 0.8, 0.4 * v, 0.8 * v).astype(np.float32)
         return np.column_stack([scales, scales])

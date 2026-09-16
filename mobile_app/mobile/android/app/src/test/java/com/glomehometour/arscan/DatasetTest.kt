@@ -201,4 +201,18 @@ class DatasetTest {
         assertEquals(100.toByte(), out[w * h + 1]) // then U
         assertEquals(out.size, w * h + w * h / 2)
     }
+
+    @Test
+    fun `transforms json defaults distortion to zero and carries real k1 k2 when given`() {
+        val defaulted = DatasetFormat.transformsJson(500f, 501f, 320f, 240f, 640, 480, emptyList())
+        assertTrue(defaulted.contains("\"k1\": 0.000000"))
+        assertTrue(defaulted.contains("\"p1\": 0.0"))
+
+        val withDistortion = DatasetFormat.transformsJson(
+            500f, 501f, 320f, 240f, 640, 480, emptyList(), k1 = -0.123f, k2 = 0.045f,
+        )
+        assertTrue(withDistortion.contains("\"k1\": -0.123000"))
+        assertTrue(withDistortion.contains("\"k2\": 0.045000"))
+        assertTrue(withDistortion.contains("\"p1\": 0.0"))
+    }
 }

@@ -12,9 +12,9 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from ingestion.package_loader import CameraIntrinsics, Keyframe
-from reconstruction.depth_priors import DepthEstimationError, arcore_c2w_to_da3_w2c
-from reconstruction.initialization import SurfelCloudInitializer
+from package_loader import CameraIntrinsics, Keyframe
+from depth_priors import DepthEstimationError, arcore_c2w_to_da3_w2c
+from initialization import SurfelCloudInitializer
 
 W, H = 160, 120
 INTRINSICS = CameraIntrinsics(
@@ -117,7 +117,7 @@ def test_multiview_flat_wall_unprojects_planar_and_metric():
 
 def test_unusable_depth_raises_instead_of_being_fabricated(monkeypatch):
     """The failure that shipped: NaN depth quietly replaced by synthetic geometry."""
-    from reconstruction import depth_priors
+    import depth_priors
 
     est = object.__new__(depth_priors.DepthPriorEstimator)
     est.min_depth, est.max_depth, est.max_invalid_depth_frac = 0.2, 15.0, 0.05

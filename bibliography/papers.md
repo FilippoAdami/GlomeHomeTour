@@ -1,126 +1,204 @@
-# Bibliography: Papers
+# Bibliography: Academic Papers
 
-This document lists academic papers that were read, referenced, and used during the research and development of the Glome Suite across both the mobile capture client and backend ingestion/reconstruction systems.
+This document lists academic papers that were read, referenced, and integrated across the Glome Suite backend pipeline (Passes 0 to 3: Ingestion, Pose Refinement, Metric Depth Estimation, and 2D Gaussian Splatting) and mobile capture client.
 
 Items prefixed with `**` represent papers that were evaluated, benchmarked, or compared against during development but were not integrated into the active production pipeline.
 
 ---
 
-## Active & Integrated Papers
+## Active & Integrated Papers (Passes 0 to 3)
 
-### Depth Anything 3: Recovering the Visual Space from Any Views (2025) [arXiv:2511.10647] - Lihe Yang, et al.
+### 2D Gaussian Splatting for Geometrically Accurate Radiance Fields (2DGS) (CVPR 2024) [arXiv:2403.17888] - Binbin Huang, Zehao Yu, Anpei Chen, Andreas Geiger, Shenghua Gao
 
-**Description:**
-Depth Anything 3 (DA3) introduces a plain transformer-based foundation model for monocular depth estimation that handles multi-view geometry natively. By predicting depth maps and camera rays jointly across multiple input frames, DA3 achieves state-of-the-art spatial consistency and metric depth accuracy across diverse unconstrained video sequences without requiring heavy test-time optimization.
+- **Description:**
+  Replaces standard 3D volumetric ellipsoidal Gaussians with flat, oriented 2D planar Gaussian disks (surfels) embedded in 3D space. Defines explicit surface normals, 2D tangent frames, and exact ray-splat intersection formulas, eliminating volumetric floater fuzz, multi-view ambiguity, and needle-like artifacts.
+- **Where & How Used in Glome (Pass 3):**
+  Core neural radiance representation in `backend/03_2DGS_training/` executed via native `diff-surfel-rasterization`. The planar surfel geometry provides the foundational representation for downstream floor plan slicing ($1.0\text{m}-1.5\text{m}$), 3D mesh reconstruction (`05_2DGS_to_mesh`), and MLS walkthrough packaging.
+- **Motive & Rationale:**
+  Standard 3DGS produces thick, fuzzy volumetric shells and severe floater artifacts when viewing surfaces from oblique angles or unobserved directions. 2DGS enforces true surface-bound geometry with consistent normal vectors, which is strictly required for CAD-compatible architectural mesh extraction and planar wall fitting.
+- **Last Verified / Checked:** 2026-09-15 (Fully integrated in `step_train.py` and `diff-surfel-rasterization`).
 
-**How and Where Used in Glome:**
-DA3 is the primary monocular metric depth estimation backend engine integrated in `backend/reconstruction/depth_priors.py`. It is executed over keyframe sequences using sliding-window chunk streaming (`DA3NESTED-GIANT-LARGE-1.1`). The resulting metric depth predictions serve as the foundational geometric prior for sparse landmark scale-shift graph optimization and multi-view surface normal estimation.
+---
 
-**Link / Source:**
-[arXiv:2511.10647](https://arxiv.org/abs/2511.10647)
+### Depth Anything 3: Recovering the Visual Space from Any Views (DA3) (2025) [arXiv:2511.10647] - Lihe Yang, et al.
+
+- **Description:**
+  A vision transformer foundation model for metric monocular depth estimation with multi-view attention. Jointly predicts dense metric depth and camera rays across multi-view image sequences, achieving high spatial consistency and metric scale fidelity across unconstrained video captures.
+- **Where & How Used in Glome (Pass 2):**
+  Primary metric depth inference engine in `backend/02_depth_estimation/depth_priors.py` and `step_depth.py` using `depth-anything/DA3-BASE` (and `DA3NESTED-GIANT-LARGE-1.1`). Keyframes are processed in overlapping sliding-window chunks ($N=6, K=2$) with OpenCV world-to-camera poses to generate metric depth arrays (`depth_maps/*.npy`) and surface normals.
+- **Motive & Rationale:**
+  Unlike classical stereo matching (which fails on textureless white walls) and single-view monocular depth models (which drift in scale from frame to frame), DA3 combines multi-view cross-attention with learned indoor priors, generating metric, warp-free depth maps across entire residential scans.
+- **Last Verified / Checked:** 2026-09-15 (Sliding-window runner verified with OpenCV $w2c$ input convention).
+
+---
+
+### Structure-from-Motion Revisited (COLMAP) (CVPR 2016) - Johannes L. Schönberger, Jan-Michael Frahm
+
+- **Description:**
+  A comprehensive Structure-from-Motion (SfM) architecture introducing geometric verification, robust triangulation, view-graph construction, and non-linear bundle adjustment strategies that mitigate drift and mis-registration.
+- **Where & How Used in Glome (Pass 1):**
+  Powers `backend/01_poses_refinment/` (`convert_transforms_to_colmap.py` and `step_colmap.py`). Glome uses COLMAP's SIFT feature extraction, sequential matcher, and `point_triangulator` with fixed ARCore VIO poses, plus optional soft pose-prior bundle adjustment (`pose_prior_mapper`).
+- **Motive & Rationale:**
+  Rather than running unconstrained SfM from scratch (which frequently collapses, warps focal length, or invents phantom distortion on indoor loops), triangulating against known-good metric ARCore VIO poses guarantees scale consistency and provides verified multi-view point tracks.
+- **Last Verified / Checked:** 2026-09-15 (Integrated via `step_colmap.py` with Sampson error gating).
+
+---
+
+### PGSR: Planar-based Gaussian Splatting for Robust Surface Reconstruction (2024) [arXiv:2406.06521] - Danpeng Chen, et al.
+
+- **Description:**
+  Introduces a multi-view planar regularization technique for Gaussian Splatting. Treats each rendered pixel's depth and normal as a local tangent plane and enforces photometric homography consistency across neighboring camera views using $H = K_n (R - t n^T / d) K_c^{-1}$.
+- **Where & How Used in Glome (Pass 3):**
+  Integrated in `backend/03_2DGS_training/utils/multiview_loss.py` via `multiview_photometric_loss` and `--lambda_multiview`. Computes warped photometric consensus across sequential and loop-closure views with an asymmetric free-space veto weight ($w_{\text{veto}} = 0.5$).
+- **Motive & Rationale:**
+  Photometric color loss alone allows Gaussians to overfit to camera-specific lighting, specular reflections, or textureless regions. Homography-based multi-view consensus forces surfels to align with physical planar surfaces, preventing multi-layering ("onion-peel") and surface wrinkling.
+- **Last Verified / Checked:** 2026-09-15 (Asymmetric free-space veto integrated and unit-tested).
+
+---
+
+### TrackGS: Direct Neural Tracking with 2D/3D Gaussian Splatting (2024) - TrackGS Authors
+
+- **Description:**
+  Enables continuous camera pose refinement during Gaussian Splatting training. Optimizes small Lie-algebra $\mathfrak{se}(3)$ camera pose deltas jointly with scene Gaussians, regularized by fixed 3D landmark reprojection constraints to prevent pose drift.
+- **Where & How Used in Glome (Pass 3):**
+  Implemented in `backend/03_2DGS_training/scene/cameras.py` and activated by `step_train.py` **exclusively in Stage 4 (full native 1080p resolution, iterations 6,000–10,000)** via `--refine_poses_during_training`, `--pose_lr 0.0001`, and `--lambda_track 0.1`. Poses remain rigidly locked during Stages 1–3 ($r=8, 4, 2$) to prevent gauge drift and preserve metric alignment with DA3 depth priors.
+- **Motive & Rationale:**
+  Compensates for residual sub-pixel handheld frame-to-frame jitter and rolling shutter sync offsets between adjacent keyframes during high-resolution texture convergence, without allowing the optimizer to bend the global metric camera trajectory or distort DA3 multi-view depth priors.
+- **Last Verified / Checked:** 2026-09-15 (Enabled in Stage 4 of `step_train.py` with tight track constraints).
+
+---
+
+### TIDI-GS: Tile-based and Direct Observation Pruning for Gaussian Splatting (2024/2025)
+
+- **Description:**
+  Analyzes camera visibility frustums versus direct rendering contributions per Gaussian primitive to identify and prune floating artifacts. Surfel primitives that are visible in many camera view frustums but only actively contribute alpha opacity to one or two views are detected as monocular floaters.
+- **Where & How Used in Glome (Pass 3):**
+  Implemented in `backend/03_2DGS_training/scene/gaussian_model.py` (`frustum_counter`, `observation_counter`, `densify_and_prune`). Culls primitives visible in $\ge 8$ frustums but actively contributing in $\le 2$ views after iteration 1500.
+- **Motive & Rationale:**
+  Standard opacity pruning fails on semi-transparent floaters that receive gradient updates from only a single camera. Tracking frustum-to-contribution ratios cleanly removes airborne glare spikes and boundary floaters without eroding solid walls.
+- **Last Verified / Checked:** 2026-09-15 (Observation tracking and floater pruning verified).
+
+---
+
+### DN-Splatter: Depth and Normal Priors for Gaussian Splatting (2024) [arXiv:2403.17822] - Matias Turkulainen, et al.
+
+- **Description:**
+  Incorporates external dense monocular depth and surface normal priors into 3D/2D Gaussian Splatting optimization via depth-ranking and normal-alignment loss terms, drastically improving surface reconstruction quality in sparse or untextured regions.
+- **Where & How Used in Glome (Pass 2 & Pass 3):**
+  Governs surfel cloud initialization (`02_depth_estimation/initialization.py`) and training normal supervision (`03_2DGS_training/utils/loss_utils.py` via `normal_loss`). Depth gradients from DA3 initialize surfel tangent frames and guide optimization where image texture is uniform.
+- **Motive & Rationale:**
+  Indoor architectural captures feature large textureless white drywall and ceilings where photometric gradients are zero. Depth and normal priors anchor Gaussian positions and orientations geometrically, preventing hollow geometry.
+- **Last Verified / Checked:** 2026-09-15 (Integrated with dynamic saturation masking).
+
+---
+
+### Distinctive Image Features from Scale-Invariant Keypoints (SIFT) (IJCV 2004) - David G. Lowe
+
+- **Description:**
+  Seminal algorithm for detecting and describing local scale- and rotation-invariant features in images, robust to changes in illumination, noise, and 3D viewpoint variations.
+- **Where & How Used in Glome (Pass 0 & Pass 1):**
+  Used in `backend/00_ingestion/` for keyframe covisibility verification and in `backend/01_poses_refinment/` for COLMAP sequential matching and feature graph construction.
+- **Motive & Rationale:**
+  Classical SIFT provides highly reliable, sub-pixel feature correspondences across wide baselines without requiring heavy GPU memory or PyTorch neural inference during stage 1 ingestion.
+- **Last Verified / Checked:** 2026-09-15 (SIFT extraction and sequential matching verified).
+
+---
+
+### The Structural Similarity Image Metric (SSIM) (IEEE TIP 2004) - Zhou Wang, Alan C. Bovik, Hamid R. Sheikh, Eero P. Simoncelli
+
+- **Description:**
+  A perceptual metric that measures visual degradation based on luminance, contrast, and structural information changes, outperforming raw mean squared error for human perceptual quality assessment.
+- **Where & How Used in Glome (Pass 3):**
+  Core photometric loss term in `03_2DGS_training/utils/loss_utils.py` and evaluation metric in `metrics.py`. Combined with L1 loss: $\mathcal{L} = (1 - \lambda_{\text{ssim}}) \mathcal{L}_1 + \lambda_{\text{ssim}} (1 - \text{SSIM})$.
+- **Motive & Rationale:**
+  L1 loss alone yields blurry edges and over-smooths specular highlights. SSIM penalizes structural patch distortion, maintaining sharp architectural corners and texture fidelity.
+- **Last Verified / Checked:** 2026-09-15 (Separable 2D conv implementation optimized for ROCm).
+
+---
+
+### The Unreasonable Effectiveness of Deep Features as a Perceptual Metric (LPIPS) (CVPR 2018) - Richard Zhang, Phillip Isola, Alexei A. Efros, Eli Shechtman, Oliver Wang
+
+- **Description:**
+  Evaluates perceptual image distance by extracting and comparing deep feature activations from pretrained networks (VGG/AlexNet), aligning closely with human visual quality judgments.
+- **Where & How Used in Glome (Pass 3):**
+  Integrated in `backend/03_2DGS_training/lpipsPyTorch/` and `metrics.py` for automated novel-view visual quality benchmarking.
+- **Motive & Rationale:**
+  Standard PSNR and SSIM can be deceptive on subtle high-frequency artifacts (such as minor splat misalignment). LPIPS provides an objective standard for MLS listing image quality certification.
+- **Last Verified / Checked:** 2026-09-15 (Perceptual metric scripts verified).
 
 ---
 
 ### Depth Anything V2 (2024) [arXiv:2406.09414] - Lihe Yang, et al.
 
-**Description:**
-Depth Anything V2 significantly refines monocular depth estimation accuracy and detail by training discriminative vision transformers on large-scale synthetic images paired with teacher-student distillation. It produces smoother depth boundaries and finer surface details while remaining robust against challenging indoor lighting and reflective materials.
-
-**How and Where Used in Glome:**
-Integrated in `backend/reconstruction/depth_priors.py` as the automated metric fallback model (`Depth-Anything-V2-Metric-Indoor-Base-hf`). When DA3 is unequipped or hardware constraints dictate lower VRAM usage, Depth Anything V2 generates metric depth predictions for least-squares scale-shift alignment against VIO landmarks.
-
-**Link / Source:**
-[arXiv:2406.09414](https://arxiv.org/abs/2406.09414)
-
----
-
-### Structure-from-Motion Revisited (2016) [IEEE CVPR 2016] - Johannes L. Schönberger, Jan-Michael Frahm
-
-**Description:**
-This paper presents COLMAP, a comprehensive review and redesign of Structure-from-Motion (SfM) pipelines. It details robust algorithms for geometric verification, geometric-aware keyframe selection, non-linear bundle adjustment, and scene graph construction that collectively overcome drift and mis-registrations in monocular multi-view datasets.
-
-**How and Where Used in Glome:**
-The geometric bundle adjustment principles from this paper govern `backend/ingestion/sfm_refinement.py`. Glome uses SIFT feature detection and FLANN-based matching to seed non-linear pose refinement over VIO trajectory priors, refining camera intrinsics ($f_x, f_y, c_x, c_y$) and solving radial/tangential distortion parameters ($k_1, k_2, p_1, p_2$).
-
-**Link / Source:**
-[IEEE Xplore / CVPR 2016](https://openaccess.thecvf.com/content_cvpr_2016/papers/Schonberger_Structure-From-Motion_Revisited_CVPR_2016_paper.pdf)
-
----
-
-### Distinctive Image Features from Scale-Invariant Keypoints (2004) [International Journal of Computer Vision] - David G. Lowe
-
-**Description:**
-This seminal paper introduces the Scale-Invariant Feature Transform (SIFT), an algorithm for detecting and describing local scale- and rotation-invariant features in images. SIFT features are highly distinctive and invariant to image scaling, rotation, illumination changes, and 3D viewpoint variations.
-
-**How and Where Used in Glome:**
-SIFT is the core feature extraction algorithm used in `backend/ingestion/sfm_refinement.py` (via OpenCV's `cv2.SIFT_create`). It extracts robust keypoints across keyframe pairs to establish geometric correspondences for Essential matrix estimation and VIO trajectory pose refinement.
-
-**Link / Source:**
-[IJCV 2004 / Springer](https://link.springer.com/article/10.1023/B:VISI.0000029664.99615.94)
+- **Description:**
+  Refined monocular depth estimation model trained on synthetic data with teacher-student distillation, producing clean depth boundaries and high-frequency surface detail.
+- **Where & How Used in Glome (Pass 2):**
+  Configured as an automated local fallback in `backend/02_depth_estimation/depth_priors.py` (`Depth-Anything-V2-Metric-Indoor-Base-hf`) when running on resource-constrained compute nodes without DA3 multi-view weights.
+- **Motive & Rationale:**
+  Provides a fast, robust single-view indoor depth fallback when multi-view windowing is unnecessary or memory is constrained.
+- **Last Verified / Checked:** 2026-09-15 (Fallback loading verified).
 
 ---
 
 ## Evaluated & Compared Papers (Not Integrated)
 
-### **Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data (2024) [IEEE CVPR 2024 / arXiv:2401.10891] - Lihe Yang, et al.
-
-**Description:**
-The original Depth Anything paper presents a foundation model for relative monocular depth estimation trained on 62M unlabeled images using data augmentation and scale-invariant loss functions. It established strong zero-shot depth estimation performance across general unconstrained images.
-
-**How and Where Evaluated in Glome:**
-Evaluated during early backend depth prior research. It was compared against DA2 and DA3 metric indoor models; because v1 outputs relative/scale-ambiguous depth maps without metric calibrations, it was superseded by Depth Anything V2/V3 metric models in the backend pipeline.
-
-**Link / Source:**
-[arXiv:2401.10891](https://arxiv.org/abs/2401.10891)
+### **Depth Anything: Unleashing the Power of Large-Scale Unlabeled Data (CVPR 2024) [arXiv:2401.10891] - Lihe Yang, et al.
+- **Description:** Original foundation model for relative monocular depth estimation.
+- **Evaluation in Glome:** Evaluated during early depth research. Outputs relative/scale-ambiguous depth maps without metric calibrations; superseded by Depth Anything V2/V3 metric models in Pass 2.
+- **Last Checked:** 2026-09-10.
 
 ---
 
-### **Towards Robust Monocular Depth Estimation: Mixing Datasets for Zero-shot Cross-dataset Transfer (MiDaS) (2019) [IEEE TPAMI / arXiv:1907.01341] - René Ranftl, Katrin Lasinger, David Hafner, Konrad Schindler, Vladlen Koltun
-
-**Description:**
-MiDaS introduces a scale- and shift-invariant loss function and dataset mixing strategy that enables monocular depth networks to train across disparate, incompatible depth sources. It pioneered generalizable zero-shot monocular depth estimation across diverse environments.
-
-**How and Where Evaluated in Glome:**
-Benchmarked on-device for live mobile HUD depth rendering and in early backend tests (`ml/depth-model/`). Compared directly against ZipDepth and Depth Anything; MiDaS-small was evaluated for mobile runtime but discarded in favor of ONNX-optimized ZipDepth on mobile and Depth Anything V3 on the backend.
-
-**Link / Source:**
-[arXiv:1907.01341](https://arxiv.org/abs/1907.01341)
+### **Towards Robust Monocular Depth Estimation (MiDaS) (IEEE TPAMI 2019) [arXiv:1907.01341] - René Ranftl, et al.
+- **Description:** Multi-dataset relative depth estimation architecture.
+- **Evaluation in Glome:** Benchmarked for mobile depth HUD and early backend testing. Superseded by ONNX ZipDepth on mobile and DA3 on the backend due to scale ambiguity and boundary bleeding.
+- **Last Checked:** 2026-09-10.
 
 ---
 
-### **SuperPoint: Self-Supervised Interest Point Detection and Description (2018) [IEEE CVPRW 2018 / arXiv:1712.07629] - Daniel DeTone, Tomasz Malisiewicz, Andrew Rabinovich
-
-**Description:**
-SuperPoint proposes a fully-convolutional neural network architecture that operates on full-size images and computes interest point locations and descriptors in a single forward pass. It uses self-supervised synthetic homography adaptation for training interest point detectors.
-
-**How and Where Evaluated in Glome:**
-Compared against SIFT for keyframe feature matching in `backend/ingestion/sfm_refinement.py`. While SuperPoint demonstrated strong matching performance on textureless surfaces, SIFT was retained as the default due to lower CPU dependency footprint and zero GPU model execution requirement during ingestion.
-
-**Link / Source:**
-[arXiv:1712.07629](https://arxiv.org/abs/1712.07629)
+### **SuperPoint: Self-Supervised Interest Point Detection and Description (CVPRW 2018) [arXiv:1712.07629] - Daniel DeTone, et al.
+- **Description:** Fully-convolutional interest point detector and descriptor network.
+- **Evaluation in Glome:** Compared against classical SIFT in Pass 1. SIFT was selected for lower CPU footprint and zero GPU dependency during initial ingestion.
+- **Last Checked:** 2026-09-14.
 
 ---
 
-### **Random Sample Consensus: A Paradigm for Model Fitting with Applications to Image Analysis and Automated Cartography (RANSAC) (1981) [Communications of the ACM] - Martin A. Fischler, Robert C. Bolles
-
-**Description:**
-RANSAC is an iterative method to estimate parameters of a mathematical model from a set of observed data that contains a high proportion of outliers. It repeatedly selects random subsets of data, fits candidate models, and evaluates inlier consensus.
-
-**How and Where Evaluated in Glome:**
-Evaluated for 2D floor plan wall segment extraction from horizontal point slices. The technique is specified for future vectorization stages but is not yet consolidated into the live execution codebase.
-
-**Link / Source:**
-[ACM Digital Library](https://dl.acm.org/doi/10.1145/358669.358692)
+### **Instant Neural Graphics Primitives (Instant-NGP) (ACM TOG / SIGGRAPH 2022) - Thomas Müller, et al.
+- **Description:** Multi-resolution hash grid encoding for real-time neural radiance fields.
+- **Evaluation in Glome:** Evaluated against 2DGS/3DGS for real estate walkthroughs. While training is fast, volumetric ray-marching requires heavy GPU compute for client-side rendering (failing MLS mobile/web budget requirements) and cannot export direct 2D floor plans.
+- **Last Checked:** 2026-09-10.
 
 ---
 
-### **Marching Cubes: A High Resolution 3D Surface Construction Algorithm (1987) [ACM SIGGRAPH Computer Graphics] - William E. Lorensen, Harvey E. Cline
+### **Direct Voxel Grid Optimization (DVGO) (CVPR 2022) - Cheng Sun, et al.
+- **Description:** Explicit voxel grid radiance field representation.
+- **Evaluation in Glome:** Evaluated for rapid indoor reconstruction. Discarded due to high memory footprint for large multi-room spaces and lack of explicit surface normals.
+- **Last Checked:** 2026-09-10.
 
-**Description:**
-Marching Cubes is a 3D surface construction algorithm that extracts a polygonal mesh of an isosurface from a 3D scalar field. It processes voxel cubes sequentially, generating triangle facets based on edge intersection lookup tables.
+---
 
-**How and Where Evaluated in Glome:**
-Evaluated in early mobile client variants (`mobile/android/` specifications) for real-time 3D voxel coverage mesh visualization. Replaced on-device by live two-ray closed-form triangulation and OpenGL point sprite landmark rendering (`FeatureParallaxTracker.kt`) to eliminate mobile GPU overhead.
+### **MonoSDF: Exploring Monocular Geometric Cues for Neural Implicit Surface Reconstruction (NeurIPS 2022) - Zehao Yu, et al.
+- **Description:** Signed Distance Function (SDF) surface reconstruction supervised with monocular depth and normal cues.
+- **Evaluation in Glome:** Influenced our depth and normal prior loss formulations. Full implicit SDF volume rendering was rejected due to slow training convergence (>1 hour per room) compared to 2DGS (<5 minutes).
+- **Last Checked:** 2026-09-10.
 
-**Link / Source:**
-[ACM Digital Library](https://dl.acm.org/doi/10.1145/37401.37422)
+---
+
+### **NerfAcc: A General NeRF Acceleration Toolbox (2023) - Ruilong Li, et al.
+- **Description:** PyTorch acceleration library for volumetric radiance fields.
+- **Evaluation in Glome:** Evaluated for volumetric NeRF ray sampling; superseded by explicit rasterization in 2DGS.
+- **Last Checked:** 2026-09-10.
+
+---
+
+### **PCR-GS: Point Cloud Refinement for Gaussian Splatting (2024)**
+- **Description:** Point cloud outlier filtering and densification strategies for 3DGS.
+- **Evaluation in Glome:** Evaluated for Pass 1/2 point cloud cleaning; replaced by spatial voxel deduplication, SOR, and free-space epipolar carving.
+- **Last Checked:** 2026-09-14.
+
+---
+
+### **Hestia: Real-Time Multi-Room Neural Walkthroughs (2024)**
+- **Description:** Multi-room indoor radiance field partitioning and web streaming.
+- **Evaluation in Glome:** Architectural reference for multi-room listing chunking and level-of-detail management.
+- **Last Checked:** 2026-09-12.

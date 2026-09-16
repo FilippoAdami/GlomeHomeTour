@@ -2,6 +2,7 @@ package com.glomehometour.arscan
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -10,6 +11,7 @@ import android.hardware.SensorManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Looper
+import android.util.Log
 import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
@@ -57,6 +59,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var phaseText: TextView
     private lateinit var timerText: TextView
     private lateinit var infoButton: TextView
+    private lateinit var memoryButton: TextView
     private lateinit var coverageValue: TextView
     private lateinit var coverageLabel: TextView
     private lateinit var progressBar: ProgressBar
@@ -173,13 +176,29 @@ class MainActivity : AppCompatActivity() {
     private var hapticMilestone500 = false
     private var hapticLoopClosed = false
 
-    // Tracking recovery & relocalization state
+    // Tracking recovery & relocalization state. The actual point-matching/RANSAC search
+    // (RelocalizationRecovery.estimateAlignmentPreferId) runs on its own HandlerThread, never the
+    // GL thread -- see two prior ANRs where that search blocked onPause() for 5+ seconds mid-scan.
     private var needsRelocalizationCheck = false
     private var lastRelocalizationNanos = 0L
     private var relocalizedToastUntilNanos = 0L
-    private val scratchLandmarkX = FloatArray(2048)
-    private val scratchLandmarkY = FloatArray(2048)
-    private val scratchLandmarkZ = FloatArray(2048)
+    private val scratchLandmarkX = FloatArray(20000)
+    private val scratchLandmarkY = FloatArray(20000)
+    private val scratchLandmarkZ = FloatArray(20000)
+    private val relocIdCurX = FloatArray(64)
+    private val relocIdCurY = FloatArray(64)
+    private val relocIdCurZ = FloatArray(64)
+    private val relocIdLandX = FloatArray(64)
+    private val relocIdLandY = FloatArray(64)
+    private val relocIdLandZ = FloatArray(64)
+    private val relocThread = android.os.HandlerThread("relocalization").apply { start() }
+    private val relocHandler = android.os.Handler(relocThread.looper)
+    private val relocJobRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val relocConfirmedTransform =
+        java.util.concurrent.atomic.AtomicReference<RelocalizationRecovery.RigidTransform?>(null)
+    /** Touched only on [relocThread] -- one candidate must be rediscovered on a second, independent
+     * pass before it's trusted enough to snap the landmark cloud (see [relocConfirmedTransform]). */
+    private var relocPendingCandidate: RelocalizationRecovery.RigidTransform? = null
 
     /** Pre-flight calibration flow:
      * 0 = 5-second automatic multi-angle ISO/shutter exposure & auto-WB calibration.
@@ -218,6 +237,7 @@ class MainActivity : AppCompatActivity() {
         phaseText = findViewById(R.id.phaseText)
         timerText = findViewById(R.id.timerText)
         infoButton = findViewById(R.id.infoButton)
+        memoryButton = findViewById(R.id.memoryButton)
         coverageValue = findViewById(R.id.coverageValue)
         coverageLabel = findViewById(R.id.coverageLabel)
         progressBar = findViewById(R.id.progressBar)
@@ -269,6 +289,9 @@ class MainActivity : AppCompatActivity() {
             showDiag = !showDiag
             diagText.setVisible(showDiag)
             infoButton.alpha = if (showDiag) 1f else 0.7f
+        }
+        memoryButton.setOnClickListener {
+            startActivity(Intent(this, ScanGalleryActivity::class.java))
         }
         infoButton.alpha = 0.7f
 
@@ -588,6 +611,7 @@ class MainActivity : AppCompatActivity() {
         w.finish(
             r?.focalX ?: 0f, r?.focalY ?: 0f, r?.principalX ?: 0f, r?.principalY ?: 0f,
             r?.imageWidth ?: 0, r?.imageHeight ?: 0, summary,
+            k1 = r?.pipeline?.lensDistortionK1, k2 = r?.pipeline?.lensDistortionK2,
         ) { path ->
             finishedPath = path
             android.util.Log.i(TAG, "dataset written to $path")
@@ -598,6 +622,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---- per-frame (render thread) ----
+
+    /** Diagnostic only: the render thread stalling for seconds (see two ANRs at ~800-900
+     * landmarks) has to be caught mid-frame to find which stage is slow -- flags anything over
+     * 50ms, since a healthy frame budget at 30fps is ~33ms total. */
+    private fun logIfSlow(label: String, startNs: Long, n: Int) {
+        val ms = (System.nanoTime() - startNs) / 1_000_000.0
+        if (ms > 50.0) Log.w(TAG, "SLOW FRAME: $label took ${"%.1f".format(ms)}ms (n=$n)")
+    }
 
     private fun onFrame(sample: ArScanRenderer.Sample?) {
         frameCounter++
@@ -623,6 +655,10 @@ class MainActivity : AppCompatActivity() {
             if (wasTracking && state == State.SCANNING) {
                 trackingLosses++
                 needsRelocalizationCheck = true
+                // A candidate carried over from a prior recovery cycle must not be allowed to
+                // "confirm" a candidate from this new one -- they were never independently
+                // rediscovering the same alignment, just coincidentally close.
+                relocPendingCandidate = null
             }
             wasTracking = false
             // Poses either side of a tracking gap are unrelated; differencing them would
@@ -634,6 +670,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (!wasTracking && state == State.SCANNING) {
             needsRelocalizationCheck = true
+            relocPendingCandidate = null
         }
         wasTracking = true
         framesSeen++
@@ -647,29 +684,64 @@ class MainActivity : AppCompatActivity() {
         // Feed sparse feature points to parallax tracker continuously (live viewport feedback & triangulation)
         if (sample.points != null && sample.pointIds != null && sample.numPoints > 0) {
             val now = System.nanoTime()
-            if (state == State.SCANNING && needsRelocalizationCheck && parallaxTracker.verifiedLandmarkCount >= 10 && (now - lastRelocalizationNanos) > 1_000_000_000L) {
+            if (state == State.SCANNING && needsRelocalizationCheck && parallaxTracker.verifiedLandmarkCount >= 10 &&
+                (now - lastRelocalizationNanos) > 1_000_000_000L && relocJobRunning.compareAndSet(false, true)
+            ) {
                 lastRelocalizationNanos = now
+                // Cheap on the GL thread: bounded array copies, no search. The actual matching
+                // happens off-thread in the block below.
                 val landmarkCount = parallaxTracker.getLandmarkData(scratchLandmarkX, scratchLandmarkY, scratchLandmarkZ)
-                val rigidTransform = RelocalizationRecovery.estimateAlignment(
-                    sample.points, sample.numPoints,
-                    translation[0], translation[1], translation[2],
-                    scratchLandmarkX, scratchLandmarkY, scratchLandmarkZ,
-                    landmarkCount,
+                val idMatchCount = parallaxTracker.matchById(
+                    sample.pointIds, sample.points, sample.numPoints,
+                    relocIdCurX, relocIdCurY, relocIdCurZ, relocIdLandX, relocIdLandY, relocIdLandZ,
                 )
-                if (rigidTransform != null && rigidTransform.isSignificant) {
-                    parallaxTracker.transformLandmarks(rigidTransform)
-                    needsRelocalizationCheck = false
-                    relocalizedToastUntilNanos = now + 2_500_000_000L // show for 2.5s
-                    root.post { root.performHapticFeedback(HapticFeedbackConstants.CONFIRM) }
+                val camX = translation[0]; val camY = translation[1]; val camZ = translation[2]
+                val currentPoints = sample.points
+                val currentNumPoints = sample.numPoints
+                relocHandler.post {
+                    try {
+                        val transform = RelocalizationRecovery.estimateAlignmentPreferId(
+                            idMatchCount, relocIdCurX, relocIdCurY, relocIdCurZ, relocIdLandX, relocIdLandY, relocIdLandZ,
+                            currentPoints, currentNumPoints, camX, camY, camZ,
+                            scratchLandmarkX, scratchLandmarkY, scratchLandmarkZ, landmarkCount,
+                        )
+                        val pending = relocPendingCandidate
+                        if (transform != null && transform.isSignificant) {
+                            if (pending != null && RelocalizationRecovery.isSimilarTransform(pending, transform)) {
+                                relocConfirmedTransform.set(transform)
+                                relocPendingCandidate = null
+                            } else {
+                                relocPendingCandidate = transform
+                            }
+                        } else {
+                            relocPendingCandidate = null
+                        }
+                    } finally {
+                        relocJobRunning.set(false)
+                    }
                 }
             }
 
+            // Cheap poll every frame: applies a transform once it's been rediscovered on two
+            // independent background passes (see relocPendingCandidate above).
+            val confirmedTransform = relocConfirmedTransform.getAndSet(null)
+            if (confirmedTransform != null) {
+                parallaxTracker.transformLandmarks(confirmedTransform)
+                needsRelocalizationCheck = false
+                relocalizedToastUntilNanos = now + 2_500_000_000L // show for 2.5s
+                root.post { root.performHapticFeedback(HapticFeedbackConstants.CONFIRM) }
+            }
+
+            val updateStartNs = System.nanoTime()
             parallaxTracker.update(
                 sample.points, sample.pointIds, sample.numPoints,
                 translation[0], translation[1], translation[2],
                 sample.timestampNs,
             )
+            logIfSlow("parallaxTracker.update", updateStartNs, parallaxTracker.verifiedLandmarkCount)
+            val exportStartNs = System.nanoTime()
             val exportedCount = parallaxTracker.exportPointVertices(pointSpriteExportBuf, sample.timestampNs)
+            logIfSlow("exportPointVertices", exportStartNs, exportedCount)
             renderer?.pointVertices = pointSpriteExportBuf
             renderer?.pointVertexCount = exportedCount
         }

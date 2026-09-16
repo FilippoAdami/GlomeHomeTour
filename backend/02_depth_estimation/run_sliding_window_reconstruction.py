@@ -28,17 +28,17 @@ from PIL import Image
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
-from pipeline_paths import bootstrap
+from Utilities.pipeline_paths import bootstrap
 bootstrap()
 
-_da3_src = _backend_dir / "third_party" / "depth_anything_3" / "src"
+_da3_src = _backend_dir / "Utilities" / "third_party" / "depth_anything_3" / "src"
 if _da3_src.is_dir() and str(_da3_src) not in sys.path:
     sys.path.insert(0, str(_da3_src))
 
 from package_loader import CameraIntrinsics, CapturePackage, Keyframe, PackageLoader
 from quality_gate import QualityGate
 from pose_aligner import PoseAligner
-from depth_priors import DepthPriorEstimator
+from depth_priors import DepthPriorEstimator, arcore_c2w_to_da3_w2c
 from initialization import SurfelCloudInitializer
 
 
@@ -397,7 +397,11 @@ def main():
         print(f"Compute Device: {device}")
         
         # Build extrinsics (M, 4, 4) and intrinsics (M, 3, 3) for depth keyframes
-        exts = np.stack([kf.transform_matrix for kf in depth_keyframes], axis=0)
+        # These are raw ARCore camera-to-world poses. The estimator takes OpenCV
+        # world-to-camera (the pipeline feeds it COLMAP poses, already in that
+        # form), so this legacy path has to convert for itself.
+        exts = arcore_c2w_to_da3_w2c(
+            np.stack([kf.transform_matrix for kf in depth_keyframes], axis=0))
         K_mat = np.array([
             [intrinsics.fl_x, 0.0, intrinsics.cx],
             [0.0, intrinsics.fl_y, intrinsics.cy],

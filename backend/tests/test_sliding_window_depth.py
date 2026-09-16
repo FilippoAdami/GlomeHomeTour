@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 from pathlib import Path
-from reconstruction.depth_priors import DepthPriorEstimator
+from depth_priors import DepthPriorEstimator
 
 def test_sliding_window_mock_k2():
     # Use mock model to avoid loading weights

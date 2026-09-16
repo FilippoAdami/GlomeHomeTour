@@ -21,18 +21,18 @@ backend_dir = Path("/home/monday/Desktop/GlomeHomeTour/backend")
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-da3_src = backend_dir / "third_party" / "depth_anything_3" / "src"
+da3_src = backend_dir / "Utilities" / "third_party" / "depth_anything_3" / "src"
 if da3_src.is_dir() and str(da3_src) not in sys.path:
     sys.path.insert(0, str(da3_src))
 
-from ingestion.package_loader import CameraIntrinsics, Keyframe
-from reconstruction.depth_priors import (
+from package_loader import CameraIntrinsics, Keyframe
+from depth_priors import (
     DepthPriorEstimator,
     GlobalDepthGraphOptimizer,
     MetricDepthAligner,
     compute_surface_normals,
 )
-from reconstruction.initialization import SurfelCloudInitializer
+from initialization import SurfelCloudInitializer
 
 
 # ==============================================================================

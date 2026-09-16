@@ -83,4 +83,49 @@ class FeatureParallaxTrackerTest {
         assertEquals(2f, result.z, 1e-3f)
         assertTrue(result.residual < 1e-3f)
     }
+
+    /**
+     * Regression: the landmark hash table was sized `maxLandmarks * 2` = 40000 while the probe
+     * masks with `size - 1`. 39999 is not a power of two, so the AND reached only 1024 distinct
+     * buckets and `(idx + 1) and mask` cycled among them instead of finding an empty one --
+     * landmarkSlotForId spun forever on the GL thread once a scan passed ~800 landmarks (ANR).
+     */
+    @Test(timeout = 30_000)
+    fun `scan past the old 1024 bucket hash ceiling still terminates`() {
+        val tracker = FeatureParallaxTracker()
+        val side = 35 // 1225 points, comfortably past the 1024 reachable buckets
+        val n = side * side
+        val points = FloatArray(n * 4)
+        val ids = IntArray(n)
+        for (row in 0 until side) {
+            for (col in 0 until side) {
+                val i = row * side + col
+                points[i * 4] = (col - side / 2) * 0.065f // > MIN_LANDMARK_SPACING_M apart
+                points[i * 4 + 1] = (row - side / 2) * 0.065f
+                points[i * 4 + 2] = 2.5f
+                points[i * 4 + 3] = 0.9f
+                ids[i] = i + 1
+            }
+        }
+
+        // Frame 1 registers candidates; frame 2 from a 1.2 m baseline gives even the worst-placed
+        // grid corner ~18 deg of parallax, so every point triangulates and promotes.
+        tracker.update(points, ids, n, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 1_000L)
+        tracker.update(points, ids, n, cameraX = 1.2f, cameraY = 0f, cameraZ = 0f, timestampNs = 2_000L)
+
+        assertEquals(n, tracker.verifiedLandmarkCount)
+
+        // Every id must be findable again through the hash lookup (matchById -> landmarkSlotForId).
+        val cur = Array(3) { FloatArray(n) }
+        val lm = Array(3) { FloatArray(n) }
+        assertEquals(n, tracker.matchById(ids, points, n, cur[0], cur[1], cur[2], lm[0], lm[1], lm[2]))
+    }
+
+    @Test
+    fun `hash table sizes are powers of two with headroom`() {
+        for (entries in intArrayOf(1, 3, 500, 4096, 20000)) {
+            val size = FeatureParallaxTracker.tableSizeFor(entries)
+            assertTrue("$entries -> $size", size >= entries * 2 && (size and (size - 1)) == 0)
+        }
+    }
 }

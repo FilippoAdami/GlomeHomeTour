@@ -76,6 +76,20 @@
                         android:fontFamily="sans-serif-medium"
                         android:text="" />
 
+                    <!-- Previous scans gallery -->
+                    <TextView
+                        android:id="@+id/memoryButton"
+                        android:layout_width="26dp"
+                        android:layout_height="26dp"
+                        android:layout_marginEnd="6dp"
+                        android:background="@drawable/pill"
+                        android:gravity="center"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="13sp"
+                        android:fontFamily="sans-serif-medium"
+                        android:contentDescription="Previous scans"
+                        android:text="&#128193;" />
+
                     <!-- On-device diagnostics button -->
                     <TextView
                         android:id="@+id/infoButton"

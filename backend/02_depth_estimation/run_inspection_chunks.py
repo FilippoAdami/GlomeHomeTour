@@ -24,10 +24,10 @@ import torch
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
-from pipeline_paths import bootstrap
+from Utilities.pipeline_paths import bootstrap
 bootstrap()
 
-_da3_src = _backend_dir / "third_party" / "depth_anything_3" / "src"
+_da3_src = _backend_dir / "Utilities" / "third_party" / "depth_anything_3" / "src"
 if _da3_src.is_dir() and str(_da3_src) not in sys.path:
     sys.path.insert(0, str(_da3_src))
 
@@ -131,7 +131,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Running DA3 Multi-View Depth Estimation on {device}...")
     
-    exts = np.stack([kf.transform_matrix for kf in keyframes], axis=0)
+    # These are raw ARCore camera-to-world poses. The estimator takes OpenCV
+    # world-to-camera (the pipeline feeds it COLMAP poses, already in that form),
+    # so this legacy path has to convert for itself.
+    exts = arcore_c2w_to_da3_w2c(np.stack([kf.transform_matrix for kf in keyframes], axis=0))
     K_mat = np.array([
         [intrinsics.fl_x, 0.0, intrinsics.cx],
         [0.0, intrinsics.fl_y, intrinsics.cy],

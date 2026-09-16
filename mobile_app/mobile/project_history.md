@@ -739,3 +739,165 @@ Outcome: Build clean, all 68 unit tests passing (`BUILD SUCCESSFUL`), schema val
 3. **Verification & Deployment:**
    - All unit tests passed (`./gradlew testDebugUnitTest`).
    - Built and deployed directly to connected device (`V4TGH6FENFVWEYAQ`).
+
+### Milestone: Fix Tracking-Recovery Hang/Crash on Re-Anchor to Dense Areas (2026-09-13)
+
+1. **Root Cause:**
+   - `RelocalizationRecovery.estimateAlignment` runs on the render thread and did O(n^3) triangle matching over all landmarks within 3.5m of the camera, times 60 RANSAC iterations.
+   - Re-pointing at an already-densely-scanned area maximizes that nearby landmark count, blowing the search up to billions of ops in one frame -> ANR -> app killed.
+2. **Fix (`RelocalizationRecovery.kt`):**
+   - Capped the candidate set used for triangle matching to 40 landmarks, evenly strided across the near set for spatial spread.
+   - Final inlier consensus scoring still evaluates every nearby landmark, so alignment quality/threshold behavior is unchanged.
+3. **Verification:**
+   - `./gradlew testDebugUnitTest --tests "*RelocalizationRecoveryTest*"` passed, full build succeeded.
+
+### Milestone: Fix Landmark Cap Stall & Mirrored Realignment (2026-09-13)
+
+1. **Root Cause 1 — Scan stalls at 2048 points:**
+   - `FeatureParallaxTracker.maxLandmarks` was a hard-coded `2048`-slot array. With
+     `MIN_LANDMARK_SPACING_M = 0.06f`, a full-home scan easily needs far more landmarks than that;
+     once full, `canPromoteLandmark`/`addPermanentLandmark` silently refused all further points, so
+     no new point could turn green for the rest of the scan.
+   - Fix: raised `maxLandmarks` to 20000 (`FeatureParallaxTracker.kt`) and matched the
+     `scratchLandmarkX/Y/Z` buffers in `MainActivity.kt`.
+2. **Root Cause 2 — Bad re-alignment after tracking loss:**
+   - `RelocalizationRecovery.solve3PointRigid` matched candidate triangles by edge length only,
+     which is satisfied equally by a true rotation or its mirror image. RANSAC could accept a
+     reflection (det(R) = -1) as a "match," flipping/warping the whole landmark cloud instead of
+     rigidly re-aligning it.
+   - Fix: reject any candidate transform whose rotation determinant isn't ~+1 (mirror solutions are
+     now discarded so RANSAC keeps searching for a proper rigid match).
+3. **Verification:** `./gradlew testDebugUnitTest` — full suite passed.
+
+### Milestone: ANR Investigation & Scan Gallery/Delete UI (2026-09-13)
+
+1. **Investigated "crash at 893 points":** Logcat showed no exception/OOM anywhere for the app --
+   an ANR ("Input dispatching timed out... Waited 5002ms for FocusEvent") while `onPause()` was
+   blocked waiting for the GL thread to park (by design, see `MainActivity.kt:1196`'s comment).
+   None of the per-frame paths that scale with landmark count are anywhere near O(seconds) at 893
+   landmarks. The ANR timestamp lines up exactly with `ACTION_POWER_CONNECTED`/USB broadcasts from
+   plugging the phone in for on-device debugging, which is the more likely trigger (storage/USB
+   stack stall) than a code regression. Unconfirmed without a repro off-USB.
+2. **Added "Previous Scans" gallery (`ScanGalleryActivity.kt`):** New pill button on the main HUD
+   (`memoryButton`) opens a list of past scan sessions with date, total size, and a Delete button
+   with a confirmation dialog. Reads both storage locations DatasetWriter can use: MediaStore
+   `Documents/GlomeHomeTour/<session>/` (primary) and the app's external files dir fallback,
+   merged by session name. No new dependency added -- plain `LinearLayout` rows in a `ScrollView`,
+   since the list is small and RecyclerView wasn't already in the project.
+3. **Verification:** `./gradlew testDebugUnitTest` passed; installed and launched on connected
+   device (`V4TGH6FENFVWEYAQ`).
+
+### Milestone: Scan Gallery Delete Progress (2026-09-13)
+
+1. **Root cause of "delete looks blocked":** `deleteScan` ran the MediaStore bulk delete directly
+   on the UI thread with a single LIKE-scoped `contentResolver.delete()` call -- genuinely
+   blocking, not just looking like it, for however long that bulk delete took.
+2. **Fix (`ScanGalleryActivity.kt`):** moved deletion to a background `Thread`; deletes each
+   MediaStore row / fallback file individually (instead of one bulk call) so real 0-100% progress
+   is available, and posts it back via `runOnUiThread`. The row's "Delete" label swaps for a
+   `ProgressBar` + percentage text for the duration.
+3. **Verification:** `./gradlew testDebugUnitTest` passed; installed and launched on connected
+   device (`V4TGH6FENFVWEYAQ`).
+
+### Milestone: Relocalization ID-first matching + background thread (2026-09-13)
+
+1. **Problem:** after a tracking loss, re-alignment relied purely on triangle edge-length
+   congruence between newly observed points and stored landmarks -- geometry-only matching with
+   no memory of which physical feature a point actually was, so it could mismatch under repeated
+   or symmetric geometry. The RANSAC search also ran synchronously on the GL thread, a plausible
+   contributor to the ANR reports around 800-900 points (unconfirmed, see previous milestone).
+2. **ID-first matching (`FeatureParallaxTracker.kt`, `RelocalizationRecovery.kt`):** landmark ID
+   lookup switched from a hash set to a hash map (`landmarkHashSlots`/`landmarkSlotForId`) so a
+   currently-tracked point's ARCore ID can be matched directly against a previously-stored
+   landmark's ID in O(1), skipping geometry guessing whenever the same physical feature is still
+   being tracked by ID across the gap. New `matchById(...)` collects these correspondences;
+   `estimateAlignmentPreferId(...)` solves the rigid transform from them directly
+   (`solveFromIdMatches`) when enough exist, falling back to the existing triangle-congruence
+   RANSAC (`estimateAlignment`) otherwise.
+3. **Cross-frame confirmation:** a single frame's transform estimate is no longer trusted
+   immediately -- `isSimilarTransform(a, b)` compares consecutive passes' results, and only a
+   transform confirmed by two independent passes is applied to the landmark cloud, cutting the
+   chance a single bad match snaps the scan to the wrong pose.
+4. **Off the GL thread (`MainActivity.kt`):** the relocalization block in `onFrame` now only does
+   bounded array copies on the GL thread (landmark snapshot, ID-match arrays); the actual
+   `estimateAlignmentPreferId` call and confirmation comparison run on a dedicated
+   `HandlerThread("relocalization")`, guarded by `relocJobRunning` (AtomicBoolean) so only one
+   search runs at a time, with the confirmed result handed back via
+   `relocConfirmedTransform` (AtomicReference) and applied on the GL thread next frame. This
+   removes the RANSAC search from the render loop entirely, which may also resolve (not yet
+   confirmed) the ANR reports from the previous milestone.
+5. **Scoped down from the fuller design:** skipped persisting full per-landmark camera/viewing
+   history (bigger change, marginal gain over ID+geometry matching) and requiring multiple
+   independent triangle hypotheses to agree within a single RANSAC pass (redundant once
+   cross-frame confirmation exists). Can revisit either if ID-first + cross-frame isn't enough.
+6. **Verification:** `./gradlew testDebugUnitTest` passed; installed and launched on connected
+   device (`V4TGH6FENFVWEYAQ`). Not yet re-tested against a live tracking-loss scenario or the
+   800+ point ANR by the user.
+
+### Milestone: Root-caused the ~800-point freeze — non-power-of-two hash table (2026-09-13)
+
+1. **Root cause (confirmed from the ANR trace, not guessed):** `/data/anr` dump for pid 21184
+   showed `GLThread` **Runnable** with 78 s of user CPU, spinning in
+   `FeatureParallaxTracker.landmarkSlotForId` <- `isLandmark` <- `update` <- `onFrame`. `main` was
+   blocked in `onPause` waiting for that GL thread, which is what surfaced as the ANR. So the
+   earlier "USB broadcast / plugging in the phone" theory was wrong, and moving RANSAC off the GL
+   thread didn't help because relocalization was never the culprit.
+   - The landmark hash map was `IntArray(maxLandmarks * 2)` = 40000 entries, but the probe masks
+     with `size - 1`. 39999 is **not a power of two**, so `and mask` is not a modulo: it has only
+     10 bits set, reaching 1024 distinct buckets, and `idx = (idx + 1) and mask` cycles after
+     visiting just **64** slots. Once any 64-slot window filled up (~800 landmarks in practice,
+     matching every report), `landmarkSlotForId` looped forever. Raising `maxLandmarks` to 20000
+     is what introduced it — the previous 2048 gave 4096, a valid power of two.
+   - `maxCandidates * 2` = 8192 was accidentally still a power of two, so the candidate map was fine.
+2. **Fix (`FeatureParallaxTracker.kt`):** added `tableSizeFor(entries)` = smallest power of two
+   >= 2 * entries, used for both hash maps. Landmarks now get a 65536-slot table. The 2x headroom
+   also means neither table can ever fill, which is what bounds the unguarded insert loops in
+   `addPermanentLandmark`/`allocateCandSlot`.
+3. **Verification:** new `FeatureParallaxTrackerTest` case promotes 1225 landmarks (a 35x35 grid
+   over a 1.2 m baseline) and requires `matchById` to resolve all of them — it hangs on the old
+   code and passes in ~1 s now; plus a check that both table sizes are powers of two. Full
+   `testDebugUnitTest` green, APK built and installed on `V4TGH6FENFVWEYAQ`. Not yet re-tested
+   with a live 2000+ point walkthrough by the user.
+
+## 2026-09-13: Wire real k1/k2 lens distortion into transforms.json
+`transforms.json` had always hardcoded `k1/k2/p1/p2` to `0.0`, even though the schema, backend
+`package_loader.py`, and `sfm_refinement.py`'s bundle adjustment already consume them (seeding
+its distortion refinement from zero every time). `CameraPipeline` now reads
+`CameraCharacteristics.LENS_DISTORTION` (API 28+, static per physical camera) once in `start()`
+and maps kappa_0/kappa_1 to k1/k2 as an approximate seed -- Android's model is a 5-term rational
+model with no tangential term, not an exact match for OpenCV's plumb-bob (k1,k2,p1,p2), so p1/p2
+stay 0. Threaded through `DatasetWriter.finish` -> `DatasetFormat.transformsJson`.
+Outcome: done — compiles, existing + new `DatasetTest` cases pass.
+
+## 2026-09-13: Zip capture output on finish(), delete leftover empty folders
+Ask: after a capture completes, save the whole dataset as a single zip and leave nothing else on
+the phone; make delete also clean up the empty per-session folders the phone had accumulated.
+Investigation found the empty-folder complaint was structural, not a missed `deleteRecursively()`
+call: `DatasetWriter`'s MediaStore path wrote every session under its own
+`Documents/GlomeHomeTour/<session>/` subfolder, but MediaStore only tracks *files* as rows, not
+the directories it creates for them — once every file row under a session is deleted, the
+directory itself (and its `images/` subfolder) is an orphaned real folder on disk with no
+MediaStore row to delete, and plain `File.delete()` on it fails with `EACCES` under scoped
+storage (confirmed via `adb shell ls` on `rosemary`: a folder deleted through the gallery UI
+still had its `images/` subdir on disk afterwards, permission-denied to the app).
+Fix: `DatasetWriter.finish()` now zips the session (images + manifests) into a single
+`"$sessionName.zip"` and deletes the loose originals from the writer thread
+(`zipAndCleanup`/`zipFromMediaStore`/`zipFromFallback`). Root-caused the folder problem instead
+of patching around it: the MediaStore path no longer creates a per-session subfolder at all --
+every file is written flat under the shared `Documents/GlomeHomeTour/` album with the session
+name prefixed onto the filename (`flatMediaName`/`unflattenMediaName`, unit-tested in
+`DatasetWriterFlatNameTest`), so there is no per-session directory left to orphan. The
+fallback (non-MediaStore) path already used real per-session `File` folders and
+`deleteRecursively()`, which works fine under app-private storage, so it was left as-is.
+`ScanGalleryActivity` now lists/deletes zips (`mediaZipId`/`fallbackZipFile`) plus two legacy
+cases for scans captured before this change: old nested-folder sessions (`legacyMediaSession`,
+best-effort empty-dir cleanup via `deleteEmptyDirUpwards`, which does NOT work on `rosemary` --
+confirmed on-device, scoped storage denies the `File.delete()` without `MANAGE_EXTERNAL_STORAGE`
+-- so pre-existing orphaned folders from before this fix are stuck until manually cleared via a
+file manager with root/ADB) and old crashed-mid-capture flat sessions (`legacyFlatMediaSession`).
+Outcome: done — compiles, `DatasetWriterFlatNameTest` passes, APK built and installed on
+`V4TGH6FENFVWEYAQ`. Verified end-to-end on-device: app launches, gallery lists a pre-existing
+legacy nested-folder scan correctly, delete removes all its MediaStore rows and clears the list.
+Not verified: a live capture through `finish()` producing an actual zip (needs a real ARCore walk
+around a room, can't be driven from this sandbox — see project's `arcore-pointcloud-not-a-tracking-gate`
+memory). Ask the user to run one real capture and check the gallery shows a single zip afterward.

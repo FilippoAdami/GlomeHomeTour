@@ -110,3 +110,19 @@ Still not fixable here: 6 pairs of *adjacent* stage-2 frames are themselves disj
 0.00-0.29), including the user-reported 454/455 (stage2 1257->1258). No subset of the input can
 bridge those — they are capture-side jumps, possibly widened by stage 1/2 dropping a blurred
 frame that was the only link. Reported as `unavoidable_gap` rather than hidden.
+
+## 2026-09-14: split into step 1, with the parallax/keyframe stages moved downstream
+`step_filter_quality.py` is now stage 1 of the old three-stage filter and nothing
+more — `QualityGate` itself is reused unchanged. The parallax and keyframe stages
+moved to `02_depth_estimation/step_filter_depth.py`, where COLMAP's triangulated
+geometry replaces their estimated depth and their frustum-overlap approximation.
+
+Outcome: worked — 1400/1431 kept on Bedroom2 (31 blur, 0 exposure, 0 texture) in
+19 s. Per-frame reason/value/threshold/margin goes to `filter_quality_stats.json`,
+never into transforms.json: the schema is frozen with `additionalProperties: false`
+and rejects an extra `reason` field. The reject cap's re-accepts are inferred
+(accepted frames scoring under the relative blur threshold) because the cap
+mutates flags before metrics are built.
+
+Frames are moved to `discarded/` with their camera entry, and `--force` calls
+`merge_back()` first so a re-run judges its original input.

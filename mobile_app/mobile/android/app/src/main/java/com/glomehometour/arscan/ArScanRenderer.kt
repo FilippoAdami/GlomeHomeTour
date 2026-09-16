@@ -346,7 +346,6 @@ class ArScanRenderer(
             android.util.Log.i("AR-Scan", "Selected wideId: $wideId, sustained60Fps: $sustained60Fps")
             val candidates = if (wideId != null) configs.filter { it.cameraId == wideId } else configs
             val best = candidates
-                .filter { it.imageSize.width <= MAX_CPU_IMAGE_WIDTH && it.imageSize.height <= MAX_CPU_IMAGE_HEIGHT }
                 .maxByOrNull { it.imageSize.width.toLong() * it.imageSize.height }
             if (best != null) {
                 android.util.Log.i("AR-Scan", "Setting s.cameraConfig = cameraId:${best.cameraId} size:${best.imageSize.width}x${best.imageSize.height}")
@@ -815,9 +814,6 @@ class ArScanRenderer(
         const val MAX_OVERLAY_TRIANGLES = 120_000
         private const val MAX_PLANE_VERTS = 8192
         const val MAX_POINT_SPRITES = 8192
-
-        private const val MAX_CPU_IMAGE_WIDTH = 1920
-        private const val MAX_CPU_IMAGE_HEIGHT = 1080
 
         private const val NEAR_M = 0.1f
         private const val FAR_M = 30f

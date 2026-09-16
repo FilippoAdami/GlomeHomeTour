@@ -18,14 +18,16 @@ import numpy as np
 import torch
 import cv2
 
-_backend_dir = Path(__file__).resolve().parent
+_backend_dir = Path(__file__).resolve().parent.parent
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
+from Utilities.pipeline_paths import bootstrap
+bootstrap()
 
-from ingestion.package_loader import PackageLoader
+from package_loader import PackageLoader
 from run_sliding_window_reconstruction import extract_depth_adaptive_keyframes
-from reconstruction.depth_priors import DepthPriorEstimator
-from reconstruction.initialization import SurfelCloudInitializer
+from depth_priors import DepthPriorEstimator, arcore_c2w_to_da3_w2c
+from initialization import SurfelCloudInitializer
 
 
 def main():
@@ -84,7 +86,10 @@ def main():
     print("\n[Phase 2] Multi-View Sliding Window Depth Estimation (DA3-BASE, N=6, K=2)...")
     t2_start = time.perf_counter()
 
-    exts = np.stack([kf.transform_matrix for kf in depth_keyframes], axis=0)
+    # These are raw ARCore camera-to-world poses. The estimator takes OpenCV
+    # world-to-camera (the pipeline feeds it COLMAP poses, already in that form),
+    # so this legacy path has to convert for itself.
+    exts = arcore_c2w_to_da3_w2c(np.stack([kf.transform_matrix for kf in depth_keyframes], axis=0))
     K_mat = np.array([
         [intrinsics.fl_x, 0.0, intrinsics.cx],
         [0.0, intrinsics.fl_y, intrinsics.cy],

@@ -1,5 +1,6 @@
 package com.glomehometour.arscan
 
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.ImageFormat
@@ -16,6 +17,8 @@ import java.io.FileOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /** Camera planes -> NV21, split into the cheap half (GL thread) and the per-pixel half
  * (writer thread). */
@@ -107,13 +110,19 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     private var nv21: ByteArray? = null
 
     @Volatile private var useMediaStore = true
-    private val relativeRoot = "Documents/$ALBUM/$sessionName"
+    /** MediaStore files are kept flat, directly under the shared album folder, with every
+     * filename prefixed by [sessionName] ("$sessionName_frame_00005.jpg", etc). A per-session
+     * subfolder would leave an empty, permission-denied directory behind once its files are
+     * deleted -- MediaStore doesn't track directories, so nothing can ever clean it back up under
+     * scoped storage (see project_history.md). One shared folder never has that problem. */
+    private val mediaAlbumPath = "Documents/$ALBUM"
 
     val keyframeCount: Int get() = keyframes.size
 
     /** Human-readable destination for the HUD; only meaningful after the probe has run. */
     val destination: String
-        get() = if (useMediaStore) relativeRoot else File(context.getExternalFilesDir(null), sessionName).absolutePath
+        get() = if (useMediaStore) "$mediaAlbumPath/$sessionName*"
+        else File(context.getExternalFilesDir(null), sessionName).absolutePath
 
     init {
         handler.post { probeSink() }
@@ -195,13 +204,17 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     /**
      * GL thread. Serialises the manifests and flushes them once the keyframe queue drains (the
      * writer is a single ordered handler thread, so posting last is enough to be last).
-     * onDone fires on the writer thread.
+     * Once everything is on disk it's re-packed as a single "$sessionName.zip" next to the
+     * session folder and the loose files/folder are deleted, so nothing but the zip survives on
+     * the phone (SPEC: nothing else saved). onDone fires on the writer thread with the zip path.
      */
     fun finish(
         fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int,
-        summaryJson: String, onDone: (String) -> Unit,
+        summaryJson: String,
+        k1: Float? = null, k2: Float? = null,
+        onDone: (String) -> Unit,
     ) {
-        val transforms = DatasetFormat.transformsJson(fx, fy, cx, cy, width, height, keyframes)
+        val transforms = DatasetFormat.transformsJson(fx, fy, cx, cy, width, height, keyframes, k1, k2)
         val csv = trajectory.toString()
         val focusJson = DatasetFormat.focusMetadataJson(keyframes)
         handler.post {
@@ -209,7 +222,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             writeText("trajectory.csv", "text/csv", csv)
             writeText("coverage_summary.json", "application/json", summaryJson)
             writeText("focus_metadata.json", "application/json", focusJson)
-            onDone(destination)
+            onDone(zipAndCleanup())
         }
     }
 
@@ -222,7 +235,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     private fun probeSink() {
         if (!useMediaStore) return
         try {
-            val uri = insert("images", "probe.jpg", "image/jpeg") ?: throw IllegalStateException("insert returned null")
+            val uri = insert(flatName("images", "probe.jpg"), "image/jpeg") ?: throw IllegalStateException("insert returned null")
             context.contentResolver.delete(uri, null, null)
         } catch (e: Exception) {
             Log.w(TAG, "MediaStore rejected the dataset layout, falling back to app storage", e)
@@ -244,7 +257,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             target.mkdirs()
             return FileOutputStream(File(target, name))
         }
-        val uri = insert(dir, name, mime) ?: return null
+        val uri = insert(flatName(dir, name), mime) ?: return null
         val stream = context.contentResolver.openOutputStream(uri) ?: return null
         // IS_PENDING keeps half-written files hidden from other apps; clearing it is what
         // publishes them (same lesson as mobile_sphere_capture's GalleryOutput).
@@ -260,11 +273,15 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         }
     }
 
-    private fun insert(dir: String?, name: String, mime: String): Uri? {
+    private fun flatName(dir: String?, name: String): String = flatMediaName(sessionName, dir, name)
+
+    private fun insert(name: String, mime: String): Uri? = insertAt(mediaAlbumPath, name, mime)
+
+    private fun insertAt(relativePath: String, name: String, mime: String): Uri? {
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, if (dir == null) relativeRoot else "$relativeRoot/$dir")
+            put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         return context.contentResolver.insert(
@@ -272,9 +289,84 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         )
     }
 
+    /**
+     * Writer thread, called once every manifest is flushed. Packs the whole session (images +
+     * manifests) into a single "$sessionName.zip" alongside the flat album folder / session
+     * folder, then deletes the loose originals so only the zip remains.
+     */
+    private fun zipAndCleanup(): String {
+        val zipName = "$sessionName.zip"
+        return if (useMediaStore) zipFromMediaStore(zipName) else zipFromFallback(zipName)
+    }
+
+    private fun unflatten(displayName: String): String = unflattenMediaName(sessionName, displayName)
+
+    private fun zipFromMediaStore(zipName: String): String {
+        val filesUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val entries = mutableListOf<Pair<Long, String>>()
+        context.contentResolver.query(
+            filesUri,
+            arrayOf(MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.DISPLAY_NAME),
+            "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?",
+            arrayOf(mediaAlbumPath, "${sessionName}_%"),
+            null,
+        )?.use { cursor ->
+            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+            while (cursor.moveToNext()) {
+                entries.add(cursor.getLong(idCol) to unflatten(cursor.getString(nameCol)))
+            }
+        }
+
+        try {
+            val zipUri = insert(zipName, "application/zip") ?: throw IllegalStateException("insert returned null")
+            context.contentResolver.openOutputStream(zipUri)?.use { out ->
+                ZipOutputStream(out).use { zos ->
+                    for ((id, entryName) in entries) {
+                        context.contentResolver.openInputStream(ContentUris.withAppendedId(filesUri, id))?.use { input ->
+                            zos.putNextEntry(ZipEntry(entryName))
+                            input.copyTo(zos)
+                            zos.closeEntry()
+                        }
+                    }
+                }
+            }
+            context.contentResolver.update(
+                zipUri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "zip write failed, leaving loose files in place", e)
+            return mediaAlbumPath
+        }
+
+        for ((id, _) in entries) {
+            context.contentResolver.delete(ContentUris.withAppendedId(filesUri, id), null, null)
+        }
+        return "$mediaAlbumPath/$zipName"
+    }
+
+    private fun zipFromFallback(zipName: String): String {
+        val sessionDir = File(context.getExternalFilesDir(null), sessionName)
+        val zipFile = File(sessionDir.parentFile, zipName)
+        try {
+            ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
+                sessionDir.walkTopDown().filter { it.isFile }.forEach { file ->
+                    zos.putNextEntry(ZipEntry(file.relativeTo(sessionDir).path))
+                    file.inputStream().use { it.copyTo(zos) }
+                    zos.closeEntry()
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "zip write failed, leaving loose files in place", e)
+            return sessionDir.absolutePath
+        }
+        sessionDir.deleteRecursively()
+        return zipFile.absolutePath
+    }
+
     companion object {
         private const val TAG = "ArScan"
-        private const val ALBUM = "GlomeHomeTour"
+        const val ALBUM = "GlomeHomeTour"
         private const val JPEG_QUALITY = 92
         /** Deep enough to ride out an encode that runs long, shallow enough that a sustained
          * backlog is dropped now rather than eaten as latency and RAM. */
@@ -282,5 +374,35 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
          * the next one may be taken. Keyframes are capped at 5 Hz and a 1080p encode is ~40 ms,
          * so the queue is rarely the thing that drops a frame; droppedQueue says if it is. */
         private const val MAX_QUEUED = 1
+    }
+}
+
+/** "$sessionName_$name" for root files, "$sessionName_${dir}_$name" for e.g. images -- keeps
+ * every MediaStore file for this session unique and self-groupable under the flat album folder
+ * without ever creating a per-session directory (see DatasetWriter.mediaAlbumPath). */
+internal fun flatMediaName(sessionName: String, dir: String?, name: String): String =
+    if (dir == null) "${sessionName}_$name" else "${sessionName}_${dir}_$name"
+
+/** Inverse of [flatMediaName]: strips the session prefix back off a MediaStore display name so
+ * it can be re-added to the zip at the same path the fallback (nested-folder) writer produces,
+ * e.g. "${sessionName}_images_frame_00005.jpg" -> "images/frame_00005.jpg". */
+internal fun unflattenMediaName(sessionName: String, displayName: String): String {
+    val rest = displayName.removePrefix("${sessionName}_")
+    return if (rest.startsWith("images_")) "images/${rest.removePrefix("images_")}" else rest
+}
+
+/** Deletes [dir] and then its parents, one level at a time, stopping at the first non-empty
+ * (or missing) directory and never at or above [stopAt] (the shared album folder — other
+ * sessions live there, and it must never cascade up into Documents/ itself). Shared by
+ * DatasetWriter (post-zip cleanup) and ScanGalleryActivity (deleting legacy loose sessions). */
+internal fun deleteEmptyDirUpwards(dir: File, stopAt: File) {
+    var current: File? = dir
+    while (
+        current != null && current != stopAt && current.isDirectory &&
+        current.list()?.isEmpty() == true
+    ) {
+        val parent = current.parentFile
+        if (!current.delete()) break
+        current = parent
     }
 }

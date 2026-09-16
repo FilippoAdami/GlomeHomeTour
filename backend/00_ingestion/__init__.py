@@ -1,7 +1,10 @@
 """GlomeHomeTour Backend: Ingestion Layer.
 
-Exposes package loading, schema contract verification, quality gating,
-timestamp-to-VIO pose alignment, and hybrid SfM pose refinement.
+Exposes package loading, schema contract verification, quality gating, and
+timestamp-to-VIO pose alignment.
+
+Pose refinement now lives in stage 2 (``01_poses_refinment/``), which drives
+COLMAP triangulation via ``convert_transforms_to_colmap.py``.
 """
 
 from package_loader import (
@@ -32,11 +35,6 @@ from quality_gate import (
     QualityGateResult,
     prune_redundant,
 )
-from sfm_refinement import (
-    HybridSfMRefiner,
-    SfMRefinementResult,
-)
-
 __all__ = [
     "CameraIntrinsics",
     "CapturePackage",
@@ -58,6 +56,4 @@ __all__ = [
     "DynamicKeyframeSelector",
     "KeyframeSelectionResult",
     "estimate_scene_depths",
-    "HybridSfMRefiner",
-    "SfMRefinementResult",
 ]

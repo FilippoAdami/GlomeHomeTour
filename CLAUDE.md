@@ -93,16 +93,24 @@ glome-home-tour/
 ├── ml/
 │   └── depth-model/           # training/export/quantization for the on-device depth model
 │                               # (separate env from backend/ — export tooling, not ROCm)
-├── backend/
-│   ├── ingestion/              # frame extraction, pose/timestamp matching
-│   ├── reconstruction/
+├── backend/                       # numbered folders = pipeline stage order; flat modules within
+│   │                               # each stage, imported via backend/pipeline_paths.py bootstrap
+│   ├── 00_ingestion/            # frame extraction, quality gate, parallax dedup, pose/timestamp matching
+│   ├── 01_poses_refinment/       # COLMAP/SfM pose refinement (mostly unfilled, ported from another project)
+│   ├── 02_depth_estimation/       # Depth Anything 3 inference, surfel-cloud initialization
+│   ├── 03_2DGS_training/           # 2DGS optimization loop, density control
 │   │   ├── rasterizer_hip/            # hand-authored HIP 2DGS rasterizer (ROCm/RDNA4)
-│   │   ├── training/                  # 2DGS optimization loop, density control
 │   │   └── rasterizer_torch_fallback/ # pure-PyTorch rasterizer, correctness oracle
+│   ├── 04_2DGS_refinment/           # material learning & other 2DGS model refinement (unfilled)
+│   ├── 05_2DGS_to_mesh/               # mesh extraction from the trained 2DGS scene
+│   ├── 06_mesh_refinment/              # mesh refinement (unfilled)
 │   ├── floorplan/               # cross-section slicing, RANSAC, Manhattan regularization
 │   ├── panorama/                 # viewpoint discovery, equirectangular synthesis
 │   ├── api/                       # job submission/status, asset packaging
-│   └── worker/                     # queue consumer, GPU job runner
+│   └── Utilities/                  # cross-stage tooling, not a pipeline step
+│       ├── pipeline_paths.py          # sys.path bootstrap so stage modules import by flat name
+│       ├── worker/                     # queue consumer, GPU job runner
+│       └── third_party/                 # vendored deps (e.g. depth_anything_3)
 ├── web/
 │   ├── viewer/                      # 2DGS Three.js web viewer
 │   └── minimap/                      # 2D floor plan widget
@@ -144,7 +152,7 @@ fixes stay on Sonnet regardless of which subsystem they're in.
 than carrying the stale context forward.
 
 **`project_history.md` per app folder:** each `mobile_*/` (and any other actively-iterated
-subfolder, e.g. `backend/reconstruction/`) keeps a `project_history.md` at its root logging what
+subfolder, e.g. any `backend/0N_*` stage folder) keeps a `project_history.md` at its root logging what
 was tried and the outcome, in order, one entry per attempt. Before starting work in that folder,
 read its `project_history.md` first so you don't repeat an approach already tried and rejected.
 At the end of a macro task (a meaningful chunk of work, not every small edit) in that folder,

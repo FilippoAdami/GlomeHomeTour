@@ -26,7 +26,7 @@ import kotlin.math.sqrt
  *    - Snaps initial inaccurate monocular depth estimations to the true geometric ray intersection.
  */
 class FeatureParallaxTracker(
-    private val maxLandmarks: Int = 2048,
+    private val maxLandmarks: Int = 20000,
     private val maxCandidates: Int = 4096,
 ) {
     // ---- PERSISTENT VERIFIED LANDMARKS (NEVER DELETED ONCE GREEN) ----
@@ -52,12 +52,21 @@ class FeatureParallaxTracker(
     private val candLastSeenNs = LongArray(maxCandidates)
     private var candidateCount: Int = 0
 
-    // Fast open-addressed hash map for active candidates: pointId -> slot
-    private val candHashKeys = IntArray(maxCandidates * 2) { EMPTY_KEY }
-    private val candHashSlots = IntArray(maxCandidates * 2) { -1 }
+    // Both maps below probe with `idx = (idx + 1) and mask`, which is only a valid wrap when the
+    // table size is a power of two. A raw `count * 2` is not: for 20000 landmarks the mask 39999
+    // has 10 bits set, so the AND reaches only 2^10 = 1024 distinct buckets and the probe walk
+    // cycles among them instead of ever reaching an EMPTY_KEY -- lookups spun forever on the GL
+    // thread at ~800 landmarks (ANR). Rounding up keeps the table at >= 2x the entry count, so it
+    // also can never fill, which is what bounds the insert loops in addPermanentLandmark/
+    // allocateCandSlot.
 
-    // Fast open-addressed hash set for verified landmark IDs
-    private val landmarkHashKeys = IntArray(maxLandmarks * 2) { EMPTY_KEY }
+    // Fast open-addressed hash map for active candidates: pointId -> slot
+    private val candHashKeys = IntArray(tableSizeFor(maxCandidates)) { EMPTY_KEY }
+    private val candHashSlots = IntArray(tableSizeFor(maxCandidates)) { -1 }
+
+    // Fast open-addressed hash map for verified landmarks: pointId -> slot
+    private val landmarkHashKeys = IntArray(tableSizeFor(maxLandmarks)) { EMPTY_KEY }
+    private val landmarkHashSlots = IntArray(tableSizeFor(maxLandmarks)) { -1 }
 
     // Target verified landmarks to reach 100% room coverage
     val targetLandmarkCount: Int = TARGET_ROOM_LANDMARKS
@@ -211,24 +220,58 @@ class FeatureParallaxTracker(
         landmarkPromoteTimeNs[slot] = timestampNs
         verifiedLandmarkCount++
 
-        // Insert into landmark hash set
+        // Insert into landmark hash map
         val mask = landmarkHashKeys.size - 1
         var idx = (id * 0x45d9f3b) and mask
         while (landmarkHashKeys[idx] != EMPTY_KEY) {
             idx = (idx + 1) and mask
         }
         landmarkHashKeys[idx] = id
+        landmarkHashSlots[idx] = slot
     }
 
-    private fun isLandmark(id: Int): Boolean {
+    private fun isLandmark(id: Int): Boolean = landmarkSlotForId(id) >= 0
+
+    private fun landmarkSlotForId(id: Int): Int {
         val mask = landmarkHashKeys.size - 1
         var idx = (id * 0x45d9f3b) and mask
         while (true) {
             val k = landmarkHashKeys[idx]
-            if (k == id) return true
-            if (k == EMPTY_KEY) return false
+            if (k == id) return landmarkHashSlots[idx]
+            if (k == EMPTY_KEY) return -1
             idx = (idx + 1) and mask
         }
+    }
+
+    /**
+     * Free, unambiguous correspondences for relocalization: points in the current frame whose
+     * ARCore ID already belongs to a verified landmark (ARCore can preserve IDs across a brief
+     * tracking interruption, though not a full reset). Far cheaper and far less error-prone than
+     * blind triangle-congruence matching, so it's always worth checking first.
+     * Returns the number of matched pairs written into the out arrays.
+     */
+    fun matchById(
+        pointIds: IntArray,
+        points: FloatArray,
+        numPoints: Int,
+        outCurrentX: FloatArray, outCurrentY: FloatArray, outCurrentZ: FloatArray,
+        outLandmarkX: FloatArray, outLandmarkY: FloatArray, outLandmarkZ: FloatArray,
+    ): Int {
+        var count = 0
+        val maxOut = minOf(outCurrentX.size, outLandmarkX.size)
+        for (i in 0 until numPoints) {
+            if (count >= maxOut) break
+            val slot = landmarkSlotForId(pointIds[i])
+            if (slot < 0) continue
+            outCurrentX[count] = points[i * 4]
+            outCurrentY[count] = points[i * 4 + 1]
+            outCurrentZ[count] = points[i * 4 + 2]
+            outLandmarkX[count] = landmarkX[slot]
+            outLandmarkY[count] = landmarkY[slot]
+            outLandmarkZ[count] = landmarkZ[slot]
+            count++
+        }
+        return count
     }
 
     /**
@@ -426,6 +469,9 @@ class FeatureParallaxTracker(
 
     companion object {
         private const val EMPTY_KEY = -1
+
+        /** Smallest power of two >= 2 * [entries]; see the hash map fields for why it must be one. */
+        internal fun tableSizeFor(entries: Int): Int = Integer.highestOneBit(entries * 2 - 1) * 2
         /** Target count of solid verified landmarks across a typical room to reach 100% (200 solid points). */
         const val TARGET_ROOM_LANDMARKS = 500
         /** Minimum spatial distance between solid permanent landmarks (0.12 m). */

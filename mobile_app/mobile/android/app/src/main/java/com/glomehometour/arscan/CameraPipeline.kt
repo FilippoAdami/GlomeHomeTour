@@ -86,7 +86,14 @@ class CameraPipeline(
     fun start(extraSurfaces: List<android.view.Surface> = emptyList(), onReady: () -> Unit = {}) {
         this.onReady = onReady
         val cameraId = session.cameraConfig.cameraId
-        characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val chars = cameraManager.getCameraCharacteristics(cameraId)
+        characteristics = chars
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            chars.get(CameraCharacteristics.LENS_DISTORTION)?.let { k ->
+                lensDistortionK1 = k.getOrNull(0)
+                lensDistortionK2 = k.getOrNull(1)
+            }
+        }
         val sharedCamera = session.sharedCamera
         if (extraSurfaces.isNotEmpty()) {
             sharedCamera.setAppSurfaces(cameraId, extraSurfaces)
@@ -152,6 +159,19 @@ class CameraPipeline(
     @Volatile var latestAfState: Int = 0
     @Volatile var latestAfMode: Int = 0
     @Volatile var latestFocalLengthMm: Float = 0f
+
+    /**
+     * Static per-physical-camera lens distortion, read once in `start()`. Android's
+     * `LENS_DISTORTION` (API 28+) is a 5-term rational model (kappa_0..4, no tangential term),
+     * not OpenCV's plumb-bob (k1, k2, p1, p2) that `transforms.json` declares -- kappa_0/kappa_1
+     * are used as an approximate seed for k1/k2 (p1/p2 stay 0, Android has no tangential term).
+     * Good enough as a starting point for `sfm_refinement.py`'s bundle adjustment, not an exact
+     * undistortion model on its own. Null on API <28 or if the characteristic is absent.
+     */
+    @Volatile var lensDistortionK1: Float? = null
+        private set
+    @Volatile var lensDistortionK2: Float? = null
+        private set
 
     private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(

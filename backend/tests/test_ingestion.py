@@ -1,4 +1,4 @@
-"""Unit tests for backend/ingestion/ subsystem."""
+"""Unit tests for backend/00_ingestion/ subsystem."""
 
 import io
 import json
@@ -8,11 +8,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
 
-from ingestion.package_loader import (
+from package_loader import (
     CapturePackage,
     Keyframe,
     PackageLoader,
@@ -20,7 +21,7 @@ from ingestion.package_loader import (
     TrajectorySample,
     find_schemas_dir,
 )
-from ingestion.pose_aligner import (
+from pose_aligner import (
     PoseAligner,
     matrix_to_quaternion,
     opencv_to_opengl,
@@ -28,8 +29,7 @@ from ingestion.pose_aligner import (
     quaternion_slerp,
     quaternion_to_matrix,
 )
-from ingestion.quality_gate import QualityGate
-from ingestion.sfm_refinement import HybridSfMRefiner
+from quality_gate import QualityGate, prune_redundant
 
 
 @pytest.fixture
@@ -238,12 +238,7 @@ def test_quality_gate_blur_detection():
 
 
 def test_quality_gate_redundancy_filter():
-    gate = QualityGate(
-        blur_threshold=10.0,
-        min_translation_m=0.03,  # 3 cm
-        min_rotation_deg=2.0,     # 2 deg
-    )
-
+    """Stage 2: near-duplicate viewpoints are dropped, real baselines are kept."""
     sharp_arr = (np.random.RandomState(42).rand(100, 100, 3) * 255).astype(np.uint8)
     img = Image.fromarray(sharp_arr)
 
@@ -261,13 +256,10 @@ def test_quality_gate_redundancy_filter():
     mat2[0, 3] = 0.10
     kf2 = Keyframe("img2.jpg", 300, 500.0, 500.0, 50.0, 50.0, mat2, lambda: img)
 
-    res = gate.evaluate([kf0, kf1, kf2])
+    kept, dropped = prune_redundant([kf0, kf1, kf2], min_translation_m=0.03, min_rotation_deg=2.0)
 
-    assert 0 in res.accepted_indices
-    assert 1 in res.discarded_indices
-    assert res.metrics[1].rejection_reason == "redundancy"
-    assert 2 in res.accepted_indices
-    assert len(res.accepted_keyframes) == 2
+    assert kept == [0, 2]
+    assert dropped == [1]
 
 
 def test_quality_gate_exposure_filter():
@@ -291,46 +283,75 @@ def test_quality_gate_exposure_filter():
     assert res.metrics[1].rejection_reason == "exposure"
 
 
-# ==============================================================================
-# 4. Hybrid SfM Refinement Tests
-# ==============================================================================
+def _block_pattern(period=40, lo=90, hi=190):
+    """Mid-gray checkerboard: textured, in focus, nothing clipped.
 
-def test_hybrid_sfm_graceful_fallback_on_low_features():
-    from ingestion.package_loader import CameraIntrinsics
+    Thin bright lines on black would be ~90% crushed black and get (correctly)
+    rejected on exposure, and blurred white noise loses all structure and gets
+    (correctly) rejected as featureless -- neither isolates the blur gate.
+    """
+    a = np.full((240, 240), lo, np.uint8)
+    for y in range(0, 240, period):
+        for x in range(0, 240, period):
+            if ((y // period) + (x // period)) % 2 == 0:
+                a[y:y + period, x:x + period] = hi
+    return cv2.cvtColor(a, cv2.COLOR_GRAY2RGB)
 
-    intrinsics = CameraIntrinsics(
-        camera_model="OPENCV",
-        fl_x=500.0, fl_y=500.0, cx=320.0, cy=240.0,
-        w=640, h=480, camera_angle_x=0.6,
-        k1=0.0, k2=0.0, p1=0.0, p2=0.0
-    )
 
-    flat_arr = (np.ones((240, 320, 3)) * 128).astype(np.uint8)
-    img_flat = Image.fromarray(flat_arr)
+def test_quality_gate_uneven_lighting_edge_cases():
+    """Dim-but-sharp frames survive; blurred, clipped and featureless ones don't."""
+    texture = _block_pattern()
 
-    kf0 = Keyframe("img0.jpg", 100, 500.0, 500.0, 320.0, 240.0, np.eye(4), lambda: img_flat)
-    mat1 = np.eye(4)
-    mat1[0, 3] = 0.5
-    kf1 = Keyframe("img1.jpg", 200, 500.0, 500.0, 320.0, 240.0, mat1, lambda: img_flat)
+    def kf(name, arr, x):
+        mat = np.eye(4)
+        mat[0, 3] = x
+        img = Image.fromarray(arr)
+        return Keyframe(name, 100, 500.0, 500.0, 120.0, 120.0, mat, lambda: img)
 
-    refiner = HybridSfMRefiner(min_matches=5)
-    result = refiner.refine(intrinsics, [kf0, kf1])
+    frames = [kf(f"bright_{i}.jpg", texture, 0.5 * i) for i in range(6)]
+    # Same detail at a quarter of the exposure -- sharp, just in shadow.
+    frames.append(kf("dark.jpg", (texture * 0.25).astype(np.uint8), 4.0))
+    # Motion blur: detail gone, structure kept.
+    frames.append(kf("blurred.jpg", cv2.GaussianBlur(texture, (0, 0), 2.0), 5.0))
+    # Sun in the lens: most of the frame clipped to white.
+    blown = texture.copy()
+    blown[:200] = 255
+    frames.append(kf("blown.jpg", blown, 6.0))
+    # Blank wall: nothing to track.
+    frames.append(kf("flat.jpg", np.full((240, 240, 3), 128, np.uint8), 7.0))
 
-    # Should retain input poses gracefully
-    assert len(result.refined_keyframes) == 2
-    np.testing.assert_allclose(result.refined_keyframes[0].transform_matrix, np.eye(4), atol=1e-6)
-    assert result.refined_distortion == (0.0, 0.0, 0.0, 0.0)
+    res = QualityGate().evaluate(frames)
+    reason = {m.file_path: m.rejection_reason for m in res.metrics}
+    assert reason["dark.jpg"] is None
+    assert reason["blurred.jpg"] == "blur"
+    assert reason["blown.jpg"] == "exposure"
+    assert reason["flat.jpg"] == "texture"
+    assert res.summary["accepted"] >= 7
+
+
+def test_quality_gate_reject_cap():
+    """A scan the metric reads as uniformly blurred still yields usable frames."""
+    soft = cv2.GaussianBlur(_block_pattern(), (0, 0), 2.0)
+    frames = []
+    for i in range(10):
+        mat = np.eye(4)
+        mat[0, 3] = 0.5 * i
+        img = Image.fromarray(soft)
+        frames.append(Keyframe(f"f{i}.jpg", 100, 500.0, 500.0, 120.0, 120.0, mat, lambda: img))
+
+    res = QualityGate(blur_threshold=10_000.0).evaluate(frames)
+    assert res.summary["accepted"] >= 8
 
 
 def test_full_ingestion_pipeline(mock_package_dir: Path):
-    """Integration test chaining package loading -> quality gating -> pose sync -> sfm refinement."""
+    """Integration test chaining package loading -> quality gating -> pose sync."""
     # 1. Package loading
     loader = PackageLoader(min_keyframes=2)
     pkg = loader.load(mock_package_dir)
     assert len(pkg.keyframes) == 2
 
     # 2. Quality gating
-    gate = QualityGate(blur_threshold=10.0, min_translation_m=0.01)
+    gate = QualityGate(blur_threshold=10.0)
     gate_res = gate.evaluate(pkg.keyframes)
     assert len(gate_res.accepted_keyframes) == 2
 
@@ -340,9 +361,4 @@ def test_full_ingestion_pipeline(mock_package_dir: Path):
     assert len(synced_kfs) == 2
     for kf in synced_kfs:
         assert kf.transform_matrix.shape == (4, 4)
-
-    # 4. Hybrid SfM refinement
-    refiner = HybridSfMRefiner(min_matches=5)
-    sfm_res = refiner.refine(pkg.intrinsics, synced_kfs)
-    assert len(sfm_res.refined_keyframes) == 2
 
