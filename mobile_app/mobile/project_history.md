@@ -901,3 +901,41 @@ legacy nested-folder scan correctly, delete removes all its MediaStore rows and 
 Not verified: a live capture through `finish()` producing an actual zip (needs a real ARCore walk
 around a room, can't be driven from this sandbox — see project's `arcore-pointcloud-not-a-tracking-gate`
 memory). Ask the user to run one real capture and check the gallery shows a single zip afterward.
+
+## 2026-09-17: Magnetic compass heading in transforms.json
+ARCore's world yaw is arbitrary (wherever tracking started), so the exported scene had no way to
+be locked to real-world orientation. Registered `TYPE_MAGNETIC_FIELD` alongside the existing
+gravity listener, combined via `SensorManager.getRotationMatrix`/`getOrientation` into a
+`compassHeadingDeg` (clockwise from magnetic north, not declination-corrected -- no location fix
+available) updated on every sensor tick and threaded through `writeKeyframe` -> `addKeyframe` ->
+`DatasetFormat.Keyframe` -> `transforms.json`'s per-frame `compass_heading_deg` (`null` until the
+magnetometer produces a first reading).
+Outcome: done — `compileDebugKotlin` and `DatasetTest` (incl. new compass cases) pass. Not
+verified on-device with a live magnetometer reading.
+
+## 2026-09-17: Auto WB converges instead of compounding cold
+Pre-flight auto white balance always landed too cold. Root cause: AWB is off and
+`COLOR_CORRECTION_GAINS` is already applied, but `whiteBalanceGains` re-solved absolutely from
+every frame -- so it kept re-correcting an image that already carried last frame's correction and
+compounded until it clamped. Split into `greyWorldSolve` (unchanged math), `whiteBalanceStep`
+(damped accumulation, 10%/frame + a 2-unit Cb/Cr deadzone, same shape as `meteredExposure`) and
+`whiteBalanceTrim` (operator slider trim on top); the loop now settles over ~1.5 s of the 5 s
+sweep. Touching a WB slider sets `autoWbLocked` so the loop stops fighting the operator; the
+reset button clears it. Dropped the cb/cr slider pre-centering at step 0->1 -- centre now means
+"the converged auto read".
+Outcome: worked — new closed-loop GatingTest walks the feedback path over a tungsten wall and
+asserts it lands neutral without railing; 85 unit tests pass, installed on rosemary and launches.
+The colour result itself still needs a human pointing it at a real wall.
+
+## 2026-09-17: Pre-flight WB hands illuminant estimation to the ISP
+The damped grey-world loop from the entry above converged, but to the wrong answer: grey-world
+neutralises whatever is in the reticle, so a pine floor came out grey-blue instead of wooden. It
+cannot separate "neutral wall under warm light" from "warm surface under neutral light" -- that's
+illuminant estimation, not chroma averaging. Pre-flight now leaves `CONTROL_AWB_MODE_AUTO` on
+through the sweep, echoes the ISP's `COLOR_CORRECTION_GAINS`/`_TRANSFORM` back off the capture
+result, and freezes them at step 0->1 (`CameraPipeline.autoWhiteBalance`, `freezeAutoWhiteBalance`);
+sliders trim on top, reset re-runs the ISP estimate. Deleted `whiteBalanceStep` and the
+accumulation state; `whiteBalanceGains` stays as the one-shot fallback for a device that never
+reports its AWB gains.
+Outcome: worked — rosemary reports them (`WB frozen: isp=true gains=1.1875, 1.0, 2.4824219`, i.e.
+scene-dependent), and the frozen preview looks natural instead of blue. 84 unit tests pass.

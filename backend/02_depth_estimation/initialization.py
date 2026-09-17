@@ -787,7 +787,7 @@ def filter_multiview_consistency(
         valid_obs = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2)
 
         # 1. Surface agreement / consensus check
-        tol = 0.10 + 0.07 * proj_z
+        tol = 0.08 + 0.05 * proj_z
         match = valid_obs & (np.abs(obs_depth - proj_z) <= tol)
         consensus_count += match.astype(np.int32)
 
@@ -807,7 +807,9 @@ def filter_multiview_consistency(
             freespace_violations += empty_space.astype(np.int32)
 
     # 1. Consensus rule: If observed by other views, require at least min_consensus matches.
-    # Uniquely seen points (views_in_frustum == 0) are kept.
+    # Uniquely seen points (views_in_frustum == 0) are kept -- no distance cap. A point no
+    # other camera can see is not evidence of anything except a surface only this view covers,
+    # and culling the far ones just eats the far wall of a large room.
     if min_consensus > 0:
         valid_mask = (views_in_frustum == 0) | (consensus_count >= min_consensus)
     else:
@@ -969,7 +971,7 @@ def regularize_surface_normals_multiview(
 
         obs_depth = np.zeros(n_pts, dtype=np.float32)
         obs_depth[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
-        tol = 0.10 + 0.07 * proj_z
+        tol = 0.08 + 0.05 * proj_z
         match = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2) & (np.abs(obs_depth - proj_z) <= tol)
 
         if not np.any(match):

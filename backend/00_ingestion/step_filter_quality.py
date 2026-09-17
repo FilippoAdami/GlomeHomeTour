@@ -32,12 +32,14 @@ from Utilities.scene_io import load_scene, merge_back, split_scene
 from quality_gate import QualityGate
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+STAGE_DIRNAME = "00_ingestion"
 DISCARD_DIRNAME = "discarded"
 
 
-def filter_quality(workspace: Path, ctx: StepContext, gate: QualityGate | None = None) -> None:
+def filter_quality(workspace: Path, stage_dir: Path, ctx: StepContext,
+                    gate: QualityGate | None = None) -> None:
     gate = gate or QualityGate()
-    scene = load_scene(workspace)
+    scene = load_scene(stage_dir, images_root=workspace)
     keyframes = scene.keyframes()
     total = len(keyframes)
     ctx.note(f"Evaluating {total} frames")
@@ -46,7 +48,8 @@ def filter_quality(workspace: Path, ctx: StepContext, gate: QualityGate | None =
         result = gate.evaluate(keyframes)
 
     reject_names = [Path(keyframes[i].file_path).name for i in result.discarded_indices]
-    kept, rejected = split_scene(workspace, workspace / DISCARD_DIRNAME, reject_names)
+    kept, rejected = split_scene(stage_dir, stage_dir / DISCARD_DIRNAME, reject_names,
+                                  images_root=workspace)
 
     pct = 100.0 * kept / max(1, total)
     ctx.metric("total_in", total)
@@ -121,18 +124,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
-    if not args.force and is_done(workspace, "filter_quality", [workspace / "transforms.json"]):
+    stage_dir = workspace / STAGE_DIRNAME
+    if not args.force and is_done(workspace, "filter_quality", [stage_dir / "transforms.json"]):
         print("[filter_quality] already done, skipping (use --force to re-run)")
         return 0
 
     if args.force:
         # Idempotence: put the previous run's rejects back before re-judging them.
-        restored = merge_back(workspace / DISCARD_DIRNAME, workspace)
+        restored = merge_back(stage_dir / DISCARD_DIRNAME, stage_dir, images_root=workspace)
         if restored:
             print(f"[filter_quality] --force: restored {restored} previously discarded frame(s)")
 
-    with StepContext("filter_quality", workspace) as ctx:
-        filter_quality(workspace, ctx)
+    with StepContext("filter_quality", workspace, artifacts_dir=stage_dir) as ctx:
+        filter_quality(workspace, stage_dir, ctx)
     return 0
 
 

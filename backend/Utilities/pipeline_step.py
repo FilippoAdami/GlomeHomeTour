@@ -61,11 +61,18 @@ def is_done(workspace: Path | str, name: str, outputs: Iterable[Path | str] = ()
 
 
 class StepContext:
-    """Context manager owning one step's log, stats and state entry."""
+    """Context manager owning one step's log, stats and state entry.
 
-    def __init__(self, name: str, workspace: Path | str):
+    ``workspace`` is where the shared ``pipeline_state.json`` lives (always the
+    scene root). ``artifacts_dir`` is where this step's own ``<name>_log.txt``
+    and ``<name>_stats.json`` are written -- its per-stage subfolder, if it has
+    one, else the same as ``workspace``.
+    """
+
+    def __init__(self, name: str, workspace: Path | str, artifacts_dir: Path | str | None = None):
         self.name = name
         self.workspace = Path(workspace)
+        self.artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else self.workspace
         self.metrics: dict[str, Any] = {}
         self.timings: dict[str, float] = {}
         self._started = 0.0
@@ -97,8 +104,9 @@ class StepContext:
 
     def __enter__(self) -> "StepContext":
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._started = time.time()
-        self._log = open(self.workspace / f"{self.name}_log.txt", "w", encoding="utf-8")
+        self._log = open(self.artifacts_dir / f"{self.name}_log.txt", "w", encoding="utf-8")
         self.note("=" * 70)
         self.note(f"  STEP: {self.name}   started {_now()}")
         self.note("=" * 70)
@@ -122,7 +130,7 @@ class StepContext:
             self.note(f"OK in {elapsed:.1f}s")
             status = "ok"
 
-        (self.workspace / f"{self.name}_stats.json").write_text(
+        (self.artifacts_dir / f"{self.name}_stats.json").write_text(
             json.dumps(self.metrics, indent=2, default=str), encoding="utf-8")
         write_state(self.workspace, self.name, {
             "status": status,

@@ -47,27 +47,37 @@ from densify_pointcloud import remove_outliers, voxel_dedup
 from export_keyframes import (MAX_SAMPSON_REJECT_FRAC, filter_by_sampson,
                               prune_model, registered_names, sampson_rejects)
 from scene.dataset_readers import storePly
+from scene_extent import scene_extent, write_scene_size_txt
+from select_keyframes_arcore import select_keyframes_arcore
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+MANIFEST_DIRNAME = "00_ingestion"    # transforms.json lives here; images/ stays at workspace root
+STAGE_DIRNAME = "01_poses_refinment"
 DISCARD_DIRNAME = "colmap_discarded_images"
+DIAGNOSTICS_DIRNAME = "colmap_diagnostics"
 CONVERTER = _backend_dir / "01_poses_refinment" / "convert_transforms_to_colmap.py"
 
 MAX_SAMPSON_PX = 2.0
 # A run that registers less of the capture than this has failed, whatever the
 # per-frame numbers say -- carrying on would train on a fragment of the room.
 MIN_REGISTERED_FRAC = 0.7
+MAX_ROTATION_DRIFT_DEG = 10.0
+MAX_TRANSLATION_DRIFT_M = 0.25
 VOXEL_SIZE_M = 0.01
 OUTLIER_NEIGHBOURS, OUTLIER_STD_RATIO = 20, 2.0
 
 
-def run_colmap(workspace: Path, ctx: StepContext, matcher: str = "sequential") -> None:
+def run_colmap(workspace: Path, diagnostics_dir: Path, ctx: StepContext,
+               matcher: str = "sequential") -> None:
     cmd = [sys.executable, str(CONVERTER),
            "-s", str(workspace),
+           "--transforms", f"{MANIFEST_DIRNAME}/transforms.json",
+           "--database", f"{STAGE_DIRNAME}/colmap_database.db",
            "--matcher", matcher,
            "--refine_poses",
            "--no_keyframes",
            "--keep_database",
-           "--diagnostics", str(workspace / "colmap_diagnostics")]
+           "--diagnostics", str(diagnostics_dir)]
     ctx.note(f"$ {' '.join(cmd)}")
     with ctx.timer("colmap"):
         # Streamed, not captured: COLMAP is the long pole in the pipeline and a
@@ -76,12 +86,12 @@ def run_colmap(workspace: Path, ctx: StepContext, matcher: str = "sequential") -
     if proc.returncode != 0:
         raise RuntimeError(
             f"convert_transforms_to_colmap.py failed (exit {proc.returncode}). "
-            f"See the output above and {workspace / 'colmap_log.txt'}.")
+            f"See the output above and {diagnostics_dir / 'colmap_log.txt'}.")
 
 
-def log_diagnostics(workspace: Path, ctx: StepContext) -> None:
+def log_diagnostics(diagnostics_dir: Path, ctx: StepContext) -> None:
     """Fold the converter's own diagnostics into this step's stats."""
-    report_path = workspace / "colmap_diagnostics" / "diagnostics_report.json"
+    report_path = diagnostics_dir / "diagnostics_report.json"
     if not report_path.exists():
         ctx.note("No diagnostics_report.json written; skipping diagnostic metrics")
         return
@@ -144,16 +154,39 @@ def clean_point_cloud(sparse_dir: Path, ctx: StepContext) -> None:
              f"-> {len(xyz)} (outlier removal), written to points3D.ply")
 
 
-def colmap_step(workspace: Path, ctx: StepContext, matcher: str = "sequential") -> None:
-    scene = load_scene(workspace)
+def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostics_dir: Path,
+                 discard_dir: Path, ctx: StepContext, matcher: str = "sequential") -> None:
+    scene = load_scene(manifest_dir, images_root=workspace)
+    raw_names = set(scene.names)
+    raw_total = len(raw_names)
+    ctx.note(f"Input scene has {raw_total} frames")
+
+    # Keyframe selection based on room extent & ARCore trajectory geometry
+    selected_frames, kf_meta = select_keyframes_arcore(scene.frames)
+    ctx.metric("arcore_keyframe_selection", kf_meta)
+    extent = kf_meta.get("extent", {})
+    area = extent.get("floor_area_m2", "?")
+    ctx.note(f"ARCore room extent: {extent.get('room_dim_x', '?')}m x {extent.get('room_dim_z', '?')}m, "
+             f"estimated floor area {area} m² (standoff {extent.get('standoff_m', 0.8)}m)")
+
+    selected_names = {Path(f["file_path"]).name for f in selected_frames}
+    non_kf_names = raw_names - selected_names
+    if non_kf_names:
+        ctx.note(f"Pre-COLMAP keyframe selection: keeping {len(selected_names)}/{raw_total} frames "
+                 f"(budget [{kf_meta.get('budget', [0, 0])[0]}..{kf_meta.get('budget', [0, 0])[1]}])")
+        non_kf_dir = stage_dir / "colmap_non_keyframes"
+        split_scene(manifest_dir, non_kf_dir, non_kf_names, images_root=workspace)
+
+    # Re-read scene containing only selected keyframes for COLMAP
+    scene = load_scene(manifest_dir, images_root=workspace)
     all_names = set(scene.names)
     total = len(all_names)
     ctx.note(f"Running COLMAP on {total} frames")
 
-    run_colmap(workspace, ctx, matcher)
+    run_colmap(workspace, diagnostics_dir, ctx, matcher)
 
     sparse_dir = workspace / "sparse" / "0"
-    db_path = workspace / "colmap_database.db"
+    db_path = workspace / STAGE_DIRNAME / "colmap_database.db"
     registered = registered_names(str(sparse_dir))
     unregistered = all_names - registered
     ctx.metric("total_in", total)
@@ -167,7 +200,7 @@ def colmap_step(workspace: Path, ctx: StepContext, matcher: str = "sequential") 
             f"COLMAP registered only {len(registered)}/{total} frames "
             f"({100.0 * len(registered) / max(1, total):.1f}%), under the "
             f"{MIN_REGISTERED_FRAC:.0%} floor. The capture or the matcher is at fault; "
-            "inspect colmap_diagnostics/ before continuing.")
+            f"inspect {diagnostics_dir}/ before continuing.")
 
     with ctx.timer("sampson"):
         rejects = sampson_rejects(str(db_path), str(sparse_dir), MAX_SAMPSON_PX)
@@ -185,16 +218,37 @@ def colmap_step(workspace: Path, ctx: StepContext, matcher: str = "sequential") 
         ctx.note(f"REFUSED to apply the Sampson filter: {len(rejects)}/{len(registered)} frames "
                  f"exceed {MAX_SAMPSON_PX} px, over the {MAX_SAMPSON_REJECT_FRAC:.0%} cap. "
                  "That many bad poses means the model is suspect, not the frames. "
-                 "Keeping every registered frame -- inspect colmap_diagnostics/.")
+                 f"Keeping every registered frame -- inspect {diagnostics_dir}/.")
     elif rejects:
         ctx.note(f"Sampson filter: dropping {len(rejects)} badly posed frame(s) above {MAX_SAMPSON_PX} px")
         for name, err in sorted(rejects.items(), key=lambda kv: -kv[1])[:8]:
             ctx.note(f"    {name}  {err:8.2f} px")
 
-    log_diagnostics(workspace, ctx)
+    log_diagnostics(diagnostics_dir, ctx)
+
+    # Filter catastrophic bundle adjustment drift against ARCore VIO prior
+    drift_outliers = set()
+    per_frame_deltas_path = diagnostics_dir / "per_frame_deltas.csv"
+    if per_frame_deltas_path.exists():
+        import csv
+        with open(per_frame_deltas_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    rot_err = float(r["rotation_delta_deg"])
+                    trans_err = float(r["translation_delta_m"])
+                    if rot_err > MAX_ROTATION_DRIFT_DEG or trans_err > MAX_TRANSLATION_DRIFT_M:
+                        drift_outliers.add(r["image"])
+                except (ValueError, KeyError):
+                    continue
+    if drift_outliers:
+        ctx.metric("pose_drift_outliers", len(drift_outliers))
+        ctx.note(f"Pose drift filter: dropping {len(drift_outliers)} frame(s) with severe ARCore drift "
+                 f"(>{MAX_ROTATION_DRIFT_DEG} deg or >{MAX_TRANSLATION_DRIFT_M*100:.0f} cm): {sorted(drift_outliers)}")
+        keep = keep - drift_outliers
 
     drop = sorted(all_names - keep)
-    kept, rejected = split_scene(workspace, workspace / DISCARD_DIRNAME, drop)
+    kept, rejected = split_scene(manifest_dir, discard_dir, drop, images_root=workspace)
     if drop:
         with ctx.timer("prune_model"):
             # The model must name exactly what images/ holds: the 2DGS loader
@@ -206,9 +260,19 @@ def colmap_step(workspace: Path, ctx: StepContext, matcher: str = "sequential") 
     ctx.metric("kept_pct", round(100.0 * kept / max(1, total), 1))
     ctx.metric("discarded_unregistered", sorted(unregistered)[:50])
     ctx.note(f"Kept {kept}/{total} ({100.0 * kept / max(1, total):.1f}%), "
-             f"moved {rejected} to {DISCARD_DIRNAME}/")
+             f"moved {rejected} to {discard_dir}/")
 
     clean_point_cloud(sparse_dir, ctx)
+
+    extent = scene_extent(sparse_dir)
+    (stage_dir / "scene_extent.json").write_text(json.dumps(extent, indent=2))
+    write_scene_size_txt(stage_dir, extent)
+    ctx.metric("scene_extent", extent)
+    aligned = extent["aligned"]
+    x, y, z = aligned["point_cloud"]["size_m"]
+    ctx.note(f"Wall-aligned scene size ({aligned['rotation_deg_about_up_axis']:.1f} deg "
+             f"about up axis {aligned['up_axis']}): x={x:.2f} y={y:.2f} z={z:.2f} m, "
+             f"written to scene_size.txt")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,18 +284,25 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
-    outputs = [workspace / "sparse" / "0" / "images.txt", workspace / "transforms.json"]
+    manifest_dir = workspace / MANIFEST_DIRNAME
+    stage_dir = workspace / STAGE_DIRNAME
+    diagnostics_dir = stage_dir / DIAGNOSTICS_DIRNAME
+    discard_dir = stage_dir / DISCARD_DIRNAME
+    outputs = [workspace / "sparse" / "0" / "images.txt", manifest_dir / "transforms.json"]
     if not args.force and is_done(workspace, "colmap", outputs):
         print("[colmap] already done, skipping (use --force to re-run)")
         return 0
 
+    non_kf_dir = stage_dir / "colmap_non_keyframes"
     if args.force:
-        restored = merge_back(workspace / DISCARD_DIRNAME, workspace)
+        restored_disc = merge_back(discard_dir, manifest_dir, images_root=workspace)
+        restored_non_kf = merge_back(non_kf_dir, manifest_dir, images_root=workspace)
+        restored = restored_disc + restored_non_kf
         if restored:
-            print(f"[colmap] --force: restored {restored} previously discarded frame(s)")
+            print(f"[colmap] --force: restored {restored} previously moved frame(s)")
 
-    with StepContext("colmap", workspace) as ctx:
-        colmap_step(workspace, ctx, args.matcher)
+    with StepContext("colmap", workspace, artifacts_dir=diagnostics_dir) as ctx:
+        colmap_step(workspace, manifest_dir, stage_dir, diagnostics_dir, discard_dir, ctx, args.matcher)
     return 0
 
 

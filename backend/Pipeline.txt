@@ -7,10 +7,19 @@ Entire pipeline trial run
     - transforms.json to colmap /sparse/0 folder [V]
     - unusable frames and poses removal (unregistered + Sampson filter) [V]
     - sparse cloud voxel dedup + outliers removal [V]
+    - floor count and scene's sqared footage [V]
     - human-inspectable diagnostics [V]
 02_depth_estimation
-    - track covisibility keyframe selection [V] 
+    - scene-size guided keyframe selection [V] 
     - DA3 multiview depth estimation (N=6 K=3 res=756x420 - 13.4min) [V]
     - RGB-Guided Edge Filtering & RANSAC scale-shift alignment [V]
     - Hybrid Dual-Guided Surfel Backprojection (Overexposure Masking + Cross-View Carving)
     - Normal Tube Collapse ( 1.5 cm Normal-Aligned Deduplication) [V]
+03_2DGS_training
+    - surfel budget safety net [V] (no-op below 3M points; escalates voxel grid to 5cm max if over; aborts the stage if still over budget at 5cm -- only ever engages if step 4's own 3M target was bypassed)
+    - point cloud resolution (train.py --point_cloud reads depth/points3D_depth.ply directly; COLMAP's sparse/0/points3D.ply is never touched)
+    - Phase 1: r=425 (DA3-matched resolution) training, iter 0-3,000 -- positions/orientations free, densification ON (loose grad threshold 0.0016, warmup to iter 500), poses locked
+    - Phase 2: r=1 (full res) training, iter 3,000-10,000, chained via --start_checkpoint -- densification ON (strict grad threshold 0.0008, opacity reset every 2,000), TrackGS pose refinement (--refine_poses_during_training, pose_lr 1e-4, lambda_track 0.1)
+    - continuous decoupled pruning (every 100 iters, both phases): opacity < 0.05 cull, view-evidence floater cull (>=8 frustums, <=2 observations)
+    - sensor saturation/glare masking on photometric + normal + dist + multiview losses throughout
+    - checkpoint + point_cloud.ply emitted per stage (2dgs/point_cloud/iteration_<N>/point_cloud.ply, 2dgs/chkpnt<N>.pth)

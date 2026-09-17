@@ -43,18 +43,25 @@ def transforms_schema() -> dict[str, Any]:
 
 @dataclass
 class Scene:
-    """An ``images/`` + ``transforms.json`` pair on disk."""
+    """A ``transforms.json`` and the ``images/`` its ``file_path``s resolve against.
+
+    Usually the same folder (a self-contained "scene folder"), but the live
+    pipeline manifest lives in its own stage subfolder while ``images/`` stays
+    put at the workspace root across every stage -- ``images_root`` lets the
+    two diverge.
+    """
 
     directory: Path
     header: dict[str, Any]      # every transforms.json key except "frames"
     frames: list[dict[str, Any]]
+    images_root: Optional[Path] = None
 
     def __len__(self) -> int:
         return len(self.frames)
 
     @property
     def images_dir(self) -> Path:
-        return self.directory / "images"
+        return (self.images_root or self.directory) / "images"
 
     @property
     def names(self) -> list[str]:
@@ -82,9 +89,10 @@ class Scene:
         """
         import numpy as np
 
+        root = self.images_root or self.directory
         out = []
         for frame in self.frames:
-            path = self.directory / frame["file_path"]
+            path = root / frame["file_path"]
             out.append(Keyframe(
                 file_path=frame["file_path"],
                 timestamp_ns=int(frame["timestamp_ns"]),
@@ -96,14 +104,25 @@ class Scene:
         return out
 
 
-def load_scene(directory: Path | str, *, validate: bool = True) -> Scene:
-    """Read a scene folder, optionally schema-checking it."""
+def load_scene(directory: Path | str, *, validate: bool = True,
+                images_root: Path | str | None = None) -> Scene:
+    """Read a scene folder, optionally schema-checking it.
+
+    ``images_root`` overrides where ``frames[].file_path`` resolves against,
+    for a manifest that lives apart from the ``images/`` it describes.
+    """
     directory = Path(directory)
-    data = json.loads((directory / "transforms.json").read_text(encoding="utf-8"))
+    transforms_file = directory / "transforms.json"
+    if not transforms_file.exists() and (directory / "00_ingestion" / "transforms.json").exists():
+        transforms_file = directory / "00_ingestion" / "transforms.json"
+        if images_root is None:
+            images_root = directory
+    data = json.loads(transforms_file.read_text(encoding="utf-8"))
     if validate:
         jsonschema.validate(instance=data, schema=transforms_schema())
     header = {k: v for k, v in data.items() if k != "frames"}
-    return Scene(directory=directory, header=header, frames=list(data.get("frames", [])))
+    return Scene(directory=directory, header=header, frames=list(data.get("frames", [])),
+                 images_root=Path(images_root) if images_root is not None else None)
 
 
 def write_scene(
@@ -129,16 +148,21 @@ def split_scene(
     src_dir: Path | str,
     dst_dir: Path | str,
     reject_names: Iterable[str],
+    *,
+    images_root: Path | str | None = None,
 ) -> tuple[int, int]:
     """Move rejected frames out of ``src_dir`` into their own scene folder.
 
-    ``reject_names`` are basenames. Returns ``(kept, rejected)``.
+    ``reject_names`` are basenames. Returns ``(kept, rejected)``. ``images_root``
+    is where the images physically live, if not ``src_dir`` itself -- ``dst_dir``
+    stays self-contained (its own ``images/`` + ``transforms.json``) either way.
 
     Both manifests are built in memory before anything moves, so an interruption
     leaves ``dst_dir`` a partial but still-loadable scene rather than a
     ``transforms.json`` naming files that are not there.
     """
     src_dir, dst_dir = Path(src_dir), Path(dst_dir)
+    src_images = Path(images_root) if images_root is not None else src_dir
     scene = load_scene(src_dir)
     rejects = set(reject_names)
 
@@ -156,7 +180,7 @@ def split_scene(
 
         (dst_dir / "images").mkdir(parents=True, exist_ok=True)
         for frame in drop_frames:
-            src = src_dir / frame["file_path"]
+            src = src_images / frame["file_path"]
             if src.exists():
                 shutil.move(str(src), str(dst_dir / frame["file_path"]))
         write_scene(dst_dir, scene.header,
@@ -166,13 +190,16 @@ def split_scene(
     return len(keep_frames), len(drop_frames)
 
 
-def merge_back(dst_dir: Path | str, src_dir: Path | str) -> int:
+def merge_back(dst_dir: Path | str, src_dir: Path | str, *,
+                images_root: Path | str | None = None) -> int:
     """Inverse of :func:`split_scene`: return every rejected frame to the scene.
 
     Used by ``--force`` re-runs so a step always sees the same input it saw the
-    first time, and by hand when inspecting why a frame was dropped.
+    first time, and by hand when inspecting why a frame was dropped. ``images_root``
+    mirrors the one passed to :func:`split_scene`.
     """
     dst_dir, src_dir = Path(dst_dir), Path(src_dir)
+    src_images = Path(images_root) if images_root is not None else src_dir
     if not (dst_dir / "transforms.json").exists():
         return 0
     rejected = load_scene(dst_dir)
@@ -185,7 +212,7 @@ def merge_back(dst_dir: Path | str, src_dir: Path | str) -> int:
     for frame in rejected.frames:
         src = dst_dir / frame["file_path"]
         if src.exists():
-            shutil.move(str(src), str(src_dir / frame["file_path"]))
+            shutil.move(str(src), str(src_images / frame["file_path"]))
         if frame["file_path"] not in present:
             restored.append(frame)
 

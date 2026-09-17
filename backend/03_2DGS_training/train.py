@@ -121,12 +121,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         rend_alpha = render_pkg['rend_alpha']
         # ponytail: HIP rasterizer occasionally emits NaN alpha on degenerate
         # surfels; clamp here rather than upstream, tighten if a real cause is found.
-        rend_alpha = torch.nan_to_num(rend_alpha, nan=0.0)
+        rend_alpha = torch.nan_to_num(rend_alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         # The same degenerate surfels poison the normal buffers. Clean them here
         # rather than at each use: multiview_loss reads rend_normal too, and a
         # NaN there is just as fatal as one in normal_loss.
-        render_pkg['rend_normal'] = torch.nan_to_num(render_pkg['rend_normal'], nan=0.0)
-        render_pkg['surf_normal'] = torch.nan_to_num(render_pkg['surf_normal'], nan=0.0)
+        render_pkg['rend_normal'] = torch.nan_to_num(render_pkg['rend_normal'], nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+        render_pkg['surf_normal'] = torch.nan_to_num(render_pkg['surf_normal'], nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
         valid_mask = rend_alpha > 0.05
         if valid_pix_mask is not None:
             valid_mask = valid_mask & valid_pix_mask.unsqueeze(0)
@@ -294,11 +294,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # -- and the next prune 100 iterations later deletes whatever gradient
                 # did not rescue. That ratchet took Phase 1 from 2.76M to 135k surfels.
                 # Gate it on the same window that allows densification.
-                if (iteration % opt.opacity_reset_interval == 0 and iteration > opt.densify_from_iter) \
-                        or (dataset.white_background and iteration == opt.densify_from_iter):
+                within_reset_window = opt.opacity_reset_until_iter < 0 or iteration <= opt.opacity_reset_until_iter
+                if within_reset_window and (
+                        (iteration % opt.opacity_reset_interval == 0 and iteration > opt.densify_from_iter)
+                        or (dataset.white_background and iteration == opt.densify_from_iter)):
                     gaussians.reset_opacity()
 
             if iteration < opt.iterations:
+                for param_group in gaussians.optimizer.param_groups:
+                    p = param_group['params'][0]
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
                 gaussians.optimizer.step()
                 # Densify/prune rebuilds these tensors, so a NaN can also enter
                 # here rather than through the gradient.

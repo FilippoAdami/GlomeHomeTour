@@ -28,9 +28,13 @@ def init(wish_host, wish_port):
     global host, port, listener
     host = wish_host
     port = wish_port
-    listener.bind((host, port))
-    listener.listen()
-    listener.settimeout(0)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((host, port))
+        listener.listen()
+        listener.settimeout(0)
+    except OSError as e:
+        print(f"[WARN] Network GUI server could not bind to {host}:{port} ({e}). Continuing training headlessly.", flush=True)
 
 def send_json_data(conn, data):
     # Serialize the list of strings to JSON

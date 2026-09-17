@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 import hashlib
 import os
@@ -365,6 +365,8 @@ class DepthPriorEstimator:
         cache_dir: Optional[Union[str, Path]] = None,
         progress_callback: Optional[Any] = None,
         process_res: Optional[int] = None,
+        align_fn: Optional[Callable[[Sequence[int], Sequence[np.ndarray]],
+                                    list[Optional[np.ndarray]]]] = None,
     ) -> tuple[list[np.ndarray], Optional[list[np.ndarray]], Optional[list[np.ndarray]]]:
         """Estimate multi-view geometrically consistent depth maps across long sequences
 
@@ -379,6 +381,11 @@ class DepthPriorEstimator:
             cache_dir: Optional directory to cache and resume intermediate chunk predictions.
             progress_callback: Optional callable(chunk_idx, total_chunks) -> None.
             process_res: Optional resolution override for DA3 inference (e.g. 504, 1008, 1920).
+            align_fn: Optional callable(global_frame_indices, chunk_depths) -> list of depth
+                maps, entries may be None to reject a prediction. Brings every window onto a
+                common metric scale before ensembling; see :class:`ChunkTrackAligner` for why
+                skipping this step ghosts surfaces. Applied to the cache's raw predictions, so
+                the cache stays valid across changes to the alignment.
 
         Returns:
             Tuple of (fused_depths, fused_confs, uncertainty_maps).
@@ -477,12 +484,17 @@ class DepthPriorEstimator:
             if progress_callback:
                 progress_callback(c_idx + 1, num_chunks)
 
-        # 3. Multi-chunk Ensembling across overlapping sliding windows
-        # Note: DA3 with align_to_input_ext_scale=True is already globally metric-aligned
-        # against camera extrinsics (median inter-chunk error <= 5.2 cm).
-        # We perform direct multi-window median consensus without recursive pairwise scale
-        # chaining, preventing cumulative scale drift across long tours.
-        aligned_chunk_depths = raw_chunk_depths
+        # 3. Bring every window onto a common metric scale before ensembling.
+        # DA3's align_to_input_ext_scale is not enough on its own: windows disagree by up to
+        # 2x in scale and metres in shift, and averaging that disagreement puts the frame at a
+        # standoff no window predicted, which unprojects as a duplicate surface.
+        if align_fn is not None:
+            aligned_chunk_depths: list[list[Optional[np.ndarray]]] = [
+                list(align_fn(list(range(w_start, w_end)), raw_chunk_depths[c_idx]))
+                for c_idx, (w_start, w_end) in enumerate(windows)
+            ]
+        else:
+            aligned_chunk_depths = [list(c) for c in raw_chunk_depths]
 
         # 4. Multi-chunk Ensembling and Blending per Global Keyframe
         frame_predictions: list[list[np.ndarray]] = [[] for _ in range(m_total)]
@@ -492,9 +504,19 @@ class DepthPriorEstimator:
             c_depths = aligned_chunk_depths[c_idx]
             c_confs = raw_chunk_confs[c_idx]
             for local_i, global_i in enumerate(range(w_start, w_end)):
+                if c_depths[local_i] is None:
+                    continue
                 frame_predictions[global_i].append(c_depths[local_i])
                 if c_confs and c_confs[local_i] is not None:
                     frame_confs[global_i].append(c_confs[local_i])
+
+        # A frame whose every prediction was rejected still needs a depth map so the returned
+        # lists stay index-aligned with `images`. It falls back to the raw windows; align_fn
+        # is expected to have flagged it so the caller can drop it downstream.
+        for c_idx, (w_start, w_end) in enumerate(windows):
+            for local_i, global_i in enumerate(range(w_start, w_end)):
+                if not frame_predictions[global_i]:
+                    frame_predictions[global_i].append(raw_chunk_depths[c_idx][local_i])
 
         fused_depths: list[np.ndarray] = []
         fused_confs: list[np.ndarray] = []
@@ -659,21 +681,403 @@ def guided_filter_depth(
     return q
 
 
+def robust_affine(d_pred: np.ndarray, z_gt: np.ndarray, inlier_tol_m: float = 0.05,
+                  iters: int = 8, seed_pairs: int = 256) -> tuple[float, float, float]:
+    """Trimmed fit of ``z_gt = s * d_pred + t``. Returns ``(s, t, residual_MAD over all points)``.
+
+    Seeded by a Theil-Sen median slope, then refit on its inliers a few times. Not Huber
+    IRLS: the outliers that matter here are depth sampled across an occlusion edge, which is
+    wrong in *d_pred*, and a downweighted high-leverage point still drags a weighted fit.
+    Hard trimming has no breakdown against them, and from a median-slope seed it lands on the
+    inliers directly.
+
+    The returned MAD is over every point, not just the kept ones -- it is what the caller
+    uses to decide the prediction is a wrong surface rather than a mis-scaled one, so it must
+    not improve merely by discarding the evidence.
+    """
+    a = np.column_stack([d_pred, np.ones_like(d_pred)])
+    n = len(d_pred)
+    rng = np.random.RandomState(0)
+    i, j = rng.randint(0, n, seed_pairs), rng.randint(0, n, seed_pairs)
+    spread = d_pred[i] - d_pred[j]
+    usable = np.abs(spread) > 1e-3
+    if np.any(usable):
+        s0 = float(np.median((z_gt[i] - z_gt[j])[usable] / spread[usable]))
+        sol = np.array([s0, float(np.median(z_gt - s0 * d_pred))])
+    else:
+        sol = np.array([1.0, 0.0])
+
+    for _ in range(iters):
+        resid = a @ sol - z_gt
+        cutoff = max(inlier_tol_m, 3.0 * float(np.median(np.abs(resid - np.median(resid)))))
+        keep = np.abs(resid) <= cutoff
+        if np.sum(keep) < 4:
+            break
+        sol, _, _, _ = np.linalg.lstsq(a[keep], z_gt[keep], rcond=None)
+
+    resid = a @ sol - z_gt
+    return float(sol[0]), float(sol[1]), float(np.median(np.abs(resid)))
+
+
+def cross_view_scale_outliers(
+    depths: Sequence[np.ndarray],
+    w2c: np.ndarray,
+    intrinsics: np.ndarray,
+    names: Sequence[str],
+    tol: float = 0.10,
+    subsample: int = 6,
+    max_camera_dist_m: float = 3.0,
+    min_pixels: int = 300,
+    min_partners: int = 3,
+) -> tuple[dict[str, float], list[str]]:
+    """Find frames whose depth disagrees in scale with every frame that overlaps them.
+
+    COLMAP tracks cannot catch this. A frame gets a handful of triangulated points,
+    clustered wherever the scene had texture; an affine fit to them can land inside
+    ``max_residual_m`` while the rest of the depth map is structurally wrong. Measured on
+    ``current_scene``: ``frame_01275.jpg`` fits its 56 tracks to under 8 cm and is still
+    28% out of scale against 67 overlapping frames. Unprojected, it lays a copy of the
+    wall 28 cm off the real one -- the duplicated facade.
+
+    Dense co-visible pixels are the evidence the tracks lack: hundreds of thousands of
+    them, spanning the scene's whole depth range, against every overlapping frame rather
+    than the nearest few (which are temporal neighbours sharing the same error). For each
+    pair the median ratio ``observed / reprojected`` is a relative scale; a frame's median
+    over its partners is its disagreement with consensus.
+
+    Returns ``(ratio per frame, names beyond tol)``. Outliers are reported for exclusion
+    rather than rescaled: their per-partner ratios scatter 2-6x more than a healthy
+    frame's, so the depth map is misshapen, not merely mis-scaled, and one scalar cannot
+    repair it.
+    """
+    K = np.asarray(intrinsics, dtype=np.float64)
+    K = K[0] if K.ndim == 3 else K
+    s = max(1, int(subsample))
+    fx, fy = K[0, 0] / s, K[1, 1] / s
+    cx, cy = K[0, 2] / s, K[1, 2] / s
+    small = [np.asarray(d)[::s, ::s] for d in depths]
+    h, w = small[0].shape[:2]
+    vg, ug = np.mgrid[0:h, 0:w]
+    ug = ug.ravel().astype(np.float64)
+    vg = vg.ravel().astype(np.float64)
+
+    w2c = np.asarray(w2c, dtype=np.float64)
+    c2w = np.linalg.inv(w2c)
+    centres = c2w[:, :3, 3]
+
+    world = []
+    for i, d in enumerate(small):
+        z = d.ravel().astype(np.float64)
+        ok = np.isfinite(z) & (z > 0.3) & (z < 8.0)
+        pc = np.stack([(ug[ok] - cx) * z[ok] / fx, (vg[ok] - cy) * z[ok] / fy, z[ok]], -1)
+        world.append(pc @ c2w[i][:3, :3].T + c2w[i][:3, 3])
+
+    ratios: dict[str, float] = {}
+    for i, pts in enumerate(world):
+        if len(pts) < min_pixels:
+            continue
+        dist = np.linalg.norm(centres - centres[i], axis=1)
+        per_pair = []
+        for j in range(len(world)):
+            if j == i or not (0.05 < dist[j] < max_camera_dist_m):
+                continue
+            pc = pts @ w2c[j][:3, :3].T + w2c[j][:3, 3]
+            z = pc[:, 2]
+            u = pc[:, 0] * fx / np.maximum(z, 1e-6) + cx
+            v = pc[:, 1] * fy / np.maximum(z, 1e-6) + cy
+            m = (z > 0.3) & (u >= 0) & (u < w - 1) & (v >= 0) & (v < h - 1)
+            if int(m.sum()) < min_pixels:
+                continue
+            obs = small[j][v[m].astype(np.int32), u[m].astype(np.int32)]
+            g = np.isfinite(obs) & (obs > 0.3)
+            if int(g.sum()) < min_pixels:
+                continue
+            r = obs[g] / z[m][g]
+            # Keep scale-like ratios only; the rest is occlusion, where the two cameras
+            # are looking at different surfaces and no ratio is meaningful.
+            r = r[(r > 0.5) & (r < 2.0)]
+            if len(r) < min_pixels:
+                continue
+            per_pair.append((float(np.median(r)), len(r)))
+        if len(per_pair) >= min_partners:
+            # Weighted by co-visible pixels, not one vote per partner. A frame overlaps a
+            # few partners on the wall it misplaces (thousands of pixels each) and many
+            # more on a sliver of floor; unweighted, the slivers outvote the evidence and
+            # a 20%-off frame scores 1.00.
+            rr = np.array([x[0] for x in per_pair])
+            wt = np.array([x[1] for x in per_pair], dtype=np.float64)
+            o = np.argsort(rr)
+            cw = np.cumsum(wt[o])
+            ratios[str(names[i])] = float(rr[o][np.searchsorted(cw, cw[-1] / 2)])
+
+    outliers = [n for n, r in ratios.items() if abs(r - 1.0) > tol]
+    return ratios, sorted(outliers)
+
+
+class ChunkTrackAligner:
+    """Metric alignment of each sliding-window depth prediction against COLMAP tracks.
+
+    DA3's ``align_to_input_ext_scale`` does **not** hand back a common metric scale
+    across windows. Measured on ``current_scene``: the same frame came back at scale
+    0.44 from one window and 0.98 from the next, with fitted shifts spanning -2.4 m.
+    Ensembling those unaligned predictions (mean for two, median for three) lands the
+    frame at a standoff that matches neither, and unprojecting it lays a displaced
+    duplicate of the surface into the cloud -- the repeated wardrobe facade.
+
+    So every window is fitted to the triangulated track depths before fusion -- **one
+    affine fit per window**, pooled over every frame in it, mirroring the single scalar
+    DA3 itself applies per inference call.
+
+    Deliberately not a per-frame fit: a frame's own tracks rarely span enough depth to
+    determine a slope. Median track depth spread here is 0.48 m (``frame_01335.jpg``: 18
+    tracks over 0.02 m) against a real 0.5-4 m range, so a two-parameter per-frame fit is
+    unidentifiable and extrapolates wildly outside the track band. Measured: per-frame
+    fitting left cross-view disagreement at the unaligned baseline (p90 9.2 cm vs 9.4 cm)
+    while pooling cut it to 7.6 cm.
+
+    Rejection stays per frame: a prediction whose own tracks miss the window fit by more
+    than ``max_residual_m`` is dropped rather than blended in, and a frame left with no
+    surviving prediction is recorded in ``unreliable_frames()`` for the caller to exclude.
+
+    Usable as the ``align_fn`` of :meth:`DepthPriorEstimator.estimate_depth_sliding_window`.
+    """
+
+    def __init__(
+        self,
+        names: Sequence[str],
+        colmap_images: dict,
+        points_3d: dict,
+        max_residual_m: float = 0.08,
+        max_track_error_px: float = 2.0,
+        min_track_len: int = 3,
+    ):
+        self.names = [Path(n).name for n in names]
+        self.max_residual_m = max_residual_m
+        self.frame_residual_m: dict[str, float] = {}
+        self.frame_kept: dict[str, int] = {n: 0 for n in self.names}
+        self.frame_scale: dict[str, float] = {}
+
+        # Triangulated (pixel, z_camera) pairs per frame, built once.
+        self._tracks: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for idx, name in enumerate(self.names):
+            img = colmap_images.get(name)
+            if img is None:
+                continue
+            ids = np.asarray(img["p3d_ids"])
+            keep = np.array([pid >= 0 and pid in points_3d for pid in ids], dtype=bool)
+            if not np.any(keep):
+                continue
+            ids = ids[keep]
+            xyz = np.array([points_3d[pid]["xyz"] for pid in ids], dtype=np.float64)
+            err = np.array([points_3d[pid]["error"] for pid in ids])
+            tlen = np.array([points_3d[pid]["track_len"] for pid in ids])
+            z_gt = ((np.asarray(img["R_w2c"]) @ xyz.T).T + np.asarray(img["t_w2c"]))[:, 2]
+            good = (err <= max_track_error_px) & (tlen >= min_track_len) & (z_gt > 0.15)
+            if np.any(good):
+                self._tracks[idx] = (np.asarray(img["obs_xy"])[keep][good], z_gt[good])
+
+    def _sample(self, idx: int, dmap: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        tr = self._tracks.get(idx)
+        if tr is None:
+            return None
+        uv, z_gt = tr
+        h, w = dmap.shape[:2]
+        u = np.clip(np.round(uv[:, 0]).astype(int), 0, w - 1)
+        v = np.clip(np.round(uv[:, 1]).astype(int), 0, h - 1)
+        d = dmap[v, u]
+        ok = np.isfinite(d) & (d > 0.15)
+        return (d[ok], z_gt[ok]) if np.any(ok) else None
+
+    def __call__(self, frame_indices: Sequence[int],
+                 depths: Sequence[np.ndarray]) -> list[Optional[np.ndarray]]:
+        samples = {}
+        for gi, dmap in zip(frame_indices, depths):
+            s = self._sample(gi, dmap)
+            if s is not None:
+                samples[gi] = s
+        if not samples:
+            return list(depths)  # no ground truth in this window -- leave it untouched
+
+        pooled_s, pooled_t, pooled_mad = robust_affine(
+            np.concatenate([s[0] for s in samples.values()]),
+            np.concatenate([s[1] for s in samples.values()]),
+        )
+
+        out: list[Optional[np.ndarray]] = []
+        for gi, dmap in zip(frame_indices, depths):
+            name = self.names[gi]
+            sample = samples.get(gi)
+            # Residual is per frame even though the fit is not: it is what catches the
+            # single frame a window got wrong without disturbing its neighbours.
+            mad = pooled_mad if sample is None else float(
+                np.median(np.abs(pooled_s * sample[0] + pooled_t - sample[1])))
+
+            if mad < self.frame_residual_m.get(name, math.inf):
+                self.frame_residual_m[name] = mad
+                self.frame_scale[name] = pooled_s
+            if mad > self.max_residual_m:
+                out.append(None)
+                continue
+            self.frame_kept[name] += 1
+            out.append((pooled_s * dmap + pooled_t).astype(np.float32))
+        return out
+
+    def unreliable_frames(self) -> list[str]:
+        """Frames whose every window prediction failed alignment -- unsafe to unproject."""
+        return [n for n in self.names if self.frame_kept.get(n, 0) == 0]
+
+    def stats(self) -> dict:
+        res = np.array(list(self.frame_residual_m.values())) if self.frame_residual_m else np.zeros(1)
+        kept = np.array([self.frame_kept.get(n, 0) for n in self.names])
+        return {
+            "frames": len(self.names),
+            "frames_with_tracks": len(self._tracks),
+            "residual_median_m": round(float(np.median(res)), 4),
+            "residual_p95_m": round(float(np.percentile(res, 95)), 4),
+            "predictions_kept_median": int(np.median(kept)),
+            "unreliable_frames": len(self.unreliable_frames()),
+        }
+
+
 class MetricDepthAligner:
     """Aligns monocular depth predictions to absolute metric coordinates
-
-    using sparse 3D point landmarks from VIO / SfM bundle adjustment.
+    using verified 2D-3D observation tracks or sparse 3D point landmarks from SfM/COLMAP.
     """
 
     def __init__(
         self,
         min_depth: float = 0.2,
         max_depth: float = 15.0,
-        huber_delta: float = 0.2,
+        huber_delta: float = 0.06,
+        inlier_threshold_m: float = 0.06,
+        refine_threshold_m: float = 0.08,
+        ransac_iterations: int = 400,
     ):
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.huber_delta = huber_delta
+        self.inlier_threshold_m = inlier_threshold_m
+        self.refine_threshold_m = refine_threshold_m
+        self.ransac_iterations = ransac_iterations
+
+    def align_tracks(
+        self,
+        mono_depth: np.ndarray,
+        obs_xy: np.ndarray,
+        p3d_ids: np.ndarray,
+        points_3d: dict,
+        R_w2c: np.ndarray,
+        t_w2c: np.ndarray,
+    ) -> tuple[np.ndarray, float, float, float, float, int]:
+        """Solve for scale s and shift t such that z_gt = s * d_pred + t using verified 2D-3D tracks.
+
+        Args:
+            mono_depth: (H, W) float32 predicted depth map
+            obs_xy: (M, 2) 2D pixel observation coordinates
+            p3d_ids: (M,) 3D point IDs (-1 for untriangulated)
+            points_3d: dict mapping point ID -> {'xyz': ...} or Point3D
+            R_w2c: (3, 3) OpenCV world-to-camera rotation matrix
+            t_w2c: (3,) OpenCV world-to-camera translation vector
+
+        Returns:
+            (aligned_depth, scale, shift, inlier_rmse, inlier_ratio, num_valid_points)
+        """
+        h, w = mono_depth.shape[:2]
+        if len(obs_xy) == 0 or len(p3d_ids) == 0 or not points_3d:
+            aligned = np.clip(mono_depth, self.min_depth, self.max_depth)
+            return aligned, 1.0, 0.0, 0.0, 0.0, 0
+
+        valid_indices = [k for k, pid in enumerate(p3d_ids) if pid != -1 and pid in points_3d]
+        if len(valid_indices) < 4:
+            aligned = np.clip(mono_depth, self.min_depth, self.max_depth)
+            return aligned, 1.0, 0.0, 0.0, 0.0, len(valid_indices)
+
+        valid_indices = np.array(valid_indices, dtype=np.int64)
+        valid_obs = obs_xy[valid_indices]
+        valid_pids = p3d_ids[valid_indices]
+
+        # Extract world 3D coordinates
+        pts_w_list = []
+        for pid in valid_pids:
+            pt = points_3d[pid]
+            if isinstance(pt, dict):
+                pts_w_list.append(pt.get("xyz", pt.get("coord", pt)))
+            elif hasattr(pt, "xyz"):
+                pts_w_list.append(pt.xyz)
+            else:
+                pts_w_list.append(pt)
+        pts_w = np.asarray(pts_w_list, dtype=np.float64)
+
+        # Transform into camera coordinates (OpenCV: +X right, +Y down, +Z forward):
+        pts_cam = (R_w2c @ pts_w.T).T + t_w2c
+        z_gt = pts_cam[:, 2]
+
+        # Sample predicted depth at valid observations
+        u = np.clip(np.round(valid_obs[:, 0]).astype(int), 0, w - 1)
+        v = np.clip(np.round(valid_obs[:, 1]).astype(int), 0, h - 1)
+        d_pred = mono_depth[v, u]
+
+        valid_mask = (
+            (z_gt >= self.min_depth)
+            & (z_gt <= self.max_depth)
+            & (d_pred >= self.min_depth)
+            & (d_pred <= self.max_depth)
+            & np.isfinite(z_gt)
+            & np.isfinite(d_pred)
+        )
+
+        if np.sum(valid_mask) < 4:
+            aligned = np.clip(mono_depth, self.min_depth, self.max_depth)
+            return aligned, 1.0, 0.0, 0.0, 0.0, int(np.sum(valid_mask))
+
+        z_gt = z_gt[valid_mask]
+        d_pred = d_pred[valid_mask]
+        n = len(d_pred)
+
+        A = np.column_stack([d_pred, np.ones_like(d_pred)])
+
+        # RANSAC scale-shift fitting
+        best_inliers = 0
+        best_s, best_t = 1.0, 0.0
+        rng = np.random.RandomState(42)
+
+        for _ in range(self.ransac_iterations):
+            idx = rng.choice(n, 2, replace=False)
+            if abs(A[idx[0], 0] - A[idx[1], 0]) < 0.05:
+                continue
+            try:
+                sol, _, _, _ = np.linalg.lstsq(A[idx], z_gt[idx], rcond=None)
+                s_cand, t_cand = float(sol[0]), float(sol[1])
+                if s_cand < 0.2 or s_cand > 4.5 or abs(t_cand) > 3.0:
+                    continue
+                residuals = np.abs(A[:, 0] * s_cand + t_cand - z_gt)
+                inliers = np.sum(residuals < self.inlier_threshold_m)
+                if inliers > best_inliers:
+                    best_inliers = inliers
+                    best_s, best_t = s_cand, t_cand
+            except Exception:
+                continue
+
+        # Inlier refinement via least-squares
+        residuals = np.abs(A[:, 0] * best_s + best_t - z_gt)
+        inlier_mask = residuals < self.refine_threshold_m
+        if np.sum(inlier_mask) >= 4:
+            try:
+                sol, _, _, _ = np.linalg.lstsq(A[inlier_mask], z_gt[inlier_mask], rcond=None)
+                s_ref, t_ref = float(sol[0]), float(sol[1])
+                if 0.25 <= s_ref <= 4.0 and abs(t_ref) <= 3.0:
+                    best_s, best_t = s_ref, t_ref
+                    residuals = np.abs(A[:, 0] * best_s + best_t - z_gt)
+                    inlier_mask = residuals < self.refine_threshold_m
+            except Exception:
+                pass
+
+        inlier_count = int(np.sum(inlier_mask))
+        inlier_ratio = float(inlier_count / n)
+        rmse = float(np.sqrt(np.mean(residuals[inlier_mask] ** 2))) if inlier_count > 0 else 0.0
+
+        aligned_depth = np.clip(best_s * mono_depth + best_t, self.min_depth, self.max_depth).astype(np.float32)
+        return aligned_depth, best_s, best_t, rmse, inlier_ratio, n
 
     def align(
         self,
@@ -682,7 +1086,7 @@ class MetricDepthAligner:
         camera_pose_c2w: np.ndarray,  # (4, 4)
         intrinsics: CameraIntrinsics,
     ) -> tuple[np.ndarray, float, float, float]:
-        """Solve for scale s and shift t such that d_metric = s * mono_depth + t.
+        """Solve for scale s and shift t such that d_metric = s * mono_depth + t (legacy projection fallback).
 
         Returns:
             (aligned_depth, scale, shift, rmse)
@@ -692,11 +1096,9 @@ class MetricDepthAligner:
         cx, cy = intrinsics.cx, intrinsics.cy
 
         if sparse_points_3d is None or len(sparse_points_3d) < 4:
-            # Fallback to identity / unity scale
             aligned = np.clip(mono_depth, self.min_depth, self.max_depth)
             return aligned, 1.0, 0.0, 0.0
 
-        # Transform 3D world points into camera coordinates: X_cam = R_cw^T * (X_world - t_cw)
         c2w = camera_pose_c2w
         r_cw = c2w[:3, :3]
         t_cw = c2w[:3, 3]
@@ -704,9 +1106,6 @@ class MetricDepthAligner:
         w2c_t = -np.dot(w2c_r, t_cw)
 
         points_cam = np.dot(sparse_points_3d, w2c_r.T) + w2c_t
-
-        # In ARCore/OpenGL convention, camera looks along -Z
-        # Viewing distance is z_dist = -points_cam[:, 2]
         z_dist = -points_cam[:, 2]
         valid_mask = z_dist > self.min_depth
         if np.sum(valid_mask) < 4:
@@ -716,11 +1115,9 @@ class MetricDepthAligner:
         pts_valid = points_cam[valid_mask]
         z_gt = z_dist[valid_mask]
 
-        # Project to pixel coordinates: u = x*fx/z_dist + cx, v = -y*fy/z_dist + cy
         u = np.round((pts_valid[:, 0] * fx / z_gt) + cx).astype(np.int32)
         v = np.round((-pts_valid[:, 1] * fy / z_gt) + cy).astype(np.int32)
 
-        # In-bounds check
         in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
         if np.sum(in_bounds) < 4:
             aligned = np.clip(mono_depth, self.min_depth, self.max_depth)
@@ -731,15 +1128,11 @@ class MetricDepthAligner:
         z_gt = z_gt[in_bounds]
         d_pred = mono_depth[v, u]
 
-        # Robust least squares solving: z_gt = s * d_pred + t
-        # A * [s, t]^T = z_gt
         a_mat = np.column_stack([d_pred, np.ones_like(d_pred)])
-
-        # RANSAC scale-shift fitting
         best_inliers = 0
         best_s, best_t = 1.0, 0.0
         n_samples = len(d_pred)
-        n_iters = min(50, n_samples * 2)
+        n_iters = min(200, n_samples * 2)
 
         rng = np.random.RandomState(42)
         for _ in range(n_iters):
@@ -750,8 +1143,7 @@ class MetricDepthAligner:
             try:
                 sol, _, _, _ = np.linalg.lstsq(sub_a, sub_b, rcond=None)
                 s_cand, t_cand = float(sol[0]), float(sol[1])
-                # Ensure plausible positive scale
-                if s_cand < 0.2 or s_cand > 5.0:
+                if s_cand < 0.2 or s_cand > 5.0 or abs(t_cand) > 3.0:
                     continue
 
                 residuals = np.abs(a_mat[:, 0] * s_cand + t_cand - z_gt)
@@ -762,18 +1154,15 @@ class MetricDepthAligner:
             except Exception:
                 continue
 
-        # Refine on inliers if found
         residuals = np.abs(a_mat[:, 0] * best_s + best_t - z_gt)
-        inlier_mask = residuals < (self.huber_delta * 2.0)
+        inlier_mask = residuals < (self.huber_delta * 1.5)
         if np.sum(inlier_mask) >= 3:
             sol, _, _, _ = np.linalg.lstsq(a_mat[inlier_mask], z_gt[inlier_mask], rcond=None)
             s_final, t_final = float(sol[0]), float(sol[1])
-            if 0.3 <= s_final <= 3.0:
+            if 0.25 <= s_final <= 4.0 and abs(t_final) <= 3.0:
                 best_s, best_t = s_final, t_final
 
-        # Apply alignment
-        aligned_depth = best_s * mono_depth + best_t
-        aligned_depth = np.clip(aligned_depth, self.min_depth, self.max_depth)
+        aligned_depth = np.clip(best_s * mono_depth + best_t, self.min_depth, self.max_depth)
         rmse = float(np.sqrt(np.mean((a_mat[:, 0] * best_s + best_t - z_gt) ** 2)))
 
         return aligned_depth, best_s, best_t, rmse
@@ -783,43 +1172,103 @@ def anchor_depths_to_sparse_points(
     depth_maps: Sequence[np.ndarray],
     keyframes: Sequence[Keyframe],
     intrinsics: CameraIntrinsics,
-    sparse_points_3d: np.ndarray,
+    sparse_points_3d: Optional[np.ndarray] = None,
+    colmap_images: Optional[dict] = None,
+    points_3d: Optional[dict] = None,
+    sparse_dir: Optional[Union[str, Path]] = None,
     min_inliers: int = 8,
-    scale_range: tuple[float, float] = (0.8, 1.25),
-    max_shift_m: float = 0.35,
+    min_inlier_ratio: float = 0.50,
+    min_points: int = 6,
+    scale_range: tuple[float, float] = (0.25, 4.0),
+    max_shift_m: float = 3.0,
 ) -> tuple[list[np.ndarray], dict[str, float]]:
     """Anchor dense depth maps against triangulated COLMAP sparse 3D landmarks
-
-    using robust RANSAC scale-shift fitting via MetricDepthAligner.
-    Only updates depth maps whose fitted scale and shift are within plausible bounds
-    with sufficient inlier corroboration.
+    using verified 2D-3D observation tracks and robust RANSAC scale-shift fitting.
     """
     aligner = MetricDepthAligner()
-    aligned_depths: list[np.ndarray] = []
-    scales: list[float] = []
-    shifts: list[float] = []
-    rmses: list[float] = []
-    anchored_count = 0
 
-    for dmap, kf in zip(depth_maps, keyframes):
-        c2w = kf.transform_matrix
-        aligned, s, t, rmse = aligner.align(
-            mono_depth=dmap,
-            sparse_points_3d=sparse_points_3d,
-            camera_pose_c2w=c2w,
-            intrinsics=intrinsics,
-        )
-        if scale_range[0] <= s <= scale_range[1] and abs(t) <= max_shift_m:
-            aligned_depths.append(aligned)
-            scales.append(s)
-            shifts.append(t)
-            rmses.append(rmse)
-            anchored_count += 1
-        else:
-            aligned_depths.append(dmap)
-            scales.append(1.0)
-            shifts.append(0.0)
-            rmses.append(0.0)
+    # Load COLMAP model if sparse_dir provided and not pre-loaded
+    if colmap_images is None and sparse_dir is not None:
+        s_path = Path(sparse_dir)
+        try:
+            from colmap_diagnostics import parse_images_txt, parse_points3D_txt
+            if (s_path / "images.txt").exists():
+                colmap_images = parse_images_txt(s_path / "images.txt")
+            if (s_path / "points3D.txt").exists():
+                points_3d = parse_points3D_txt(s_path / "points3D.txt")
+        except Exception as e:
+            print(f"[WARN] Failed to load COLMAP files from {sparse_dir}: {e}")
+
+    use_tracks = bool(colmap_images and points_3d)
+
+    aligned_depths: list[Optional[np.ndarray]] = [None] * len(depth_maps)
+    scales: list[float] = [1.0] * len(depth_maps)
+    shifts: list[float] = [0.0] * len(depth_maps)
+    rmses: list[float] = [0.0] * len(depth_maps)
+    inlier_ratios: list[float] = [0.0] * len(depth_maps)
+    num_pts: list[int] = [0] * len(depth_maps)
+    successful_indices = []
+
+    for i, (dmap, kf) in enumerate(zip(depth_maps, keyframes)):
+        name = Path(kf.file_path).name
+        if use_tracks and name in colmap_images:
+            img_data = colmap_images[name]
+            aligned, s, t, rmse, ratio, n = aligner.align_tracks(
+                mono_depth=dmap,
+                obs_xy=img_data["obs_xy"],
+                p3d_ids=img_data["p3d_ids"],
+                points_3d=points_3d,
+                R_w2c=img_data["R_w2c"],
+                t_w2c=img_data["t_w2c"],
+            )
+            if ratio >= min_inlier_ratio and n >= min_points:
+                aligned_depths[i] = aligned
+                scales[i] = s
+                shifts[i] = t
+                rmses[i] = rmse
+                inlier_ratios[i] = ratio
+                num_pts[i] = n
+                successful_indices.append(i)
+            else:
+                # Store partial stats but defer final depth map to median fill
+                scales[i] = s
+                shifts[i] = t
+                rmses[i] = rmse
+                inlier_ratios[i] = ratio
+                num_pts[i] = n
+        elif sparse_points_3d is not None and len(sparse_points_3d) >= 8:
+            c2w = kf.transform_matrix
+            aligned, s, t, rmse = aligner.align(
+                mono_depth=dmap,
+                sparse_points_3d=sparse_points_3d,
+                camera_pose_c2w=c2w,
+                intrinsics=intrinsics,
+            )
+            aligned_depths[i] = aligned
+            scales[i] = s
+            shifts[i] = t
+            rmses[i] = rmse
+            successful_indices.append(i)
+
+    # For frames that did not pass track threshold, use robust median scale/shift
+    if successful_indices:
+        med_s = float(np.median([scales[i] for i in successful_indices]))
+        med_t = float(np.median([shifts[i] for i in successful_indices]))
+    else:
+        med_s, med_t = 1.0, 0.0
+
+    for i in range(len(depth_maps)):
+        if aligned_depths[i] is None:
+            aligned_depths[i] = np.clip(
+                med_s * depth_maps[i] + med_t,
+                aligner.min_depth,
+                aligner.max_depth,
+            ).astype(np.float32)
+            scales[i] = med_s
+            shifts[i] = med_t
+
+    final_depths = [d for d in aligned_depths if d is not None]
+    anchored_count = len(successful_indices)
 
     stats = {
         "anchored_frames": anchored_count,
@@ -827,9 +1276,11 @@ def anchor_depths_to_sparse_points(
         "anchored_fraction": round(anchored_count / max(1, len(depth_maps)), 3),
         "median_scale": round(float(np.median(scales)), 4),
         "median_shift_m": round(float(np.median(shifts)), 4),
-        "mean_rmse_m": round(float(np.mean(rmses)), 4),
+        "mean_rmse_m": round(float(np.mean([rmses[i] for i in successful_indices])) if successful_indices else 0.0, 4),
+        "mean_inlier_ratio": round(float(np.mean([inlier_ratios[i] for i in successful_indices])) if successful_indices else 0.0, 4),
+        "mean_points_per_frame": round(float(np.mean([num_pts[i] for i in successful_indices])) if successful_indices else 0.0, 1),
     }
-    return aligned_depths, stats
+    return final_depths, stats
 
 
 def compute_surface_normals(

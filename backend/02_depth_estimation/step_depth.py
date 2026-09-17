@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import sys
 import time
 from collections.abc import Sequence as SequenceABC
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 
 _backend_dir = Path(__file__).resolve().parents[1]
@@ -47,9 +49,11 @@ bootstrap()
 
 from Utilities.pipeline_step import StepContext, is_done
 from Utilities.scene_io import load_scene
-from colmap_diagnostics import parse_points3D_txt
+from colmap_diagnostics import parse_images_txt, parse_points3D_txt
 from colmap_poses_to_da3 import build_da3_poses, validate_poses
 from depth_priors import (
+    ChunkTrackAligner,
+    cross_view_scale_outliers,
     DepthPriorEstimator,
     GlobalDepthGraphOptimizer,
     anchor_depths_to_sparse_points,
@@ -59,6 +63,7 @@ from initialization import SurfelCloudInitializer
 from tsdf_fusion import TSDFVolume
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+MANIFEST_DIRNAME = "00_ingestion"
 
 # DA3 confidence is not a probability -- it is a relative score, and on textureless
 # interior walls the whole frame sits low. 0.5 throws away most of a bedroom;
@@ -68,12 +73,21 @@ CHUNK_SIZE, OVERLAP = 6, 3
 PROCESS_RES = 756  # High-quality DA3 test-time resolution (756x420, 2.25x token density)
 
 # Surfel extraction configuration
-VOXEL_DOWNSAMPLE_M = 0.015  # 1.5 cm voxels
-TARGET_SURFELS = MAX_SURFELS = 3_000_000
+VOXEL_DOWNSAMPLE_M = 0.02  # 2.0 cm voxels
+TARGET_SURFELS = MAX_SURFELS = 450_000
 
 # Boundary-floater filters (tuned hole-safe thresholds)
 MAX_DEPTH_GRADIENT = 0.15
 MAX_GRAZING_ANGLE_DEG = 82.0
+
+# A window prediction still off by more than this after its scale/shift fit to the COLMAP
+# tracks is not a scale error but a wrong surface, and gets dropped instead of blended.
+MAX_ALIGN_RESIDUAL_M = 0.08
+# A frame may fit its COLMAP tracks and still be out of scale with every frame that
+# overlaps it -- tracks are few and clustered, dense co-visible pixels are not. Healthy
+# frames here sit inside +/-4%; the ghost-planting ones run 8-28% out.
+MAX_CROSS_VIEW_SCALE_DEV = 0.08
+ALIGNMENT_FILENAME = "depth_alignment.json"
 
 _FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 
@@ -132,13 +146,15 @@ def run_depth_estimation_substep(
     overlap: int = OVERLAP,
     process_res: int = PROCESS_RES,
     enable_guided_filter: bool = True,
-    enable_sparse_anchor: bool = True,
-    enable_global_depth_graph: bool = True,
+    # Redundant now that every window is fitted to the same COLMAP tracks before fusion, and
+    # its fallback is actively harmful: a frame that fails its inlier gate gets the sequence's
+    # median scale/shift, which is ~identity, silently leaving the one frame that needed
+    # correcting uncorrected. That fallback is what planted the ghost surfaces.
+    enable_sparse_anchor: bool = False,
+    enable_global_depth_graph: bool = False,
 ) -> tuple[list[np.ndarray], list[str], np.ndarray, np.ndarray]:
     """Substep 1/2: Multi-View DA3 sliding window depth estimation & guided filtering."""
-    import torch
-
-    scene = load_scene(workspace)
+    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     names = scene.names
     sparse_dir = workspace / "sparse" / "0"
     depth_dir = workspace / "depth"
@@ -152,9 +168,9 @@ def run_depth_estimation_substep(
 
     # --- poses: COLMAP -> DA3, unconverted, but checked ---------------------
     with ctx.timer("build_poses"):
-        w2c, k_mats, pose_names = build_da3_poses(sparse_dir, names)
-        by_name = {Path(f["file_path"]).name: f for f in scene.frames}
-        centres = np.array([np.array(by_name[n]["transform_matrix"])[:3, 3] for n in pose_names])
+        by_name = {Path(f["file_path"]).name: np.array(f["transform_matrix"]) for f in scene.frames}
+        w2c, k_mats, pose_names = build_da3_poses(sparse_dir, names, arcore_transforms=by_name)
+        centres = np.array([by_name[n][:3, 3] for n in pose_names])
         stats = validate_poses(w2c, centres)
         np.savez(depth_dir / "poses_da3.npz", w2c=w2c, K=k_mats, names=np.array(pose_names))
     ctx.metric("pose_validation", {k: round(v, 6) for k, v in stats.items()})
@@ -164,6 +180,17 @@ def run_depth_estimation_substep(
 
     images = _LazyImages([workspace / "images" / n for n in pose_names])
     vram_substeps: dict[str, dict[str, float]] = {}
+
+    # Per-window metric alignment against the COLMAP tracks, applied inside the sliding
+    # window before the windows are ensembled. Without it the windows disagree on scale and
+    # the blend of that disagreement unprojects as a duplicate surface.
+    colmap_images = parse_images_txt(sparse_dir / "images.txt")
+    points = parse_points3D_txt(sparse_dir / "points3D.txt")
+    aligner = ChunkTrackAligner(pose_names, colmap_images, points,
+                                max_residual_m=MAX_ALIGN_RESIDUAL_M) if (colmap_images and points) else None
+    if aligner is None:
+        ctx.note("No COLMAP tracks available -- sliding windows will be fused unaligned, "
+                 "expect duplicated surfaces where window scales disagree")
 
     ctx.note(f"Running DA3 on {len(images)} frames (device={device}, "
              f"chunk={chunk_size}, overlap={overlap}, process_res={process_res})")
@@ -180,8 +207,51 @@ def run_depth_estimation_substep(
             overlap=overlap,
             cache_dir=depth_dir / "da3_cache",
             process_res=process_res,
+            align_fn=aligner,
         )
     vram_substeps["da3_inference"] = _get_vram_info()
+
+    unreliable: list[str] = []
+    align_stats: dict = {}
+    if aligner is not None:
+        unreliable = aligner.unreliable_frames()
+        align_stats = aligner.stats()
+        ctx.metric("chunk_alignment", align_stats)
+        ctx.note(f"Window alignment vs COLMAP tracks: residual median "
+                 f"{align_stats['residual_median_m'] * 100:.1f} cm, p95 "
+                 f"{align_stats['residual_p95_m'] * 100:.1f} cm; "
+                 f"{len(unreliable)} frame(s) unalignable and flagged for exclusion"
+                 + (f": {unreliable}" if unreliable else ""))
+
+    # Second gate, on evidence the tracks do not carry: a frame can fit its own tracks and
+    # still place every surface at the wrong standoff. That is what duplicates a wall.
+    with ctx.timer("cross_view_scale"):
+        scale_ratios, scale_outliers = cross_view_scale_outliers(
+            depth_maps, w2c, k_mats, pose_names, tol=MAX_CROSS_VIEW_SCALE_DEV)
+    dev = np.array([abs(r - 1.0) for r in scale_ratios.values()]) if scale_ratios else np.zeros(1)
+    ctx.metric("cross_view_scale", {
+        "frames_scored": len(scale_ratios),
+        "median_dev": round(float(np.median(dev)), 4),
+        "p95_dev": round(float(np.percentile(dev, 95)), 4),
+        "outliers": len(scale_outliers),
+    })
+    ctx.note(f"Cross-view scale consensus: median deviation {float(np.median(dev)) * 100:.1f}%, "
+             f"p95 {float(np.percentile(dev, 95)) * 100:.1f}%; "
+             f"{len(scale_outliers)} frame(s) out of scale with their overlaps"
+             + (f": {scale_outliers}" if scale_outliers else ""))
+    unreliable = sorted(set(unreliable) | set(scale_outliers))
+
+
+    (depth_dir / ALIGNMENT_FILENAME).write_text(json.dumps({
+        "max_residual_m": MAX_ALIGN_RESIDUAL_M,
+        "max_cross_view_scale_dev": MAX_CROSS_VIEW_SCALE_DEV,
+        "unreliable": unreliable,
+        "unalignable": aligner.unreliable_frames() if aligner is not None else [],
+        "scale_outliers": scale_outliers,
+        "scale_ratio": {n: round(v, 4) for n, v in scale_ratios.items()},
+        "residual_m": {n: round(v, 4) for n, v in aligner.frame_residual_m.items()} if aligner else {},
+        "predictions_kept": aligner.frame_kept if aligner is not None else {},
+    }, indent=2), encoding="utf-8")
 
     # --- depth post-processing: RGB-guided filtering -------------------------
     if enable_guided_filter:
@@ -196,22 +266,26 @@ def run_depth_estimation_substep(
     keyframes = [dataclasses.replace(kf_by_name[n], transform_matrix=c2w_gl[i])
                  for i, n in enumerate(pose_names)]
 
-    points = parse_points3D_txt(sparse_dir / "points3D.txt")
     sparse_xyz = np.array([p["xyz"] for p in points.values()]) if points else None
 
     # --- depth post-processing: sparse landmark scale anchoring --------------
-    if enable_sparse_anchor and sparse_xyz is not None and len(sparse_xyz) >= 8:
+    if enable_sparse_anchor and ((colmap_images and points) or (sparse_xyz is not None and len(sparse_xyz) >= 8)):
         with ctx.timer("sparse_anchor"):
             depth_maps, anchor_stats = anchor_depths_to_sparse_points(
                 depth_maps=depth_maps,
                 keyframes=keyframes,
                 intrinsics=scene.intrinsics,
                 sparse_points_3d=sparse_xyz,
+                colmap_images=colmap_images,
+                points_3d=points,
+                sparse_dir=sparse_dir,
             )
             ctx.metric("sparse_anchor_stats", anchor_stats)
-            ctx.note(f"Anchored depth maps against COLMAP sparse points: "
+            ctx.note(f"Anchored depth maps against COLMAP verified tracks: "
                      f"{anchor_stats['anchored_frames']}/{anchor_stats['total_frames']} frames "
-                     f"(median scale={anchor_stats['median_scale']}, shift={anchor_stats['median_shift_m']}m)")
+                     f"(median scale={anchor_stats['median_scale']}, shift={anchor_stats['median_shift_m']}m, "
+                     f"mean inlier ratio={anchor_stats.get('mean_inlier_ratio', 0)*100:.1f}%, "
+                     f"mean inlier RMSE={anchor_stats.get('mean_rmse_m', 0)*100:.2f}cm)")
         vram_substeps["sparse_anchor"] = _get_vram_info()
 
     # --- depth post-processing: global multi-view depth graph optimization ----
@@ -258,8 +332,6 @@ def run_depth_estimation_substep(
     # RGB | depth side-by-side composite images
     depth_images_dir = depth_dir / "depth_images"
     depth_images_dir.mkdir(exist_ok=True)
-    vis_dir = depth_dir / "depth_vis"
-    vis_dir.mkdir(exist_ok=True)
 
     with ctx.timer("write_depth_images"):
         for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
@@ -272,8 +344,6 @@ def run_depth_estimation_substep(
             comp_img = Image.fromarray(composite)
             stem = Path(name).stem
             comp_img.save(depth_images_dir / f"{stem}.jpg", quality=90)
-            if not (vis_dir / f"{stem}.jpg").exists():
-                comp_img.save(vis_dir / f"{stem}.jpg", quality=90)
     vram_substeps["write_depth_images"] = _get_vram_info()
 
     # Diagnostic markdown summary
@@ -324,9 +394,7 @@ def run_tsdf_substep(
     max_surfels: int = 500_000,
 ) -> None:
     """Substep 4d: Volumetric TSDF Fusion & Multi-Scale Zero-Crossing Surfel Extraction."""
-    import torch
-
-    scene = load_scene(workspace)
+    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     sparse_dir = workspace / "sparse" / "0"
     depth_dir = workspace / "depth"
     maps_dir = depth_dir / "depth_maps"
@@ -479,16 +547,18 @@ def run_surfels_substep(
     workspace: Path,
     ctx: StepContext,
     voxel_downsample_m: float = VOXEL_DOWNSAMPLE_M,
+    min_consensus: int = 1,
     enable_sor: bool = True,
     sor_k: int = 20,
     sor_std_mul: float = 2.8,
     enable_normal_consensus: bool = True,
     enable_saturation_mask: bool = True,
-    enable_freespace_filter: bool = False,
-    max_freespace_violations: int = 0,
+    enable_freespace_filter: bool = True,
+    max_freespace_violations: int = 2,
+    freespace_margin_m: float = 0.08,
     enable_tube_collapse: bool = True,
-    tube_radius_m: float = 0.03,
-    tube_length_m: float = 0.25,
+    tube_radius_m: float = 0.02,
+    tube_length_m: float = 0.15,
     tube_min_normal_cos: float = 0.75,
     enable_multiscale_pyramid: bool = False,
     enable_hybrid_sampling: bool = True,
@@ -496,7 +566,7 @@ def run_surfels_substep(
     hybrid_coarse_stride: int = 3,
 ) -> None:
     """Substep 4b: Standard unprojection surfel initializer with geometric filtering."""
-    scene = load_scene(workspace)
+    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     sparse_dir = workspace / "sparse" / "0"
     depth_dir = workspace / "depth"
     maps_dir = depth_dir / "depth_maps"
@@ -510,6 +580,46 @@ def run_surfels_substep(
     w2c = poses_data["w2c"]
 
     c2w_gl = np.stack([np.linalg.inv(p.astype(np.float64)) @ _FLIP_YZ for p in w2c])
+    by_name_arcore = {Path(f["file_path"]).name: np.array(f["transform_matrix"]) for f in scene.frames}
+
+    # Frames whose every sliding-window prediction failed metric alignment. Their depth is at
+    # a standoff nothing corroborates, so unprojecting them lays a duplicate of whatever they
+    # see next to the real surface. Losing their coverage is the cheaper error.
+    unreliable = set()
+    align_path = depth_dir / ALIGNMENT_FILENAME
+    if align_path.exists():
+        unreliable = set(json.loads(align_path.read_text()).get("unreliable", []))
+
+    # Filter out any corrupted poses with severe ARCore drift (>10 deg or >25 cm)
+    clean_indices = []
+    dropped_drift = []
+    dropped_align = []
+    for i, n in enumerate(pose_names):
+        if n in unreliable:
+            dropped_align.append(n)
+            continue
+        if n in by_name_arcore:
+            c2w_c = c2w_gl[i]
+            c2w_a = by_name_arcore[n]
+            r_diff = c2w_c[:3, :3].T @ c2w_a[:3, :3]
+            trace_val = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
+            angle_deg = float(np.degrees(np.arccos(trace_val)))
+            trans_m = float(np.linalg.norm(c2w_c[:3, 3] - c2w_a[:3, 3]))
+            if angle_deg > 10.0 or trans_m > 0.25:
+                dropped_drift.append((n, angle_deg, trans_m))
+                continue
+        clean_indices.append(i)
+
+    if dropped_align:
+        ctx.note(f"Surfel init: pruned {len(dropped_align)} keyframe(s) whose depth could not "
+                 f"be metrically aligned to the COLMAP tracks: {dropped_align}")
+    if dropped_drift:
+        ctx.note(f"Surfel init pose filter: pruned {len(dropped_drift)} drifted keyframe(s) "
+                 f"(>10.0° or >25cm): {[d[0] for d in dropped_drift]}")
+    if dropped_align or dropped_drift:
+        pose_names = [pose_names[i] for i in clean_indices]
+        c2w_gl = c2w_gl[clean_indices]
+
     kf_by_name = {Path(k.file_path).name: k for k in scene.keyframes()}
     keyframes = [dataclasses.replace(kf_by_name[n], transform_matrix=c2w_gl[i])
                  for i, n in enumerate(pose_names)]
@@ -523,6 +633,7 @@ def run_surfels_substep(
             voxel_downsample_m=voxel_downsample_m,
             target_surfels=TARGET_SURFELS,
             max_surfels=MAX_SURFELS,
+            min_consensus=min_consensus,
             max_depth_gradient=MAX_DEPTH_GRADIENT,
             max_grazing_angle_deg=MAX_GRAZING_ANGLE_DEG,
             enable_sor=enable_sor,
@@ -531,6 +642,7 @@ def run_surfels_substep(
             enable_saturation_mask=enable_saturation_mask,
             enable_freespace_filter=enable_freespace_filter,
             max_freespace_violations=max_freespace_violations,
+            freespace_margin_m=freespace_margin_m,
             enable_normal_consensus=enable_normal_consensus,
             enable_global_carving=False,
             enable_tube_collapse=enable_tube_collapse,
@@ -555,12 +667,6 @@ def run_surfels_substep(
     # Export main points3D_depth.ply
     depth_ply_path = depth_dir / "points3D_depth.ply"
     cloud.to_ply(depth_ply_path)
-
-    # If tube collapse was enabled, also save dedicated copy for inspection
-    if enable_tube_collapse:
-        tube_ply_path = depth_dir / "points3D_tube_collapsed.ply"
-        cloud.to_ply(tube_ply_path)
-        ctx.note(f"Saved tube-collapsed surfel cloud to {tube_ply_path}")
 
     # Compute bounding box and geometry stats
     pos = cloud.positions
@@ -635,10 +741,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="Use experimental Volumetric TSDF Fusion instead of SurfelCloudInitializer")
     parser.add_argument("--no-tsdf", action="store_false", dest="enable_tsdf",
                         help="Use classic backprojection unprojection instead of TSDF")
-    parser.add_argument("--no-guided-filter", action="store_true",
-                        help="Disable RGB-guided edge-preserving depth filter")
-    parser.add_argument("--no-sparse-anchor", action="store_true",
+    parser.add_argument("--enable-sparse-anchor", action="store_true", dest="enable_sparse_anchor", default=False,
+                        help="Re-enable the post-hoc per-frame COLMAP anchoring (default: False -- "
+                             "superseded by per-window alignment inside the sliding window)")
+    parser.add_argument("--no-sparse-anchor", action="store_false", dest="enable_sparse_anchor",
                         help="Disable sparse COLMAP landmark scale/shift anchoring")
+    parser.add_argument("--enable-guided-filter", action="store_true", default=True,
+                        help="Enable depth guided edge filter")
+    parser.add_argument("--no-guided-filter", action="store_true",
+                        help="Disable depth guided edge filter")
     parser.add_argument("--no-normal-consensus", action="store_true",
                         help="Disable cross-view surface normal consensus regularization")
     parser.add_argument("--no-saturation-mask", action="store_true",
@@ -647,10 +758,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Disable normal tube collapse projection")
     parser.add_argument("--enable-tube-collapse", action="store_true", dest="enable_tube_collapse", default=True,
                         help="Enable normal tube collapse projection (default: True)")
-    parser.add_argument("--tube-radius", type=float, default=0.03,
-                        help="Normal tube cylinder radius in meters (default 0.03 = 3cm)")
-    parser.add_argument("--tube-length", type=float, default=0.25,
-                        help="Normal tube cylinder search length in meters (default 0.25 = 25cm)")
+    parser.add_argument("--tube-radius", type=float, default=0.02,
+                        help="Normal tube cylinder radius in meters (default 0.02 = 2cm)")
+    parser.add_argument("--tube-length", type=float, default=0.15,
+                        help="Normal tube cylinder search length in meters (default 0.15 = 15cm)")
+    parser.add_argument("--min-consensus", type=int, default=1,
+                        help="Min consensus views required for surfel corroboration (default 1)")
     parser.add_argument("--enable-multiscale-pyramid", action="store_true", default=False,
                         help="Enable multi-scale surfel decimation for planar regions")
     parser.add_argument("--no-multiscale-pyramid", action="store_false", dest="enable_multiscale_pyramid",
@@ -665,10 +778,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Pixel stride for uniform background flat regions (default 3 = ~4.5cm)")
     parser.add_argument("--no-freespace-filter", action="store_true",
                         help="Disable cross-view epipolar/reprojection free-space filter")
-    parser.add_argument("--enable-freespace-filter", action="store_true", default=False,
-                        help="Enable cross-view epipolar/reprojection free-space filter")
-    parser.add_argument("--max-freespace-violations", type=int, default=0,
-                        help="Max allowed free-space violations before culling (default 0)")
+    parser.add_argument("--enable-freespace-filter", action="store_true", dest="enable_freespace_filter", default=True,
+                        help="Enable cross-view epipolar/reprojection free-space filter (default: True)")
+    parser.add_argument("--max-freespace-violations", type=int, default=2,
+                        help="Max allowed free-space violations before culling (default 2)")
     # Legacy flags for compatibility
     parser.add_argument("--only-depth", action="store_true",
                         help="Alias for --substep depth")
@@ -701,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
                 overlap=args.overlap,
                 process_res=args.process_res,
                 enable_guided_filter=not args.no_guided_filter,
-                enable_sparse_anchor=not args.no_sparse_anchor,
+                enable_sparse_anchor=args.enable_sparse_anchor,
             )
 
         if substep == "tsdf" or (substep == "all" and args.enable_tsdf):
@@ -715,6 +828,7 @@ def main(argv: list[str] | None = None) -> int:
                 workspace=workspace,
                 ctx=ctx,
                 voxel_downsample_m=VOXEL_DOWNSAMPLE_M,
+                min_consensus=args.min_consensus,
                 enable_normal_consensus=not args.no_normal_consensus,
                 enable_saturation_mask=not args.no_saturation_mask,
                 enable_freespace_filter=args.enable_freespace_filter and not args.no_freespace_filter,

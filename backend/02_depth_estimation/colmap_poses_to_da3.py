@@ -40,12 +40,20 @@ bootstrap()
 from scene.colmap_loader import qvec2rotmat, read_extrinsics_text, read_intrinsics_text
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+MANIFEST_DIRNAME = "00_ingestion"
+STAGE_DIRNAME = "02_depth_estimation"
+
+
+_FLIP_YZ = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 def build_da3_poses(
     sparse_dir: Path,
     names: list[str] | None = None,
     scale: float = 1.0,
+    arcore_transforms: dict[str, np.ndarray] | None = None,
+    max_rot_deg: float = 10.0,
+    max_trans_m: float = 0.25,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Return ``(w2c (N,4,4), K (N,3,3), names)`` ordered by image name.
 
@@ -56,23 +64,55 @@ def build_da3_poses(
 
     ``scale`` rescales the intrinsics for inference at reduced resolution --
     the COLMAP model always keeps full-resolution ``fx, fy, cx, cy``.
+
+    ``arcore_transforms`` optionally gates out frames whose COLMAP bundle adjustment
+    drifted from the ARCore VIO prior by more than ``max_rot_deg`` or ``max_trans_m``.
     """
     extrinsics = read_extrinsics_text(sparse_dir / "images.txt")
     intrinsics = read_intrinsics_text(sparse_dir / "cameras.txt")
 
     by_name = {Path(img.name).name: img for img in extrinsics.values()}
     if names is None:
-        names = sorted(by_name)
+        cand_names = sorted(by_name)
     else:
         missing = [n for n in names if n not in by_name]
         if missing:
             raise KeyError(
                 f"{len(missing)} image(s) not in the COLMAP model, e.g. {missing[:5]}. "
                 "sparse/0/ and images/ must match exactly -- run step 2/3's prune first.")
+        cand_names = list(names)
 
-    w2c = np.zeros((len(names), 4, 4), dtype=np.float32)
-    k_mats = np.zeros((len(names), 3, 3), dtype=np.float32)
-    for i, name in enumerate(names):
+    # Filter by drift against ARCore if transforms are supplied
+    kept_names = []
+    dropped_drift = []
+    for name in cand_names:
+        if arcore_transforms is not None and name in arcore_transforms:
+            img = by_name[name]
+            w2c_cand = np.eye(4, dtype=np.float64)
+            w2c_cand[:3, :3] = qvec2rotmat(img.qvec)
+            w2c_cand[:3, 3] = img.tvec
+            c2w_colmap = np.linalg.inv(w2c_cand) @ _FLIP_YZ
+            c2w_arcore = np.asarray(arcore_transforms[name], dtype=np.float64)
+
+            R_diff = c2w_colmap[:3, :3].T @ c2w_arcore[:3, :3]
+            trace_val = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+            angle_deg = float(np.degrees(np.arccos(trace_val)))
+            trans_m = float(np.linalg.norm(c2w_colmap[:3, 3] - c2w_arcore[:3, 3]))
+
+            if angle_deg > max_rot_deg or trans_m > max_trans_m:
+                dropped_drift.append((name, angle_deg, trans_m))
+                continue
+        kept_names.append(name)
+
+    if dropped_drift:
+        print(f"[build_da3_poses] Pruned {len(dropped_drift)} corrupted keyframe(s) exceeding drift tolerance "
+              f"(>{max_rot_deg}° or >{max_trans_m * 100:.0f}cm):")
+        for n, a, t in dropped_drift[:10]:
+            print(f"    {n}: rot={a:.1f}°, trans={t * 100:.1f}cm")
+
+    w2c = np.zeros((len(kept_names), 4, 4), dtype=np.float32)
+    k_mats = np.zeros((len(kept_names), 3, 3), dtype=np.float32)
+    for i, name in enumerate(kept_names):
         img = by_name[name]
         w2c[i] = np.eye(4, dtype=np.float32)
         w2c[i, :3, :3] = qvec2rotmat(img.qvec)
@@ -84,7 +124,7 @@ def build_da3_poses(
                               [0.0, fy * scale, cy * scale],
                               [0.0, 0.0, 1.0]], dtype=np.float32)
 
-    return w2c, k_mats, list(names)
+    return w2c, k_mats, list(kept_names)
 
 
 def validate_poses(w2c: np.ndarray, expected_centres: np.ndarray | None = None,
@@ -128,14 +168,13 @@ def main(argv: list[str] | None = None) -> int:
     from Utilities.scene_io import load_scene
 
     workspace = Path(args.workspace)
-    scene = load_scene(workspace)
-    w2c, k_mats, names = build_da3_poses(workspace / "sparse" / "0", scene.names)
-
-    by_name = {Path(f["file_path"]).name: f for f in scene.frames}
-    centres = np.array([np.array(by_name[n]["transform_matrix"])[:3, 3] for n in names])
+    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
+    by_name = {Path(f["file_path"]).name: np.array(f["transform_matrix"]) for f in scene.frames}
+    w2c, k_mats, names = build_da3_poses(workspace / "sparse" / "0", scene.names, arcore_transforms=by_name)
+    centres = np.array([by_name[n][:3, 3] for n in names])
     stats = validate_poses(w2c, centres)
 
-    out = workspace / "depth" / "poses_da3.npz"
+    out = workspace / STAGE_DIRNAME / "depth" / "poses_da3.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out, w2c=w2c, K=k_mats, names=np.array(names))
     print(f"Wrote {len(names)} world-to-camera poses to {out}")

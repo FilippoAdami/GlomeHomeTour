@@ -46,3 +46,24 @@ takes the **delete** set (confirmed at `export_keyframes.py:169`), and the model
 must be pruned to match `images/` or the 2DGS loader dies opening a missing file.
 Also writes a cleaned `sparse/0/points3D.ply` (voxel dedup + statistical outlier
 removal), which is what `readColmapSceneInfo` initialises from.
+
+## 2026-09-17: Pre-COLMAP ARCore geometry keyframing, spatial matching & rotation clamping
+1. **Pre-COLMAP keyframe selection (`select_keyframes_arcore.py`):**
+   - Estimates room horizontal span and dilated convex hull with a 0.8m standoff buffer (each horizontal axis extends ~1.6m beyond trajectory span).
+   - Derives optimal keyframe budget $N = 50 + (8..11) \cdot A_{\text{floor}}$ (e.g. ~220-250 frames for Bedroom2).
+   - Non-keyframe frames are staged into `colmap_non_keyframes/` before COLMAP runs. Reduces runtime from ~14 minutes on 1,413 frames to ~1.5 minutes on ~230 frames.
+2. **Loop closure with `spatial_matcher`:**
+   - Pose priors are inserted into the COLMAP database before matching.
+   - `spatial_matcher` (max distance 2.5m, ignore Z) runs alongside `sequential_matcher` (overlap 5), matching views across room passes without needing an external vocabulary tree.
+3. **Rigid rotation clamping (`convert_transforms_to_colmap.py`):**
+   - Removed the 10% outlier cap on `--fix_rotation_drift`: all frames drifting $> 2.0^\circ$ are held at ARCore IMU/gravity orientation.
+   - Re-projection of $t_{w2c} = -R_{w2c} C$ strictly preserves the refined camera center $C$ while enforcing ARCore orientation during re-triangulation.
+4. **SIFT feature extraction:**
+   - Capped features at 8,192 and image dimension at 1600.
+
+## 2026-09-17: Pose Drift Filtering Against ARCore VIO Prior
+1. **Pose Drift Gating in `step_colmap.py`:**
+   - Evaluated rotation and translation delta between COLMAP refined poses and ARCore VIO initialization.
+   - Identified catastrophic bundle adjustment divergence on 14 keyframes (rotation error $14.4^\circ$ to $56.2^\circ$, translation drift $30\text{ cm}$ to $100\text{ cm}$) caused by local minima on textureless walls and repetitive wooden rafters.
+   - Added `MAX_ROTATION_DRIFT_DEG = 10.0` and `MAX_TRANSLATION_DRIFT_M = 0.25` gating in `colmap_step`: frames exceeding tolerance are pruned from `sparse/0/` and moved to `colmap_discarded_images/`.
+   - Result: eliminates unprojected stray planes and false multi-layer geometry downstream.

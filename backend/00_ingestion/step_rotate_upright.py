@@ -37,6 +37,8 @@ from Utilities.pipeline_step import StepContext, is_done
 from Utilities.scene_io import load_scene, write_scene
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+MANIFEST_DIRNAME = "00_ingestion"    # transforms.json lives here; images/ stays at workspace root
+ARTIFACTS_DIRNAME = "01_poses_refinment"
 
 # Rotating the image 90 deg clockwise means camera-local +X (image right) becomes
 # old -Y (image up) and +Y (image up) becomes old +X (image right); rolling the
@@ -59,8 +61,8 @@ def to_portrait_intrinsics(fl_x: float, fl_y: float, cx: float, cy: float,
     }
 
 
-def rotate_upright(workspace: Path, ctx: StepContext) -> None:
-    scene = load_scene(workspace)
+def rotate_upright(workspace: Path, manifest_dir: Path, ctx: StepContext) -> None:
+    scene = load_scene(manifest_dir, images_root=workspace)
     header = scene.header
 
     if header["w"] < header["h"]:
@@ -99,7 +101,7 @@ def rotate_upright(workspace: Path, ctx: StepContext) -> None:
             # Derived from the new width/fl_x, not a hardcoded FOV constant.
             "camera_angle_x": 2.0 * math.atan(header_intr["w"] / (2.0 * header_intr["fl_x"])),
         }
-        write_scene(workspace, new_header, new_frames)
+        write_scene(manifest_dir, new_header, new_frames)
 
     ctx.metric("frames_rotated", len(new_frames))
     ctx.metric("from_wh", [raw_w, raw_h])
@@ -116,12 +118,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
-    if not args.force and is_done(workspace, "rotate_upright", [workspace / "transforms.json"]):
+    manifest_dir = workspace / MANIFEST_DIRNAME
+    artifacts_dir = workspace / ARTIFACTS_DIRNAME
+    if not args.force and is_done(workspace, "rotate_upright", [manifest_dir / "transforms.json"]):
         print("[rotate_upright] already done, skipping (use --force to re-run)")
         return 0
 
-    with StepContext("rotate_upright", workspace) as ctx:
-        rotate_upright(workspace, ctx)
+    with StepContext("rotate_upright", workspace, artifacts_dir=artifacts_dir) as ctx:
+        rotate_upright(workspace, manifest_dir, ctx)
     return 0
 
 

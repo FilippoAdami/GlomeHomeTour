@@ -52,57 +52,38 @@ MODEL_DIRNAME = "2dgs"
 # lineage, where they let a few thousand blobs find global structure cheaply.
 # Step 4 already delivers metrically-correct geometry at 1.5 cm spacing, so
 # there is no global structure left to find -- and at r=8 a 1.5 cm surfel
-# covers a fraction of a pixel, so most of the cloud took no gradient while the
-# pixel-footprint culls kept deleting it.
-STAGES = ((2, 2_000), (1, 10_000))
+# Stage 1 (0-1k): Coarse resolution (r=2) to align base SH color and initial surfel scales.
+# Stage 2 (1k-3k): Native full resolution (r=1) fine-tuning.
+# Reaches convergence in ~4 minutes instead of 70+ minutes.
+STAGES = ((2, 1_000), (1, 3_000))
 TOTAL_ITERATIONS = STAGES[-1][1]
 
-# Two-phase densification.
-#
-# Phase 1 (0 - 6k): no densification at all. The surfel cloud arrives already at
-# the target density (1.5 cm grid, see step_depth.VOXEL_DOWNSAMPLE_M), so these
-# iterations only fit what is already there -- positions, rotations, scales and
-# colours -- under multi-view and normal consistency.
-# Phase 2 (6k - 10k): fine densification at a strict gradient threshold, purely
-# to resolve high-frequency texture the initial grid cannot carry.
-PHASE2_FROM = 6_000
-DENSIFY_GRAD_THRESHOLD = 0.0008
-OPACITY_RESET_INTERVAL = 2_000
+PHASE2_FROM = 1_000
+DENSIFY_WARMUP_ITERS = 200
+PHASE1_DENSIFY_GRAD_THRESHOLD = 0.0004
+PHASE2_DENSIFY_GRAD_THRESHOLD = 0.0002
 
-# Normal consistency is wanted from the start of phase 1, not from train.py's
-# upstream default of 7000 (which, on a 10k schedule, would leave it off for
-# everything but the tail). Multi-view consistency needs no flag: lambda_multiview
-# is 0.3 with mv_from_iter 0, so it is already active from iteration 0.
+# When training from a dense metric depth prior (300k+ surfels), periodic opacity
+# resets to 0.01 destroy the prior (triggering 85% point extinction during pruning).
+# We disable periodic opacity reset by setting interval beyond total iterations.
+OPACITY_RESET_INTERVAL = 999_999
+OPACITY_RESET_UNTIL_ITER = 0
+
 NORMAL_FROM_ITER = 0
 
-# TrackGS pose refinement is enabled exclusively in Stage 4 (resolution 1 / 1080p,
-# iters 6,000 to 10,000) with tight landmark reprojection regularization to absorb
-# sub-pixel handheld frame-to-frame jitter without deforming global metric geometry.
 DEFAULT_POSE_LR = 0.0001
 DEFAULT_LAMBDA_TRACK = 0.1
+MAX_SURFELS = 450_000
 
 
 def densification_flags(target_iter: int, total: int = TOTAL_ITERATIONS) -> list[str]:
-    """Densification/pruning flags for the stage ending at ``target_iter``.
-
-    train.py nests the opacity reset *inside* the ``densify_until_iter`` gate::
-
-        if iteration < opt.densify_until_iter:
-            if iteration > opt.densify_from_iter and ...:  densify_and_prune(...)
-            if iteration % opt.opacity_reset_interval == 0: reset_opacity()
-
-    so ``densify_until_iter = 0`` would switch off the 2k pruning cycles as well.
-    Phase 1 therefore suppresses densification by putting ``densify_from_iter``
-    past the end of the run and leaves the gate open, which keeps the resets.
-    """
-    if target_iter > PHASE2_FROM:
-        densify_from, densify_until = PHASE2_FROM, total
-    else:
-        densify_from, densify_until = total, PHASE2_FROM
-    return ["--densify_from_iter", str(densify_from),
-            "--densify_until_iter", str(densify_until),
-            "--densify_grad_threshold", str(DENSIFY_GRAD_THRESHOLD),
+    """Densification/pruning flags for the stage ending at ``target_iter``."""
+    threshold = PHASE2_DENSIFY_GRAD_THRESHOLD if target_iter > PHASE2_FROM else PHASE1_DENSIFY_GRAD_THRESHOLD
+    return ["--densify_from_iter", str(DENSIFY_WARMUP_ITERS),
+            "--densify_until_iter", str(total),
+            "--densify_grad_threshold", str(threshold),
             "--opacity_reset_interval", str(OPACITY_RESET_INTERVAL),
+            "--opacity_reset_until_iter", str(OPACITY_RESET_UNTIL_ITER),
             "--normal_from_iter", str(NORMAL_FROM_ITER)]
 
 

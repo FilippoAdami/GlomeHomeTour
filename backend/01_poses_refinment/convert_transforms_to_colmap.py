@@ -22,7 +22,7 @@ import sqlite3
 import argparse
 import subprocess
 import numpy as np
-from scene.colmap_loader import rotmat2qvec
+from scene.colmap_loader import qvec2rotmat, rotmat2qvec
 
 # COLMAP enum values, read off colmap/src/colmap/util/types.h (SensorType) and
 # colmap/src/colmap/geometry/pose_prior.h (PosePrior::CoordinateSystem).
@@ -307,8 +307,15 @@ def hold_rotations_at_init(refined_dir, manual_dir, flagged, out_dir):
     lines = []
     for name in sorted(refined):
         img = refined[name]
-        qvec = init[name]["qvec"] if (name in flagged and name in init) else img["qvec"]
-        t = img["t_w2c"]
+        if name in flagged and name in init:
+            qvec = init[name]["qvec"]
+            R_w2c = qvec2rotmat(qvec)
+            # Preserve refined camera center C (bounded by soft prior), reset orientation to ARCore
+            C = img["t_c2w"]
+            t = -R_w2c @ C
+        else:
+            qvec = img["qvec"]
+            t = img["t_w2c"]
         lines.append(f"{img['id']} {qvec[0]} {qvec[1]} {qvec[2]} {qvec[3]} "
                      f"{t[0]} {t[1]} {t[2]} {img['camera_id']} {name}")
         lines.append("")
@@ -343,6 +350,7 @@ def main():
                         help="sequential is much faster for ordered video-like captures; exhaustive suits unordered photo sets")
     parser.add_argument("--images", default="images", help="Name of the images subfolder to use")
     parser.add_argument("--transforms", default="transforms.json", help="Name of the transforms JSON file to use")
+    parser.add_argument("--database", default="colmap_database.db", help="Relative path for colmap_database.db")
     parser.add_argument("--refine_poses", action="store_true",
                         help="Refine the VIO poses after triangulation (see --ba_mode). Off by "
                              "default: point_triangulator already only accepts points consistent "
@@ -362,9 +370,15 @@ def main():
                         help="With --diagnostics, also export trajectory/point-cloud/frustum PLYs")
     parser.add_argument("--rot_drift_deg", type=float, default=2.0,
                         help="Flag frames whose refined rotation drifted more than this from ARCore")
+    parser.add_argument("--max_features", type=int, default=8192,
+                        help="Maximum SIFT features per frame (default 8192)")
+    parser.add_argument("--spatial_max_dist_m", type=float, default=2.5,
+                        help="Maximum distance in metres for spatial loop closure matching (default 2.5m)")
+    parser.add_argument("--no_spatial_matcher", action="store_true",
+                        help="Disable spatial matching pass using pose priors")
     parser.add_argument("--fix_rotation_drift", action="store_true",
                         help="With --diagnostics, re-triangulate holding flagged frames at their "
-                             "ARCore rotation (only if few frames are flagged)")
+                             "ARCore rotation")
     parser.add_argument("--keep_database", action="store_true",
                         help="Keep colmap_database.db (needed to re-run the Sampson check later)")
     parser.add_argument("--max_sampson_px", type=float, default=2.0,
@@ -387,13 +401,14 @@ def main():
     with open(transforms_path) as f:
         transforms = json.load(f)
 
-    db_path = os.path.join(source_path, "colmap_database.db")
+    db_path = os.path.join(source_path, args.database)
     manual_dir = os.path.join(source_path, "sparse_manual", "0")
     tri_dir = os.path.join(source_path, "sparse_triangulated", "0")
     sparse_dir = os.path.join(source_path, "sparse", "0")
 
     if os.path.exists(db_path):
         os.remove(db_path)  # feature_extractor refuses to reuse a stale database
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     os.makedirs(sparse_dir, exist_ok=True)
 
     # 1. Zoom grouping decides whether COLMAP sees one camera or several.
@@ -428,25 +443,42 @@ def main():
          "--ImageReader.camera_model", "PINHOLE",
          *camera_flag,
          "--FeatureExtraction.use_gpu", "1",   # SiftGPU via OpenGL, no CUDA needed on AMD
-         "--SiftExtraction.max_num_features", "16384"])  # default 8192 under-covers textureless walls
+         "--FeatureExtraction.max_image_size", "1600",
+         "--SiftExtraction.max_num_features", str(args.max_features)])
+
+    ba_mode = args.ba_mode if args.refine_poses else "none"
+
+    # 3. Write pose priors for spatial matching and bundle adjustment
+    if ba_mode == "pose_prior":
+        write_pose_priors(groups, db_path, args.prior_sigma_m)
 
     matcher = "sequential_matcher" if args.matcher == "sequential" else "exhaustive_matcher"
-    run(["colmap", matcher,
-         "--database_path", db_path,
-         "--FeatureMatching.use_gpu", "1",
-         # re-matches using epipolar geometry, recovers matches the SIFT ratio-test drops
-         "--FeatureMatching.guided_matching", "1"])
+    matcher_cmd = ["colmap", matcher,
+                   "--database_path", db_path,
+                   "--FeatureMatching.use_gpu", "1",
+                   # re-matches using epipolar geometry, recovers matches the SIFT ratio-test drops
+                   "--FeatureMatching.guided_matching", "1"]
+    if args.matcher == "sequential":
+        matcher_cmd.extend(["--SequentialMatching.overlap", "5"])
+    run(matcher_cmd)
 
-    # 3. Manual model from the ARCore poses.
+    # Spatial matcher: uses ARCore pose priors to find loop closures across the room
+    if args.matcher == "sequential" and ba_mode == "pose_prior" and not args.no_spatial_matcher:
+        print(f"Running spatial matcher (max distance {args.spatial_max_dist_m}m) for loop closures...")
+        run(["colmap", "spatial_matcher",
+             "--database_path", db_path,
+             "--FeatureMatching.use_gpu", "1",
+             "--FeatureMatching.guided_matching", "1",
+             "--SpatialMatching.ignore_z", "1",
+             "--SpatialMatching.max_distance", str(args.spatial_max_dist_m),
+             "--SpatialMatching.max_num_neighbors", "30"])
+
+    # 4. Manual model from the ARCore poses.
     distortion = (transforms.get("k1", 0.0), transforms.get("k2", 0.0),
                   transforms.get("p1", 0.0), transforms.get("p2", 0.0))
     build_manual_model(groups, distortion, db_path, manual_dir)
 
-    ba_mode = args.ba_mode if args.refine_poses else "none"
-    if ba_mode == "pose_prior":
-        write_pose_priors(groups, db_path, args.prior_sigma_m)
-
-    # 4. Triangulate, then optionally refine.
+    # 5. Triangulate, then optionally refine.
     if ba_mode == "none":
         triangulate(db_path, colmap_images_path, manual_dir, sparse_dir)
     else:
@@ -455,7 +487,7 @@ def main():
                               tri_dir, sparse_dir, args.prior_sigma_m)
     to_txt(sparse_dir)
 
-    # 5. Diagnostics, and the rotation-drift second pass they enable.
+    # 6. Diagnostics, and the rotation-drift second pass they enable.
     if args.diagnostics:
         from colmap_diagnostics import run_all
         report = run_all(db_path=db_path, init_dir=manual_dir, refined_dir=sparse_dir,
@@ -466,23 +498,18 @@ def main():
         flagged = report.get("drift", {}).get("rotation_outliers", [])
         if flagged and args.fix_rotation_drift:
             total = report["drift"]["num_frames"]
-            if len(flagged) <= max(1, int(0.1 * total)):
-                held_dir = os.path.join(source_path, "sparse_held", "0")
-                hold_rotations_at_init(sparse_dir, manual_dir, set(flagged), held_dir)
-                triangulate(db_path, colmap_images_path, held_dir, sparse_dir)
-                to_txt(sparse_dir)
-                run_all(db_path=db_path, init_dir=manual_dir, refined_dir=sparse_dir,
-                        images_dir=colmap_images_path,
-                        out_dir=os.path.join(args.diagnostics, "after_rotation_fix"),
-                        rot_thresh_deg=args.rot_drift_deg)
-                shutil.rmtree(os.path.dirname(held_dir), ignore_errors=True)
-            else:
-                print(f"\n{len(flagged)}/{total} frames drifted more than "
-                      f"{args.rot_drift_deg} deg in rotation. That is too many to hold at "
-                      "the ARCore value: the ARCore trajectory itself is likely bad over "
-                      "that segment, so it is reported rather than papered over.")
+            print(f"\nHolding {len(flagged)}/{total} rotation outliers (> {args.rot_drift_deg} deg) at ARCore orientation and re-triangulating...")
+            held_dir = os.path.join(source_path, "sparse_held", "0")
+            hold_rotations_at_init(sparse_dir, manual_dir, set(flagged), held_dir)
+            triangulate(db_path, colmap_images_path, held_dir, sparse_dir)
+            to_txt(sparse_dir)
+            run_all(db_path=db_path, init_dir=manual_dir, refined_dir=sparse_dir,
+                    images_dir=colmap_images_path,
+                    out_dir=os.path.join(args.diagnostics, "after_rotation_fix"),
+                    rot_thresh_deg=args.rot_drift_deg)
+            shutil.rmtree(os.path.dirname(held_dir), ignore_errors=True)
 
-    # 6. Keyframes, at the four resolutions the splatting tooling expects.
+    # 7. Keyframes, at the four resolutions the splatting tooling expects.
     if args.export_keyframes:
         from export_keyframes import export_keyframes
         export_keyframes(source_path, images_path, transforms, sparse_dir,

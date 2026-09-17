@@ -169,6 +169,19 @@ class GatingTest {
         assertTrue(greenCast[3] > 1f) // blue
     }
 
+    /** The ISP's AWB gains arrive as an RggbChannelVector (two greens); the trim works in RGB, so
+     * the two have to line up channel for channel -- getting this wrong swaps red and blue, which
+     * looks like a wildly miscalibrated scene rather than an indexing slip. */
+    @Test
+    fun `white balance trim keeps the ISP gain order`() {
+        val frozen = floatArrayOf(1.9f, 1f, 1.4f) // a typical warm-light AWB estimate
+        val gains = MainActivity.whiteBalanceTrim(frozen)
+        assertEquals(1.9f, gains[0], 1e-6f) // red
+        assertEquals(1f, gains[1], 1e-6f)   // greenEven
+        assertEquals(1f, gains[2], 1e-6f)   // greenOdd
+        assertEquals(1.4f, gains[3], 1e-6f) // blue
+    }
+
     @Test
     fun `white balance gains stay within a sane clamp for extreme chroma`() {
         val gains = MainActivity.whiteBalanceGains(128f, 255f, 0f)

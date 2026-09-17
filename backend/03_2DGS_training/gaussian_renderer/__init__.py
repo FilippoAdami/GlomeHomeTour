@@ -14,7 +14,7 @@ import math
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from utils.point_utils import depth_to_normal
+from utils.point_utils import depth_to_normal, _rotate
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
@@ -118,9 +118,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     render_alpha = allmap[1:2]
 
     # get normal map
-    # transform normal from view space to world space
+    # transform normal from view space to world space (using _rotate to prevent gfx1200 BLAS zeroing past 2^19 rows)
     render_normal = allmap[2:5]
-    render_normal = (render_normal.permute(1,2,0) @ (viewpoint_camera.world_view_transform[:3,:3].T)).permute(2,0,1)
+    rn_perm = render_normal.permute(1, 2, 0)
+    H_rn, W_rn = rn_perm.shape[:2]
+    R_cw = viewpoint_camera.world_view_transform[:3, :3].T
+    rn_rot = _rotate(rn_perm.reshape(-1, 3), R_cw).reshape(H_rn, W_rn, 3)
+    render_normal = rn_rot.permute(2, 0, 1)
     
     # get median depth map
     render_depth_median = allmap[5:6]

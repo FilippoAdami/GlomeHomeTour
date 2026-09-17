@@ -26,6 +26,7 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
+from collections import Counter
 from typing import Optional, Sequence
 
 import numpy as np
@@ -41,17 +42,24 @@ from Utilities.pipeline_step import StepContext, is_done
 from Utilities.scene_io import load_scene, merge_back, split_scene
 from colmap_diagnostics import parse_images_txt, parse_points3D_txt
 from export_keyframes import prune_model
+from keyframe_budget import (VIEWS_PER_CELL, coverage_prune, coverage_topup,
+                             frame_budget, read_scene_size, voxel_coverage)
 from keyframe_selector import DynamicKeyframeSelector
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+MANIFEST_DIRNAME = "00_ingestion"    # transforms.json lives here; images/ stays at workspace root
+STAGE_DIRNAME = "02_depth_estimation"
+ARTIFACTS_DIRNAME = "depth"          # shared with step_depth.py's own output folder
 DISCARD_IMAGES = "depth_discarded_images"
 DISCARD_SPARSE = "depth_discarded_sparse"
 
-# Depth estimation is the most expensive step in the pipeline (~seconds/frame on
-# GPU), so this stage exists to make it affordable: aim to hand step 4 a third
-# to a half of what COLMAP registered, not nearly all of it.
-RETENTION_MIN = 0.30
-RETENTION_MAX = 0.50
+# Depth estimation is the most expensive step in the pipeline (~1.2 s/frame on
+# GPU), so this stage exists to make it affordable. The budget is set by the
+# *room* -- surface area from `01_poses_refinment/scene_size.txt` over the
+# footprint one frame covers at the measured median depth -- not by a fraction
+# of however long the operator walked; see keyframe_budget.py. A slow, thorough
+# capture and a hurried one of the same flat should hand step 4 the same count.
+SIZE_FILE = Path("01_poses_refinment") / "scene_size.txt"
 
 # `for_2dgs_training` calibrated its overlap band against *frustum* covisibility.
 # This stage scores |a & b| / min(|a|, |b|) over shared COLMAP tracks, which runs
@@ -62,6 +70,17 @@ RETENTION_MAX = 0.50
 # effect was a stage that kept 90.5% and fired `redundant_covisibility` 14 times.
 MIN_COVIS = 0.25
 MAX_COVIS = 0.60
+
+# The floor the *prune* honours, which is not the same question. MIN_COVIS asks
+# "is this frame worth adding to a chain being built up"; when thinning an
+# existing chain to a fixed budget the only thing that must hold is that the
+# survivors still see each other at all. Measured on the reference capture: at
+# 0.25 the prune jams at 279 frames and never reaches the band; at 0.10 it lands
+# on 229 with 11,078 voxels covered and 6 weak pairs, against 10,314 and 31 weak
+# pairs for evenly subsampling the same chain to the same size. Below 0.05 the
+# coverage barely moves and the weak pairs jump to ~30 -- that is the edge.
+# The cost is real and visible in `consecutive_covisibility`: mean 0.38 -> 0.31.
+PRUNE_MIN_COVIS = 0.10
 
 # At a 1.47 m median scene depth an 8 cm baseline is a near-duplicate view; the
 # inherited defaults were set for a stage that could not rely on triangulated
@@ -126,12 +145,14 @@ class TrackCovisibilitySelector(DynamicKeyframeSelector):
 
 def filter_depth(
     workspace: Path,
+    manifest_dir: Path,
+    stage_dir: Path,
     ctx: StepContext,
     min_keyframes: Optional[int] = None,
     max_keyframes: Optional[int] = None,
 ) -> None:
     sparse_dir = workspace / "sparse" / "0"
-    scene = load_scene(workspace)
+    scene = load_scene(manifest_dir, images_root=workspace)
     keyframes = scene.keyframes()
     names = scene.names
     total = len(names)
@@ -152,20 +173,34 @@ def filter_depth(
             "sparse/0 was pruned by an earlier run and cannot be un-pruned here -- "
             "re-run step 2 (`01_poses_refinment/step_colmap.py --force`) first.")
 
-    # Best-effort band, met by re-walking at a tighter/looser overlap threshold
-    # (never by subsampling a chain built for overlap). Coverage still outranks
-    # compactness: the walk refuses to go below `min_covisibility`, so a fast pan
-    # can legitimately overshoot RETENTION_MAX.
-    if min_keyframes is None:
-        min_keyframes = int(total * RETENTION_MIN)
-    if max_keyframes is None:
-        max_keyframes = int(total * RETENTION_MAX)
-
-    ctx.note(f"Selecting from {total} frames against {sparse_dir} "
-             f"(target {min_keyframes}-{max_keyframes})")
-
     with ctx.timer("parse_model"):
         tracks, depths = colmap_tracks_and_depths(sparse_dir, names)
+
+    # How many frames this room needs, from its floor area alone. The walk is
+    # aimed at the band by re-walking at a tighter/looser overlap threshold;
+    # whatever gap is left after that is closed on coverage, below.
+    size_path = workspace / SIZE_FILE
+    if not size_path.exists():
+        raise SystemExit(
+            f"[filter_depth] no {size_path}. The keyframe budget is derived from scene "
+            "size -- run step 2 (`01_poses_refinment/step_colmap.py`) first, which writes it.")
+    size = read_scene_size(size_path)
+    band_lo, band_hi, budget = frame_budget(size, total)
+    if min_keyframes is None:
+        min_keyframes = band_lo
+    if max_keyframes is None:
+        max_keyframes = band_hi
+    ctx.metric("budget", {
+        **budget,
+        "area_m2": size["area_m2"], "floors": int(size["floors"]),
+        "min_keyframes": min_keyframes, "max_keyframes": max_keyframes,
+    })
+    ctx.note(f"Selecting from {total} frames against {sparse_dir} (target {min_keyframes}-"
+             f"{max_keyframes}, from {budget['floor_area_m2']:.1f} m2 floor area "
+             f"= {size['area_m2']:.1f} m2 x {int(size['floors'])} floor(s))")
+    if budget["band"][1] > total:
+        ctx.note(f"WARNING: the scene asks for up to {budget['band'][1]} frames but only {total} "
+                 "were captured -- this scene is under-sampled, expect thin coverage.")
 
     ctx.metric("scene_depth_m", {
         "median": round(float(np.median(depths)), 3),
@@ -199,12 +234,51 @@ def filter_depth(
             scene_depths=depths,
         )
 
-    selected = set(result.selected_indices)
+    # The walk only knows how to hit a budget by re-walking at a tighter overlap
+    # threshold, and that bottoms out at the overlap floor -- on a slow capture
+    # of a small room it lands far above the band. So the frames it picked are
+    # taken as a connectivity-correct starting set, and the budget is met by
+    # judging frames on the *places* they observe: drop the ones whose voxels
+    # are already well covered, or add the ones covering voxels nobody else does.
+    chain = list(result.selected_indices)
+    with ctx.timer("coverage_fit"):
+        coverage = voxel_coverage(tracks, parse_points3D_txt(sparse_dir / "points3D.txt"))
+        covis = lambda a, b: selector._mutual_covisibility(a, b, keyframes, scene.intrinsics)
+        if len(chain) > max_keyframes:
+            chain = coverage_prune(coverage, chain, max_keyframes, covis, PRUNE_MIN_COVIS)
+        else:
+            chain = coverage_topup(coverage, chain, max_keyframes)
+    delta = len(chain) - len(result.selected_indices)
+    ctx.metric("coverage_fit_delta", delta)
+    ctx.note(f"Chain {len(result.selected_indices)} frames, {delta:+d} to fit the "
+             f"{min_keyframes}-{max_keyframes} band -> {len(chain)}")
+    if len(chain) > max_keyframes:
+        ctx.note(f"WARNING: stopped at {len(chain)} frames, above the band: every remaining "
+                 "frame is load-bearing for chain connectivity. Coverage outranks the budget.")
+
+    # What the budget was actually spent on: how often each occupied cell of the
+    # room ends up observed. This is the number to look at when a reconstruction
+    # comes out thin in one corner.
+    views = Counter()
+    for i in chain:
+        views.update(coverage[i])
+    cells_total = len({c for cov in coverage for c in cov})
+    per_cell = np.array(list(views.values())) if views else np.zeros(1)
+    coverage_stats = {
+        "cells_observed": len(views),
+        "cells_total": cells_total,
+        "views_per_cell_median": float(np.median(per_cell)),
+        "cells_below_target": float(np.mean(per_cell < VIEWS_PER_CELL)),
+    }
+    ctx.metric("voxel_coverage", coverage_stats)
+    ctx.note(f"Coverage: {len(views)}/{cells_total} cells observed, "
+             f"median {np.median(per_cell):.0f} views/cell")
+
+    selected = set(chain)
     reject_names = [names[i] for i in range(total) if i not in selected]
 
     # Covisibility actually held between consecutive kept frames -- the number
     # that proves coverage survived the cull.
-    chain = result.selected_indices
     pair_covis = [selector._mutual_covisibility(chain[k], chain[k + 1], keyframes, scene.intrinsics)
                   for k in range(len(chain) - 1)]
     if pair_covis:
@@ -235,13 +309,14 @@ def filter_depth(
 
     points_before = len(parse_points3D_txt(sparse_dir / "points3D.txt"))
 
-    kept, rejected = split_scene(workspace, workspace / DISCARD_IMAGES, reject_names)
+    kept, rejected = split_scene(manifest_dir, stage_dir / DISCARD_IMAGES, reject_names,
+                                  images_root=workspace)
     if reject_names:
         with ctx.timer("prune_model"):
             # The model split mirrors the image split: copy, then delete the
             # complement from each half, so the discard folder is a loadable
             # mini-model rather than a list of names.
-            discard_sparse = workspace / DISCARD_SPARSE / "0"
+            discard_sparse = stage_dir / DISCARD_SPARSE / "0"
             shutil.rmtree(discard_sparse.parent, ignore_errors=True)
             shutil.copytree(sparse_dir, discard_sparse)
             prune_model(str(discard_sparse), set(names) - set(reject_names))
@@ -266,6 +341,17 @@ def filter_depth(
         f"**Workspace:** `{workspace}`  ",
         f"**Selected Keyframes:** {kept} / {total} ({100.0 * kept / max(1, total):.1f}%)  ",
         f"**Discarded Frames:** {rejected}  ",
+        "",
+        "## Keyframe Budget (scene-derived)",
+        "",
+        f"- **Scene:** {size['area_m2']:.1f} m2 footprint x {int(size['floors'])} floor(s), "
+        f"{size['x']:.2f} x {size['y']:.2f} x {size['z']:.2f} m",
+        f"- **Target Band:** `{min_keyframes}-{max_keyframes}` frames "
+        f"(`50 + (8..11) x {budget['floor_area_m2']:.1f} m2` floor area)",
+        f"- **Chain / Coverage Fit:** {len(result.selected_indices)} {delta:+d} = {len(chain)}",
+        f"- **Voxel Coverage:** {coverage_stats['cells_observed']}/{coverage_stats['cells_total']} "
+        f"cells observed, median {coverage_stats['views_per_cell_median']:.0f} views/cell, "
+        f"{100.0 * coverage_stats['cells_below_target']:.0f}% below target",
         "",
         "## Scene Depth & Track Statistics",
         "",
@@ -307,7 +393,8 @@ def filter_depth(
         summary_md.append(f"| `{r_key}` | **{r_count}** | {desc} |")
     summary_md.append("")
 
-    summary_file = workspace / "filter_depth_summary.md"
+    summary_file = stage_dir / ARTIFACTS_DIRNAME / "filter_depth_summary.md"
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
     summary_file.write_text("\n".join(summary_md), encoding="utf-8")
     ctx.note(f"Human-inspectable summary written to {summary_file}")
 
@@ -322,19 +409,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
-    if not args.force and is_done(workspace, "filter_depth", [workspace / "transforms.json"]):
+    manifest_dir = workspace / MANIFEST_DIRNAME
+    stage_dir = workspace / STAGE_DIRNAME
+    artifacts_dir = stage_dir / ARTIFACTS_DIRNAME
+    if not args.force and is_done(workspace, "filter_depth", [manifest_dir / "transforms.json"]):
         print("[filter_depth] already done, skipping (use --force to re-run)")
         return 0
 
     if args.force:
-        restored = merge_back(workspace / DISCARD_IMAGES, workspace)
+        restored = merge_back(stage_dir / DISCARD_IMAGES, manifest_dir, images_root=workspace)
         if restored:
             # The pruned model cannot be un-pruned in place; step 2 owns sparse/0/.
             print(f"[filter_depth] --force: restored {restored} frame(s). "
                   "Re-run step 2 as well if sparse/0/ was already pruned.")
 
-    with StepContext("filter_depth", workspace) as ctx:
-        filter_depth(workspace, ctx, args.min_keyframes, args.max_keyframes)
+    with StepContext("filter_depth", workspace, artifacts_dir=artifacts_dir) as ctx:
+        filter_depth(workspace, manifest_dir, stage_dir, ctx, args.min_keyframes, args.max_keyframes)
     return 0
 
 

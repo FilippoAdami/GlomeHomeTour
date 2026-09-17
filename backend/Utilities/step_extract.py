@@ -36,6 +36,7 @@ from Utilities.pipeline_step import StepContext, is_done
 from Utilities.scene_io import load_scene, write_scene
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+STAGE_DIRNAME = "00_ingestion"  # everything this step produces, except images/ itself
 
 
 def _find_scene_root(directory: Path) -> Path:
@@ -52,7 +53,7 @@ def _find_scene_root(directory: Path) -> Path:
     return candidates[0]
 
 
-def extract(source: Path, workspace: Path, ctx: StepContext) -> None:
+def extract(source: Path, workspace: Path, stage_dir: Path, ctx: StepContext) -> None:
     source = Path(source)
     if not source.exists():
         raise FileNotFoundError(f"Capture not found: {source}")
@@ -89,7 +90,7 @@ def extract(source: Path, workspace: Path, ctx: StepContext) -> None:
                 if not src.is_file():
                     raise FileNotFoundError(f"transforms.json names a missing image: {src}")
                 shutil.copy2(src, workspace / frame["file_path"])
-        write_scene(workspace, scene.header, scene.frames)
+        write_scene(stage_dir, scene.header, scene.frames)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -125,13 +126,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
-    outputs = [workspace / "transforms.json", workspace / "images"]
+    stage_dir = workspace / STAGE_DIRNAME
+    outputs = [stage_dir / "transforms.json", workspace / "images"]
     if not args.force and is_done(workspace, "extract", outputs):
         print("[extract] already done, skipping (use --force to re-run)")
         return 0
 
-    with StepContext("extract", workspace) as ctx:
-        extract(Path(args.source), workspace, ctx)
+    with StepContext("extract", workspace, artifacts_dir=stage_dir) as ctx:
+        extract(Path(args.source), workspace, stage_dir, ctx)
     return 0
 
 

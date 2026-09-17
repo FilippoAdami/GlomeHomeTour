@@ -10,6 +10,7 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.MeteringRectangle
 import android.hardware.camera2.params.RggbChannelVector
 import android.os.Build
@@ -60,6 +61,34 @@ class CameraPipeline(
             field = value
             applyRepeatingRequest()
         }
+
+    /** The colour transform that went with [whiteBalanceGains] when they were frozen. Gains alone
+     * are only half of the ISP's answer; freezing them without the matrix they were chosen against
+     * shifts the result. Null on devices that don't report one -- the HAL then keeps its own. */
+    @Volatile var whiteBalanceTransform: ColorSpaceTransform? = null
+
+    /**
+     * True while the device's own AWB is left running, false once pre-flight freezes it.
+     *
+     * The scan itself still needs WB nailed down -- gains drifting mid-walkthrough is exactly what
+     * makes a 2DGS scene blotchy. But *choosing* those gains is illuminant estimation, and a
+     * single-patch grey-world solve can't separate "neutral wall under warm light" from "warm
+     * wooden floor under neutral light": it neutralises both, which turned a pine floor blue-grey.
+     * The ISP's AWB does make that distinction, and it converges over a second or two on its own,
+     * so pre-flight lets it settle and then freezes whatever it landed on.
+     */
+    @Volatile var autoWhiteBalance: Boolean = true
+        set(value) {
+            field = value
+            applyRepeatingRequest()
+        }
+
+    /** What the ISP's AWB last chose, echoed back from the capture result so pre-flight can freeze
+     * it. Null until a result carries them (or on a device that never reports them). */
+    @Volatile var latestAwbGains: RggbChannelVector? = null
+        private set
+    @Volatile var latestAwbTransform: ColorSpaceTransform? = null
+        private set
 
     /** Manual ISO, metered from ambient light during pre-flight (README §4/§6) and then left
      * alone once scanning starts. Jointly tuned with `shutterNanos` against a shared tradeoff
@@ -183,6 +212,10 @@ class CameraPipeline(
             latestAfState = result.get(CaptureResult.CONTROL_AF_STATE) ?: 0
             latestAfMode = result.get(CaptureResult.CONTROL_AF_MODE) ?: 0
             latestFocalLengthMm = result.get(CaptureResult.LENS_FOCAL_LENGTH) ?: 0f
+            // Only meaningful while the ISP's AWB is the one choosing; once frozen these just
+            // echo back what we set, and overwriting them with our own values is harmless.
+            result.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { latestAwbGains = it }
+            result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { latestAwbTransform = it }
         }
     }
 
@@ -276,10 +309,17 @@ class CameraPipeline(
         val iso = isoSensitivity.coerceIn(isoRange?.lower ?: isoSensitivity, isoRange?.upper ?: isoSensitivity)
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso)
 
-        // White balance: manual, locked from pre-flight (or neutral until the operator locks).
-        builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
-        builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
-        builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, whiteBalanceGains)
+        // White balance: the ISP's AWB estimates the illuminant during pre-flight, then pre-flight
+        // freezes its answer for the scan (see `autoWhiteBalance`). In auto mode the colour
+        // correction keys in the request are ignored by the HAL anyway, so don't set them.
+        if (autoWhiteBalance) {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        } else {
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, whiteBalanceGains)
+            whiteBalanceTransform?.let { builder.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, it) }
+        }
 
         // OIS hard disabled, if the lens has it.
         val ois = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)

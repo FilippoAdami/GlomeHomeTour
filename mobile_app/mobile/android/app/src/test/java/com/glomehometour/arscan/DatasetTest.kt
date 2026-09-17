@@ -53,6 +53,19 @@ class DatasetTest {
         assertEquals(json.count { it == '{' }, json.count { it == '}' })
         assertEquals(json.count { it == '[' }, json.count { it == ']' })
         assertTrue("no trailing comma before the closing bracket", !json.contains(",\n  ]"))
+        assertTrue("frame with no magnetometer reading yet writes null, not a bogus 0", json.contains("\"compass_heading_deg\": null"))
+    }
+
+    @Test
+    fun `compass heading rides along per frame when present`() {
+        val frames = listOf(
+            DatasetFormat.Keyframe(
+                "frame_00000.jpg", DatasetFormat.cameraToWorld(0f, 0f, 0f, 0f, 0f, 0f, 1f), 111L,
+                500f, 501f, 320f, 240f, compassHeadingDeg = 87.5f,
+            ),
+        )
+        val json = DatasetFormat.transformsJson(500f, 501f, 320f, 240f, 640, 480, frames)
+        assertTrue(json.contains("\"compass_heading_deg\": 87.500000"))
     }
 
     @Test

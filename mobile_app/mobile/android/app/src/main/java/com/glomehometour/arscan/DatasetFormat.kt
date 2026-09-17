@@ -28,6 +28,11 @@ object DatasetFormat {
         val afState: Int = 0,
         val afMode: Int = 0,
         val focalLengthMm: Float = 0f,
+        /** Magnetic compass heading in degrees [0, 360), clockwise from magnetic north, of the
+         * device at capture time -- not corrected for declination (no location fix available).
+         * Lets the backend rotate the otherwise-arbitrary ARCore world yaw to a real-world
+         * orientation. Null if the magnetometer hadn't produced a reading yet. */
+        val compassHeadingDeg: Float? = null,
     )
 
     /**
@@ -72,6 +77,7 @@ object DatasetFormat {
             append("    {\"file_path\": \"images/${frame.fileName}\", \"timestamp_ns\": ${frame.timestampNs}, ")
             append("\"fl_x\": ${f(frame.fx)}, \"fl_y\": ${f(frame.fy)}, ")
             append("\"cx\": ${f(frame.cx)}, \"cy\": ${f(frame.cy)}, ")
+            append("\"compass_heading_deg\": ${frame.compassHeadingDeg?.let { f(it) } ?: "null"}, ")
             append("\"transform_matrix\": [")
             for (r in 0 until 4) {
                 append("[")

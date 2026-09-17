@@ -21,6 +21,23 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+
+def _quat_aligning_z_to(normals: torch.Tensor) -> torch.Tensor:
+    """(w,x,y,z) quaternion rotating local +Z onto each (unit) normal row."""
+    n = torch.nn.functional.normalize(normals, dim=-1)
+    z_axis = torch.zeros_like(n)
+    z_axis[:, 2] = 1.0
+    dot = (z_axis * n).sum(-1)
+    cross = torch.linalg.cross(z_axis, n, dim=-1)
+    q = torch.cat([(1.0 + dot)[:, None], cross], dim=-1)
+    # +Z antiparallel to n: cross collapses to 0 too, so the general formula
+    # gives a zero quaternion. 180 degrees about any axis orthogonal to +Z works.
+    opposite = dot < (-1.0 + 1e-6)
+    if opposite.any():
+        q[opposite] = torch.tensor([0.0, 1.0, 0.0, 0.0], device=n.device)
+    return torch.nn.functional.normalize(q, dim=-1)
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -156,7 +173,22 @@ class GaussianModel:
             # -------------------------------------------------
             scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
 
+        # Honour step 4's per-surfel normals too: the rasterizer reads a
+        # surfel's world-space normal off column 2 of its rotation matrix
+        # (forward.cu: normal = R[:, 2]), so a quaternion that maps local +Z
+        # onto the depth prior's (nx,ny,nz) starts training oriented flat
+        # against the real surface instead of facing a random direction.
+        # Tangent-plane spin around that normal is left random: the cloud
+        # only carries |scale_u|, |scale_v| magnitudes, no tangent direction
+        # to match it to. COLMAP's fallback cloud (storePly) writes all-zero
+        # normals, so those points/fallback path still get a random quaternion.
+        normals_np = np.asarray(pcd.normals) if getattr(pcd, "normals", None) is not None else np.empty((0, 3))
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+        if normals_np.size:
+            normals_t = torch.tensor(normals_np, dtype=torch.float32, device="cuda")
+            valid = normals_t.norm(dim=-1) > 1e-6
+            if valid.any():
+                rots[valid] = _quat_aligning_z_to(normals_t[valid])
 
         if getattr(pcd, "opacities", None) is not None:
             op = torch.tensor(np.asarray(pcd.opacities), dtype=torch.float32, device="cuda")
@@ -403,6 +435,7 @@ class GaussianModel:
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
+        stds = torch.nan_to_num(stds, nan=0.01, posinf=0.1, neginf=0.01).clamp(1e-6, 0.5)
         means = torch.zeros_like(stds)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
@@ -438,7 +471,7 @@ class GaussianModel:
                           frustum_min=8, min_obs=2):
         if allow_densification:
             grads = self.xyz_gradient_accum / self.denom
-            grads[grads.isnan()] = 0.0
+            grads[~torch.isfinite(grads)] = 0.0
 
             self.densify_and_clone(grads, max_grad, extent)
             self.densify_and_split(grads, max_grad, extent)
@@ -473,6 +506,7 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter, cam_id=None):
         grad_source = viewspace_point_tensor.grad if viewspace_point_tensor.grad is not None else torch.zeros_like(viewspace_point_tensor)
         grads = torch.norm(grad_source[update_filter], dim=-1, keepdim=True)
+        grads = torch.nan_to_num(grads, nan=0.0, posinf=0.0, neginf=0.0)
         self.xyz_gradient_accum[update_filter] += grads
         self.denom[update_filter] += 1
 

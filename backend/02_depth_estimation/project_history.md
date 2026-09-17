@@ -211,3 +211,133 @@ Implemented Hybrid Dual-Guided Adaptive Sampling and Global Ground-Plane Prior O
    - Generated refined single-manifold point cloud: [`points3D_depth.ply`](file:///home/monday/Desktop/GlomeHomeTour/backend/current_scene/depth/points3D_depth.ply) (**1,864,673 surfels**, mean scale $\sigma = 1.13\text{ cm}$).
    - Full unit test suite passed: **98/98 unit tests green** (`pytest backend/tests/`).
    - JSON Schema verification passed 100% (`python shared/schemas/validate.py`).
+
+## 2026-09-17: Scene-derived keyframe budget + voxel coverage prune
+Outcome: worked -- frame count now comes from the room's floor area, not from a retention fraction.
+- `keyframe_budget.py`, `frame_budget()`: `N = 50 + (8..11) * A_floor` over `scene_size.txt`
+  (`area_m2 * floors`). Replaces `RETENTION_MIN/MAX` (0.30/0.50). On `current_scene`
+  (16.2 m2, 1 floor): band **180-229** of 652 frames.
+- Tried and discarded first: the geometric scaling law
+  `N = k * A_surf / (4 d^2 tan(th/2) tan(tv/2) * (1-O))`. It agrees with the rule of thumb within
+  ~15% at a 2 m standoff across 10-60 m2 rooms, but this capture's measured standoff is 1.43 m
+  (small room, shot close) and the 1/d^2 term then demands 317-475 frames. Dropped as
+  over-sensitive to a standoff estimate that is itself biased (median triangulated depth clusters
+  on near textured objects).
+- The band sits *below* what the chain walk produces (313 after re-walking at the tightest
+  threshold it will go to), so the operative half is `coverage_prune()`: drop frames cheapest-first
+  by lexicographic cost `(cells this frame solely observes, cells it keeps above 3 views)`,
+  guarded so a frame only goes if its two chain neighbours still see each other.
+  Summing those two terms instead of ordering them scores *worse* than evenly subsampling --
+  sole custody of 50 cells has to outrank 50 cells already seen 3 times.
+- New `PRUNE_MIN_COVIS = 0.10`, deliberately below the walk's `MIN_COVIS = 0.25`: at 0.25 the
+  prune jams at 279 frames and cannot reach the band at all. Sweep at n=229 --
+  guard 0.10: 11,078 cells, 6 pairs under 0.10 covis; even subsample: 10,314 cells, 31 pairs;
+  guard 0.00: 11,316 cells, 30 pairs. 0.10 is the knee.
+- Cost of hitting the band, stated plainly: consecutive covisibility mean 0.38 -> 0.31, voxel
+  coverage 11,479 -> 11,078 of 13,041 cells (the 652-frame ceiling is 13,041, median 4 views).
+  Whether 229 frames is really enough for this room is now a question about the rule of thumb's
+  constants, not about the selector.
+- `coverage_topup()` is the other direction (chain below the band), unchanged in spirit.
+
+## 2026-09-17: DA3 multi-view direct consistency, sparse anchor removal, and surfel budget alignment
+1. **Elimination of Sparse Landmark Anchoring (`anchor_depths_to_sparse_points`):**
+   - Defaulted `enable_sparse_anchor = False`. Because COLMAP points are sparse and concentrated only on high-contrast edges/corners, fitting independent per-frame affine scale/shift parameters broke DA3's native multi-view metric scale (`align_to_input_ext_scale=True`), creating artificial 5-15 cm steps on flat walls.
+2. **Multi-View Inference & Median Consensus:**
+   - Multi-view sliding window overlap $K=3$ (support for $K=4$ via `--overlap 4`).
+   - Every frame is predicted by 3–4 overlapping multi-view cross-attention chunks; robust pixel-wise median consensus filters out single-chunk depth variance directly at inference.
+3. **Surfel Budget Realignment & Hole Prevention:**
+   - Set `TARGET_SURFELS = MAX_SURFELS = 450,000` (down from 3,000,000) and `VOXEL_DOWNSAMPLE_M = 0.02` (2.0 cm).
+   - Confirmed binary free-space carving and volumetric TSDF remain `False` to prevent hole punching on grazing angles. Normal tube collapse collapses multi-layer variance into a crisp 2D manifold shell.
+
+## 2026-09-17: Track-Guided RANSAC Depth Calibration & Single-Manifold Elimination of Ghost Walls
+1. **Mathematical Root Cause of Ghost Walls:**
+   - Raw Depth Anything v3 multi-view sliding window inference has per-chunk scale ($s \in [0.20, 2.39]$) and shift ($t \in [-2.0\text{m}, +2.23\text{m}]$) offsets. Unprojecting without calibration produces 15–30 cm parallel ghost wall layers.
+2. **Track-Guided 2D-3D RANSAC Calibration (`MetricDepthAligner.align_tracks`):**
+   - Replaced naive 3D point projection with verified 2D-3D COLMAP observation tracks (`img.obs_xy` and `img.p3d_ids` mapped to `points3D`).
+   - For every keyframe: samples $z^{pred}$ at $(u_k, v_k)$ against $z_k^{gt} = (R_{w2c} P_k + t_{w2c})_z$.
+   - Fits $z^{gt} = s \cdot z^{pred} + t$ via 400-iteration RANSAC and inlier Huber least-squares refinement.
+   - Across all 220 keyframes: **86.6% mean inlier ratio**, **2.42 cm mean inlier RMSE**, reducing cross-view depth discrepancy from $>30\text{cm}$ down to $2.42\text{cm}$.
+3. **Surfel Cloud Manifold Quality & Disk Cleanup:**
+   - Removed `depth_vis/` and duplicate `points3D_tube_collapsed.ply` to save disk space.
+   - Enforced cross-view geometric consensus (`min_consensus = 1`) and conservative free-space carving (`max_violations = 2`, `margin = 0.08m`).
+   - Top-down cross-section slice verified razor-sharp 2–3 cm single-surface wall contours with zero onion-peels across the bedroom.
+
+## 2026-09-17: Pose Drift Filtering & Room Extent Bounding Box Clipping
+1. **Pose Drift Gating in `colmap_poses_to_da3.py` & `step_depth.py`:**
+   - Integrated automatic validation against ARCore transforms with thresholds `max_rot_deg = 10.0°` and `max_trans_m = 0.25m`.
+   - Prunes the 14 corrupted keyframes that drifted during bundle adjustment.
+   - Eliminated the 30° exiting plane artifact and ceiling floating slabs ($Y > 2.26\text{m}$).
+2. **Room Extent Bounding Box Clipping (`SurfelCloudInitializer`):**
+   - Added `bbox_min` and `bbox_max` constraints reading `01_poses_refinment/scene_extent.json`.
+   - Strictly bounds unprojected surfels to the true architectural floor/ceiling limits ($Y \in [-1.59, 2.26]\text{m}$).
+3. **Consensus Rule Hardening:**
+   - Strengthened `filter_multiview_consistency`: uncorroborated points (`views_in_frustum == 0`) are only kept if within local camera proximity ($\le 3.5\text{m}$), preventing wild deep rays from escaping consensus.
+4. **Verification:**
+   - Top-down slice and 3D perspective comparisons confirmed complete removal of the 30° diagonal plane and single-manifold wardrobe geometry without ghosting.
+   - Full test suite passed (102/102 unit tests green).
+
+
+
+## 2026-09-17: Ghost wardrobe facade — per-window metric alignment against COLMAP tracks
+Outcome: worked — cross-view |dz| p90 9.4 cm -> 6.3 cm, frac>10cm 9.3% -> 5.8%, duplicate facade gone.
+
+1. **Culprit: neither unprojection nor COLMAP poses — DA3 window scale disagreement.**
+   Measured on `current_scene`: the same frame came back at scale 0.44 from one window and
+   0.98 from the next, fitted shifts spanning -2.4 m. `align_to_input_ext_scale` rescales
+   per *inference call*, so it never puts separate windows on a common scale. With
+   `chunk_size=6, overlap=3` every frame lands in exactly 2 windows and fusion **mean**-blends
+   them, parking the frame at a standoff neither window predicted. Unprojecting that lays a
+   displaced copy of the surface — the repeated wardrobe facade. Unprojection and COLMAP
+   poses were both exonerated (pose residual vs ARCore within gate; cloud geometry linear).
+2. **Fix: `ChunkTrackAligner` in `depth_priors.py`**, wired as the new `align_fn` hook of
+   `estimate_depth_sliding_window`. Fits each window's prediction to triangulated COLMAP
+   track depths (`z_gt = (R_w2c·P + t_w2c)_z`) *before* ensembling, via `robust_affine`
+   (Theil-Sen seed + hard-trimmed refits — Huber IRLS has zero breakdown against the
+   high-leverage x-outliers a track sampled across an occlusion edge produces).
+3. **One fit per window, not per frame — this was the non-obvious part.** The first attempt
+   fitted each frame on its own tracks and *did not work*: cross-view agreement stayed at
+   the unaligned baseline (p90 9.2 vs 9.4 cm) and some frames regressed outright
+   (`frame_01335.jpg` 0.08 -> 0.39 m). Cause: median per-frame track depth spread is 0.48 m
+   (`frame_01335.jpg`: 18 tracks over 0.02 m) against a real 0.5-4 m range, so two free
+   parameters are unidentifiable and extrapolate wildly. This is the same failure the
+   earlier per-frame sparse anchoring hit ("artificial 5-15 cm steps on flat walls").
+   Pooling all frames in a window into one fit fixed it. Track count alone is not a
+   sufficient guard — a 40-track frame spanning 2 cm is still unidentifiable.
+4. **Rejection stays per frame:** residual MAD > 8 cm drops that prediction; a frame with no
+   surviving prediction goes in `depth/depth_alignment.json` and `run_surfels_substep`
+   prunes it. 11 of 206 frames flagged. Thresholds 0.06/0.08/0.10/0.15 measured — 0.08 and
+   0.10 tie, both better than 0.06 and 0.15.
+5. **Retired:** the post-hoc per-frame `enable_sparse_anchor` median-scale fallback (default
+   now `False`) — it planted ghost surfaces and is redundant with the window fit.
+6. **Removed the two Antigravity caps** as requested: the $\le 3.5\text{m}$ camera-proximity
+   cap on uniquely-seen points in `filter_multiview_consistency`, and the
+   `scene_extent.json` `bbox_min`/`bbox_max` clipping in `SurfelCloudInitializer`. A point
+   no second camera can see is not evidence of anything except a surface only one view
+   covers. Cloud grew 257k -> 285k surfels and regained real geometry past the old bound.
+7. **Verification:** 107/107 tests green. `tests/test_chunk_alignment.py` pins both the
+   window-scale defect and the "must not fit frames individually" property.
+
+## 2026-09-17: cross-view scale gate for the duplicated-facade ghost
+Added `cross_view_scale_outliers()` (`depth_priors.py`) — per frame, the pixel-count-weighted
+median of `obs_j / proj_z(i->j)` over every frame within 3 m that overlaps it. Frames past 8%
+join `depth_alignment.json`'s `unreliable` list, which `run_surfels_substep` already prunes.
+Catches what COLMAP tracks cannot: `frame_01275` fits 56 tracks under 8 cm MAD yet sits 28% out
+of scale against 67 overlapping frames. 26 frames now pruned (was 11); bulk is within +/-3%
+(median deviation 0.7%). Weighting by co-visible pixels is load-bearing — unweighted, a frame's
+many sliver overlaps outvote the thousands of pixels on the wall it misplaces and `frame_00188`
+scores 1.0009 instead of 0.795.
+Outcome: partial — correct frames removed, cloud 257k -> 267k surfels, but the artifact remains.
+The residual second plane comes from frames with *no* global scale error (`00119` 0.988,
+`00196` 0.992, `01280` 0.983, `00237` 0.995) that are still 13-18 cm off on that one wall, i.e.
+regional depth error a per-frame scalar cannot see. Delivered-cloud wall IQR 0.136 -> 0.136 m.
+
+Tried and reverted, both measured:
+- Rescaling in-tolerance frames by their consensus ratio — made it worse (`00156` +0.151 ->
+  +0.212 m, low-side group grew). One scalar is not the right correction for a regional error.
+- Spreading consistency neighbours >=0.25 m apart so they stop being the temporal clique that
+  corroborates its own ghost — correct in principle, inert here (32 surfels). The real gate is
+  `min_consensus=1`: anything landing in any neighbour's frustum passes. `min_consensus=2` with
+  spread neighbours costs 50k surfels (19%) to move >12.5 cm only 28.2% -> 25.3% — deletes
+  broadly, not selectively, the same failure mode that keeps free-space carving disabled.
+Next lead: the error is per-point and regional, so it needs a per-point fix (selective carving
+or a regional scale field), not another whole-frame gate.

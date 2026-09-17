@@ -446,3 +446,26 @@ Outcome: worked — 87/87 backend tests pass. Step 5 deliberately not run yet.
 - **CLI Customization:** Exposed `--no-pose-refine`, `--pose-lr`, and `--lambda-track` in `step_train.py`.
 - **Verification:** All 87 unit tests passing (`pytest backend/tests/`).
 
+## 2026-09-17: Dense Prior Preservation, Training Acceleration (70m -> 4m) & Multiview Loss Optimization
+1. **Preserved Dense Metric Depth Prior:**
+   - Discovered and resolved the root cause of point cloud destruction: periodic `reset_opacity` (every 2k iters) reset all surfels to 0.01 opacity, causing the prune pass (every 100 iters at $\alpha < 0.05$) to permanently wipe out 85% of initialized points (1.9M -> 288k).
+   - Set `OPACITY_RESET_INTERVAL = 999_999` to disable opacity resets when training from dense metric priors.
+2. **Accelerated Training Schedule:**
+   - Streamlined schedule from 10,000 iterations to 3,000 cumulative iterations (1,000 @ r=2 / 540p, 2,000 @ r=1 / 1080p native), slashing training time from 70+ minutes to ~4-5 minutes.
+   - Tightened densification gradient thresholds (`0.0004` and `0.0002`) and set warm-up to 200 iterations.
+3. **Multiview Planar Loss Optimization:**
+   - Reduced stochastically sampled rays from 50,000 to 8,000 and neighbor views from 4 to 2.
+   - Deferred start (`mv_from_iter = 1000`) so initial SH colors and surfel scales stabilize before cross-view planar warping begins, eliminating conflicting gradients and saving ~150ms per iteration.
+4. **Surfel Budget Realignment:**
+   - Capped `MAX_SURFELS` at 450,000 in both `step_depth.py` and `step_train.py`.
+
+## 2026-09-17: Headless Multi-Stage Socket Reuse & Calibrated Surfel Training
+1. **Socket Address Reuse Fix (`network_gui.py`):**
+   - Added `setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)` and graceful `OSError` fallback to `network_gui.init`.
+   - Prevents headless chained training stages (e.g. Stage 1 -> Stage 2) from crashing with `OSError: [Errno 98] Address already in use` due to lingering TIME_WAIT sockets on port 6009.
+2. **Training Verification on Calibrated Depth Prior:**
+   - Initialized from 265,126 calibrated single-manifold surfels with verified track anchoring.
+   - Stage 1 ($r=2$) reached iteration 1,000 in 135s with loss 0.035 at ~9 it/s.
+   - Stage 2 ($r=1$) resumes and fine-tunes native resolution with multi-view consistency.
+
+

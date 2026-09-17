@@ -41,6 +41,8 @@ def depth_to_normal(view, depth):
     output = torch.zeros_like(points)
     dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
     dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
-    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
+    cross_prod = torch.cross(dx, dy, dim=-1)
+    norm = torch.norm(cross_prod, dim=-1, keepdim=True)
+    normal_map = torch.where(norm > 1e-5, cross_prod / norm.clamp_min(1e-5), torch.zeros_like(cross_prod))
     output[1:-1, 1:-1, :] = normal_map
     return output

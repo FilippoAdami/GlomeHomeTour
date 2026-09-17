@@ -88,8 +88,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     ws = Path(args.workspace).resolve()
-    ply_path = Path(args.ply) if args.ply else ws / "depth" / "points3D_depth.ply"
-    out_dir = ws / "depth" / "preview"
+    depth_dir = ws / "02_depth_estimation" / "depth"
+    ply_path = Path(args.ply) if args.ply else depth_dir / "points3D_depth.ply"
+    out_dir = depth_dir / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     v = PlyData.read(ply_path).elements[0]

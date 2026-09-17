@@ -85,7 +85,7 @@ def _intrinsics(view, device):
 
 
 def multiview_photometric_loss(view, neighbors, depth, normal, alpha,
-                               num_samples=50000, alpha_thresh=0.5,
+                               num_samples=8000, alpha_thresh=0.5,
                                min_depth=0.05, veto_weight=0.5,
                                saturation_threshold=0.98,
                                saturation_percentile=99.8,

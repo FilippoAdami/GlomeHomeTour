@@ -188,10 +188,24 @@ class ArScanRenderer(
         }
     }
 
-    /** Pre-flight WB lock (README §6 step 2): manual color-correction gains derived from the
-     * live preview, applied to the running capture request. */
+    /** Pre-flight WB lock (README §6 step 2): freezes manual color-correction gains onto the
+     * running capture request, taking the ISP's own AWB out of the loop for the rest of the scan. */
     fun lockWhiteBalance(gains: android.hardware.camera2.params.RggbChannelVector) {
-        cameraPipeline?.whiteBalanceGains = gains
+        cameraPipeline?.let {
+            it.whiteBalanceTransform = it.latestAwbTransform
+            it.whiteBalanceGains = gains
+            it.autoWhiteBalance = false
+        }
+    }
+
+    /** The gains the ISP's AWB has converged on, for pre-flight to freeze. Null until a capture
+     * result reports them. */
+    fun autoWhiteBalanceGains(): android.hardware.camera2.params.RggbChannelVector? =
+        cameraPipeline?.takeIf { it.autoWhiteBalance }?.latestAwbGains
+
+    /** Hands white balance back to the ISP -- pre-flight restarting, or the operator resetting. */
+    fun resumeAutoWhiteBalance() {
+        cameraPipeline?.autoWhiteBalance = true
     }
 
     /** Pre-flight ambient-light metering (README §4/§6): ISO and shutter jointly adjusted live

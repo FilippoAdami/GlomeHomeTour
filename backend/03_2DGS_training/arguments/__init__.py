@@ -94,6 +94,7 @@ class OptimizationParams(ParamGroup):
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
+        self.opacity_reset_until_iter = -1
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
@@ -101,12 +102,11 @@ class OptimizationParams(ParamGroup):
         # (see training() in train.py). 16 GB holds ~4.5-6M surfels.
         self.max_gaussians = -1
 
-        # PGSR-style multi-view planar consistency. On by default at 0.3, and
-        # active from iteration 0 (see mv_from_iter) -- it is part of the
-        # baseline schedule here, not an opt-in extra.
-        self.lambda_multiview = 0.3
-        self.mv_num_neighbors = 4
-        self.mv_from_iter = 0           # tuned on bedroom: applying from iter 0 beat ramping in
+        # PGSR-style multi-view planar consistency. Starts at 1,000 iterations with 2 neighbors
+        # and 8,000 samples to keep training fast (~4 min total) and prevent pose conflicts.
+        self.lambda_multiview = 0.1
+        self.mv_num_neighbors = 2
+        self.mv_from_iter = 1000
         self.mv_veto_weight = 0.5       # Asymmetric multi-view veto weight (0.0: standard mean, >0: penalize worst mismatch)
 
         # Optical bloom / sensor saturation loss masking

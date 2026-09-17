@@ -156,8 +156,36 @@ class MainActivity : AppCompatActivity() {
             val x = e.values[0]; val y = e.values[1]; val z = e.values[2]
             val n = sqrt(x * x + y * y + z * z)
             if (n > 1e-3f) gravityUpZ = z / n
+            System.arraycopy(e.values, 0, gravityVec, 0, 3)
+            updateCompassHeading()
         }
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    /**
+     * Magnetic compass heading (degrees, clockwise from magnetic north) at the most recent
+     * keyframe -- not declination-corrected, there's no location fix to derive it from. ARCore's
+     * world yaw is otherwise arbitrary (set by wherever tracking happened to start), so this is
+     * the only way the backend can lock scene orientation to something real-world.
+     */
+    @Volatile private var compassHeadingDeg: Float? = null
+    private val gravityVec = FloatArray(3)
+    private val magneticVec = FloatArray(3)
+    private val compassRotationMatrix = FloatArray(9)
+    private val compassOrientation = FloatArray(3)
+    private val magneticListener = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            System.arraycopy(e.values, 0, magneticVec, 0, 3)
+            updateCompassHeading()
+        }
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    private fun updateCompassHeading() {
+        if (!SensorManager.getRotationMatrix(compassRotationMatrix, null, gravityVec, magneticVec)) return
+        SensorManager.getOrientation(compassRotationMatrix, compassOrientation)
+        val deg = Math.toDegrees(compassOrientation[0].toDouble()).toFloat()
+        compassHeadingDeg = (deg + 360f) % 360f
     }
 
     /** README §4/§5: fixed-ratio decimation of the post-illumination-gate stream, not a
@@ -208,7 +236,12 @@ class MainActivity : AppCompatActivity() {
     private var lastMeanY = 128f
     private var lastMeanU = 128f
     private var lastMeanV = 128f
-    private var autoWbLocked = false
+    /** The auto white-balance gains (red, green, blue) pre-flight froze: the ISP AWB's own
+     * converged estimate, or a grey-world solve on devices that never report one. */
+    private val autoWbGains = floatArrayOf(1f, 1f, 1f)
+    /** False while the ISP's AWB is still driving; true once pre-flight has frozen its answer and
+     * the operator's sliders trim on top of it. Cleared by the reset button. */
+    @Volatile private var autoWbLocked = false
     /** Manual trim on top of the auto grey-world proposal (`whiteBalanceGains`), both -1..1.
      * `wbBias` is warm<->cool (red vs blue, `wbSlider`); `wbTintBias` is green<->magenta (green
      * gain, `wbTintSlider`) -- the axis the old red/blue-only heuristic couldn't reach at all, so
@@ -295,22 +328,22 @@ class MainActivity : AppCompatActivity() {
         }
         infoButton.alpha = 0.7f
 
+        // Back to the auto read: drop the operator's trim and re-run the ISP's AWB from scratch,
+        // so a reset after walking into a differently-lit room actually re-estimates.
         wbResetButton.setOnClickListener {
-            val cb = lastMeanU - 128f
-            val cr = lastMeanV - 128f
-            val autoTempBias = ((cr - cb) / 64f).coerceIn(-1f, 1f)
-            val autoTintBias = (-(cb * 0.344f + cr * 0.714f) / 48f).coerceIn(-1f, 1f)
-            wbBias = autoTempBias
-            wbTintBias = autoTintBias
-            wbSlider.progress = (50 + autoTempBias * 50).toInt().coerceIn(0, 100)
-            wbTintSlider.progress = (50 + autoTintBias * 50).toInt().coerceIn(0, 100)
-            previewWhiteBalance()
+            wbBias = 0f
+            wbTintBias = 0f
+            autoWbLocked = false
+            wbSlider.progress = 50
+            wbTintSlider.progress = 50
+            renderer?.resumeAutoWhiteBalance()
         }
 
         wbSlider = findViewById(R.id.wbSlider)
         wbSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 wbBias = (progress - 50) / 50f
+                if (fromUser) freezeAutoWhiteBalance()
                 if (state == State.PREFLIGHT && preflightStep == 1) previewWhiteBalance()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar) {}
@@ -321,6 +354,7 @@ class MainActivity : AppCompatActivity() {
         wbTintSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 wbTintBias = (progress - 50) / 50f
+                if (fromUser) freezeAutoWhiteBalance()
                 if (state == State.PREFLIGHT && preflightStep == 1) previewWhiteBalance()
             }
             override fun onStartTrackingTouch(seekBar: SeekBar) {}
@@ -501,6 +535,8 @@ class MainActivity : AppCompatActivity() {
         wbBias = 0f
         wbTintBias = 0f
         autoWbLocked = false
+        autoWbGains[0] = 1f; autoWbGains[1] = 1f; autoWbGains[2] = 1f
+        renderer?.resumeAutoWhiteBalance()
         runOnUiThread { wbSlider.progress = 50; wbTintSlider.progress = 50 }
         // Start from a high-brightness indoor baseline: ISO 800, 1/60s shutter (16.6ms) for bright, clear tracking
         currentIso = 800
@@ -519,19 +555,12 @@ class MainActivity : AppCompatActivity() {
             0 -> {
                 // Step 0 -> Step 1 (White Balance fine-tuning with reticle)
                 preflightStep = 1
-                // Compute auto-detected color balance slider positions
-                val cb = lastMeanU - 128f // blue-yellow axis
-                val cr = lastMeanV - 128f // red-cyan axis
-                // Cr > 0 is warm/red (+wbBias), Cb > 0 is cool/blue (-wbBias)
-                val autoTempBias = ((cr - cb) / 64f).coerceIn(-1f, 1f)
-                val autoTintBias = (-(cb * 0.344f + cr * 0.714f) / 48f).coerceIn(-1f, 1f)
-                wbBias = autoTempBias
-                wbTintBias = autoTintBias
-                runOnUiThread {
-                    wbSlider.progress = (50 + autoTempBias * 50).toInt().coerceIn(0, 100)
-                    wbTintSlider.progress = (50 + autoTintBias * 50).toInt().coerceIn(0, 100)
-                }
-                previewWhiteBalance()
+                // The sweep is over: freeze what the ISP's AWB settled on. Centre (= no trim) is
+                // that estimate, so the sliders only move if the operator disagrees with it.
+                wbBias = 0f
+                wbTintBias = 0f
+                runOnUiThread { wbSlider.progress = 50; wbTintSlider.progress = 50 }
+                freezeAutoWhiteBalance()
             }
             1 -> {
                 // Step 1 -> Step 2 (Camera Angle check)
@@ -876,6 +905,34 @@ class MainActivity : AppCompatActivity() {
         previewWhiteBalance()
     }
 
+    /**
+     * End of the pre-flight sweep: take whatever the ISP's AWB converged on and hold it there for
+     * the rest of the scan. Doing the illuminant estimate in the ISP rather than from the reticle
+     * patch is the whole point -- a grey-world solve on the patch neutralises the patch, so a
+     * wooden floor in the reticle came out grey-blue instead of wooden.
+     *
+     * Fallback for a device that never reports its AWB gains: the grey-world solve on the last
+     * sampled patch, which is at least better than leaving the gains neutral. Nothing is applied
+     * to the sensor before this point, so that solve reads an uncorrected frame and is a one-shot,
+     * not a loop.
+     */
+    private fun freezeAutoWhiteBalance() {
+        if (autoWbLocked) return
+        val isp = renderer?.autoWhiteBalanceGains()
+        if (isp != null) {
+            autoWbGains[0] = isp.red
+            autoWbGains[1] = (isp.greenEven + isp.greenOdd) / 2f
+            autoWbGains[2] = isp.blue
+        } else {
+            whiteBalanceGains(lastMeanY, lastMeanU, lastMeanV).let {
+                autoWbGains[0] = it[0]; autoWbGains[1] = it[1]; autoWbGains[2] = it[3]
+            }
+        }
+        Log.i(TAG, "WB frozen: isp=${isp != null} gains=${autoWbGains.joinToString()}")
+        autoWbLocked = true
+        previewWhiteBalance()
+    }
+
     private fun sampleCenterPatchMean(
         buf: java.nio.ByteBuffer, width: Int, height: Int, rowStride: Int, pixelStride: Int
     ): Float {
@@ -914,10 +971,12 @@ class MainActivity : AppCompatActivity() {
         return if (count > 0) sum.toFloat() / count else 128f
     }
 
-    /** Auto grey-world proposal (`whiteBalanceGains`) plus the operator's slider trims, applied
-     * live to the sensor during pre-flight step 1. */
+    /** The frozen auto gains plus the operator's slider trims, applied live to the sensor during
+     * pre-flight step 1. No-op until they're frozen -- before that the ISP's AWB owns the sensor
+     * and pushing gains at it would only take it out of auto early. */
     private fun previewWhiteBalance() {
-        val gains = whiteBalanceGains(lastMeanY, lastMeanU, lastMeanV, wbBias, wbTintBias)
+        if (!autoWbLocked) return
+        val gains = whiteBalanceTrim(autoWbGains, wbBias, wbTintBias)
         renderer?.lockWhiteBalance(
             android.hardware.camera2.params.RggbChannelVector(gains[0], gains[1], gains[2], gains[3])
         )
@@ -968,6 +1027,7 @@ class MainActivity : AppCompatActivity() {
             p?.latestAfState ?: 0,
             p?.latestAfMode ?: 0,
             p?.latestFocalLengthMm ?: 0f,
+            compassHeadingDeg,
         )
     }
 
@@ -1116,7 +1176,7 @@ class MainActivity : AppCompatActivity() {
             }
             state == State.PREFLIGHT && preflightStep == 1 -> {
                 title = "Step 1 of 2 · Color Balance"
-                body = "Point the reticle at a white or grey wall. The color has been automatically balanced — adjust sliders if needed, then tap Lock Color."
+                body = "Colour is balanced for this room's light and now held steady. Check it looks right — nudge the sliders if it doesn't — then tap Lock Color."
                 label = "Lock Color"
                 enabled = true
             }
@@ -1258,6 +1318,8 @@ class MainActivity : AppCompatActivity() {
         val gravity = sensors.getDefaultSensor(Sensor.TYPE_GRAVITY)
             ?: sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         gravity?.let { sensors.registerListener(gravityListener, it, SensorManager.SENSOR_DELAY_UI) }
+        sensors.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+            ?.let { sensors.registerListener(magneticListener, it, SensorManager.SENSOR_DELAY_UI) }
         renderer?.resume()
         glSurfaceView?.onResume()
     }
@@ -1265,6 +1327,7 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         sensors.unregisterListener(gravityListener)
+        sensors.unregisterListener(magneticListener)
         glSurfaceView?.onPause()
         // onPause() above blocks until the GL thread parks, so nothing is inside session.update().
         if (state == State.SCANNING) interrupted = true
@@ -1388,40 +1451,41 @@ class MainActivity : AppCompatActivity() {
         fun tiltDownDeg(forwardY: Float): Float =
             Math.toDegrees(-kotlin.math.asin(forwardY.coerceIn(-1f, 1f).toDouble())).toFloat()
 
-        /** README §6 step 2: grey-world white-balance gains from a YUV frame's means (see
-         * `sampleWhiteBalancePreview`). Decodes the sampled patch's Y/Cb/Cr back to the RGB it
-         * came from (BT.601 full-range), then solves the gain each channel needs to match the
-         * patch's own luma -- i.e. "make this neutral-wall patch actually read as neutral".
-         * Order matches `RggbChannelVector` (red, greenEven, greenOdd, blue).
-         *
-         * This replaced a red/blue-only heuristic that pinned green's gain to a fixed 1.0: that
-         * heuristic could shift warm<->cool (red vs blue) but had no way to correct a green- or
-         * magenta-tinted light source, since green was never allowed to move relative to the
-         * other two -- exactly the axis a real "Tint" control fixes and this app was missing.
-         *
-         * `warmCoolBias`/`tintBias` (-1..1, from `wbSlider`/`wbTintSlider`) are the operator's
-         * trim on top of that solve -- 0 leaves the auto grey-world read untouched.
-         * ponytail: still a single-patch grey-world solve, not multi-illuminant colour science --
-         * good enough for "point at a wall and lock"; revisit `WB_MANUAL_RANGE` if the manual
-         * range still isn't enough headroom on some device/light combo. */
-        fun whiteBalanceGains(
-            meanY: Float,
-            meanU: Float,
-            meanV: Float,
-            warmCoolBias: Float = 0f,
-            tintBias: Float = 0f,
-        ): FloatArray {
+        /** Gain per channel (red, green, blue) that makes the sampled patch read as neutral grey:
+         * decode Y/Cb/Cr back to BT.601 full-range RGB, then solve each channel against the
+         * patch's own luma. */
+        private fun greyWorldSolve(meanY: Float, meanU: Float, meanV: Float): FloatArray {
             val cb = meanU - 128f
             val cr = meanV - 128f
             val r = (meanY + 1.402f * cr).coerceAtLeast(1f)
             val g = (meanY - 0.344136f * cb - 0.714136f * cr).coerceAtLeast(1f)
             val b = (meanY + 1.772f * cb).coerceAtLeast(1f)
             val target = meanY.coerceAtLeast(1f)
-            val red = (target / r + WB_MANUAL_RANGE * warmCoolBias).coerceIn(0.5f, 4f)
-            val green = (target / g - WB_MANUAL_RANGE * tintBias).coerceIn(0.5f, 4f)
-            val blue = (target / b - WB_MANUAL_RANGE * warmCoolBias).coerceIn(0.5f, 4f)
+            return floatArrayOf(target / r, target / g, target / b)
+        }
+
+        /** The operator's `wbSlider`/`wbTintSlider` trim (-1..1 each) on top of the converged auto
+         * gains; 0/0 leaves the auto read untouched. Order matches `RggbChannelVector`
+         * (red, greenEven, greenOdd, blue). */
+        fun whiteBalanceTrim(
+            autoGains: FloatArray,
+            warmCoolBias: Float = 0f,
+            tintBias: Float = 0f,
+        ): FloatArray {
+            val red = (autoGains[0] + WB_MANUAL_RANGE * warmCoolBias).coerceIn(0.5f, 4f)
+            val green = (autoGains[1] - WB_MANUAL_RANGE * tintBias).coerceIn(0.5f, 4f)
+            val blue = (autoGains[2] - WB_MANUAL_RANGE * warmCoolBias).coerceIn(0.5f, 4f)
             return floatArrayOf(red, green, green, blue)
         }
+
+        /** One-shot grey-world solve plus trim: where `whiteBalanceStep`'s loop converges to. */
+        fun whiteBalanceGains(
+            meanY: Float,
+            meanU: Float,
+            meanV: Float,
+            warmCoolBias: Float = 0f,
+            tintBias: Float = 0f,
+        ): FloatArray = whiteBalanceTrim(greyWorldSolve(meanY, meanU, meanV), warmCoolBias, tintBias)
 
         private const val WB_MANUAL_RANGE = 0.5f
 

@@ -6,7 +6,7 @@
 
 ## What This Stage Does
 
-1. **Covisibility Keyframe Filtering (Step 3):** Replaces heuristic motion gating with true 3D covisibility (`TrackCovisibilitySelector`), measuring the shared COLMAP track fraction between frames to enforce optimal baseline coverage without redundancy.
+1. **Covisibility Keyframe Filtering (Step 3):** Replaces heuristic motion gating with true 3D covisibility (`TrackCovisibilitySelector`), measuring the shared COLMAP track fraction between frames to enforce optimal baseline coverage without redundancy. The frame count it aims for comes from the room's floor area (`keyframe_budget.py`: `N = 50 + (8..11) x A_floor` from `scene_size.txt`), and the chain is then fitted to that band by adding or dropping frames on 10 cm voxel coverage.
 2. **Multi-View Metric Depth Inference (Step 4):** Executes DA3-Base in a memory-efficient sliding window with cross-chunk overlap blending and chunk-level resume caching.
 3. **Dynamic Saturation & Bloom Masking:** Discards overexposed pixels before 3D unprojection using an adaptive percentile floor and chroma-difference check, preventing light sources from hallucinating floating artifacts.
 4. **Cross-View Epipolar / Free-Space Carving:** Reprojects candidate 3D points into unobstructed adjacent camera views and discards points landing in empty space in front of observed surfaces.
@@ -19,6 +19,7 @@
 | Module | Role |
 | --- | --- |
 | [`step_filter_depth.py`](step_filter_depth.py) | **Pipeline Step 3**: Prunes frames based on true shared COLMAP tracks (`TrackCovisibilitySelector`) and calculates scene median depth. |
+| [`keyframe_budget.py`](keyframe_budget.py) | Floor area -> keyframe count band (`frame_budget`), and greedy voxel-coverage fitting to it (`coverage_prune` / `coverage_topup`). |
 | [`step_depth.py`](step_depth.py) | **Pipeline Step 4**: Runs DA3 sliding window depth inference and builds `depth/points3D_depth.ply`. |
 | [`initialization.py`](initialization.py) | Core surfel initialization engine (`SurfelCloudInitializer`), saturation masking (`compute_overexposed_mask`), and free-space filtering (`filter_multiview_consistency`). |
 | [`depth_priors.py`](depth_priors.py) | High-level DA3 wrapper (`DepthPriorEstimator`), global scale-shift graph alignment, and surface normal compute (`compute_surface_normals`). |
