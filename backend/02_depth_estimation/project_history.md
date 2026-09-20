@@ -341,3 +341,19 @@ Tried and reverted, both measured:
   broadly, not selectively, the same failure mode that keeps free-space carving disabled.
 Next lead: the error is per-point and regional, so it needs a per-point fix (selective carving
 or a regional scale field), not another whole-frame gate.
+
+## 2026-09-17: per-point ghost filters (P1 track-weighted carving, P2 regional-support gate)
+Outcome: both abandoned, code deleted — P1 removed 37% of the duplicated facade for 9.5% of the
+cloud but visibly ate correct geometry elsewhere; P2 did not discriminate at any threshold
+(texture and track-distance distributions of the ghost and true layers overlap — they are two
+copies of the same textureless facade), costing ~1 true point per ghost point. Treating the
+duplicate as a capture-quality problem instead; do not retry post-hoc per-point filtering.
+
+## 2026-09-18: depth/ output folder moved under 02_depth_estimation/
+Outcome: fixed — `step_depth.py` was writing `depth/` at the workspace root while
+`step_filter_depth.py` and `colmap_poses_to_da3.py` already nested it under
+`02_depth_estimation/depth/`, so a real run would have produced two divergent `depth/`
+folders. `step_depth.py` now uses `workspace / "02_depth_estimation" / "depth"` (added
+`STAGE_DIRNAME`) and its `StepContext` artifacts_dir matches, consistent with every other
+step in the pipeline. `03_2DGS_training/step_train.py`'s `install_depth_cloud` updated to
+read from the new path.

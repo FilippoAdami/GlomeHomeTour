@@ -2,9 +2,9 @@
 """Step 4 -- DA3 depth priors, edge snapping, TSDF fusion, and surfel cloud initialization.
 
 In:  ``<workspace>/images/`` + ``transforms.json`` + ``sparse/0/``.
-Out: ``depth/depth_maps/*.npy``, ``depth/poses_da3.npz``,
-     ``depth/points3D_depth.ply``, ``depth/edge_snapping_vis/*.jpg``,
-     ``depth/preview/*.png``.
+Out: ``02_depth_estimation/depth/depth_maps/*.npy``, ``02_depth_estimation/depth/poses_da3.npz``,
+     ``02_depth_estimation/depth/points3D_depth.ply``, ``02_depth_estimation/depth/edge_snapping_vis/*.jpg``,
+     ``02_depth_estimation/depth/preview/*.png``.
 
 Two coordinate conventions meet here, in opposite directions, and both are
 load-bearing:
@@ -63,6 +63,7 @@ from initialization import SurfelCloudInitializer
 from tsdf_fusion import TSDFVolume
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
+STAGE_DIRNAME = "02_depth_estimation"
 MANIFEST_DIRNAME = "00_ingestion"
 
 # DA3 confidence is not a probability -- it is a relative score, and on textureless
@@ -157,7 +158,7 @@ def run_depth_estimation_substep(
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     names = scene.names
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / "depth"
+    depth_dir = workspace / STAGE_DIRNAME / "depth"
     depth_dir.mkdir(parents=True, exist_ok=True)
     maps_dir = depth_dir / "depth_maps"
     maps_dir.mkdir(exist_ok=True)
@@ -396,7 +397,7 @@ def run_tsdf_substep(
     """Substep 4d: Volumetric TSDF Fusion & Multi-Scale Zero-Crossing Surfel Extraction."""
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / "depth"
+    depth_dir = workspace / STAGE_DIRNAME / "depth"
     maps_dir = depth_dir / "depth_maps"
     poses_path = depth_dir / "poses_da3.npz"
 
@@ -568,7 +569,7 @@ def run_surfels_substep(
     """Substep 4b: Standard unprojection surfel initializer with geometric filtering."""
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / "depth"
+    depth_dir = workspace / STAGE_DIRNAME / "depth"
     maps_dir = depth_dir / "depth_maps"
     poses_path = depth_dir / "poses_da3.npz"
 
@@ -797,15 +798,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.only_surfels:
         substep = "surfels"
 
-    outputs = [workspace / "depth" / "poses_da3.npz"]
+    outputs = [workspace / STAGE_DIRNAME / "depth" / "poses_da3.npz"]
     if substep in ("all", "surfels", "tsdf"):
-        outputs.append(workspace / "depth" / "points3D_depth.ply")
+        outputs.append(workspace / STAGE_DIRNAME / "depth" / "points3D_depth.ply")
 
     if not args.force and substep == "all" and is_done(workspace, "depth", outputs):
         print("[depth] already done, skipping (use --force to re-run)")
         return 0
 
-    with StepContext("depth", workspace) as ctx:
+    with StepContext("depth", workspace, artifacts_dir=workspace / STAGE_DIRNAME) as ctx:
         if substep in ("all", "depth"):
             run_depth_estimation_substep(
                 workspace=workspace,

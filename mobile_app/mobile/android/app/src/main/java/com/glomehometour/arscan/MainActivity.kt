@@ -50,6 +50,13 @@ import kotlin.math.sqrt
 class MainActivity : AppCompatActivity() {
 
     private enum class State { IDLE, PREFLIGHT, SCANNING, DONE }
+
+    /** Identifies a warning independent of its (sometimes dynamic) text, so the queue below can
+     * dedupe by "what kind of issue" rather than by exact string. */
+    private enum class WarningKind {
+        REALIGNED, TRACKING_LOST, FINDING_POSITION, RELOCALIZE, CALIBRATING_DEPTH,
+        TOO_BRIGHT, LIGHT_TRANSITION, TOO_FAST, TURN_SLOWLY,
+    }
     private enum class Pending { START, PREFLIGHT_NEXT, FINISH, RESUME }
 
     private lateinit var root: FrameLayout
@@ -108,6 +115,40 @@ class MainActivity : AppCompatActivity() {
     private var showDiag = false
     /** Warnings buzz once on appearance, not on every 6 Hz repaint. */
     private var lastWarning: String? = null
+    private var lastAutoFocusTriggerNanos = 0L
+
+    // ---- warning queue (see pickWarning) ----
+    private var currentWarning: Pair<WarningKind, String>? = null
+    private var currentWarningShownAtNanos = 0L
+    private val warningQueue = ArrayDeque<Pair<WarningKind, String>>()
+
+    /**
+     * Debounces the raw per-frame warning conditions into something a human can actually read:
+     * some conditions (autofocus settling, a single overexposed frame) clear within a fraction
+     * of a second, so showing them level-triggered just flickers. Each distinct kind, once
+     * triggered, stays on screen at least MIN_WARNING_DISPLAY_NANOS; anything else triggered
+     * meanwhile queues up (one slot per kind, no duplicates) instead of interrupting it.
+     */
+    private fun pickWarning(nowNanos: Long, active: List<Pair<WarningKind, String>>): String? {
+        for (candidate in active) {
+            if (currentWarning?.first == candidate.first) continue
+            if (warningQueue.any { it.first == candidate.first }) continue
+            warningQueue.addLast(candidate)
+        }
+        if (currentWarning != null && nowNanos - currentWarningShownAtNanos >= MIN_WARNING_DISPLAY_NANOS) {
+            currentWarning = null
+        }
+        if (currentWarning == null && warningQueue.isNotEmpty()) {
+            currentWarning = warningQueue.removeFirst()
+            currentWarningShownAtNanos = nowNanos
+        }
+        return currentWarning?.second
+    }
+
+    private fun resetWarningQueue() {
+        currentWarning = null
+        warningQueue.clear()
+    }
     /** Hard failures (no permission, no ARCore, dead AR session) used to be written into the debug
      * HUD line, where the next UI tick overwrote them 160 ms later -- or, before tracking ever
      * started, where nobody was looking. They now own the instruction card until resolved. */
@@ -296,10 +337,28 @@ class MainActivity : AppCompatActivity() {
         bottomPadBase = bottomColumn.paddingBottom
         applyInsets()
 
+        val touchSlopPx = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        var afDownX = 0f
+        var afDownY = 0f
         root.setOnTouchListener { _, event ->
-            if (event.action == android.view.MotionEvent.ACTION_UP) {
-                if (event.y > topColumn.bottom && event.y < bottomColumn.top) {
-                    renderer?.triggerAutoFocus(event.x / root.width.toFloat(), event.y / root.height.toFloat())
+            when (event.action) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    afDownX = event.x
+                    afDownY = event.y
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    val moved = kotlin.math.hypot((event.x - afDownX).toDouble(), (event.y - afDownY).toDouble()) > touchSlopPx
+                    val now = System.nanoTime()
+                    // A tap-to-focus is a deliberate, stationary tap, not a drag, and is
+                    // debounced: continuous AF is already running (configureManualOverrides),
+                    // so spamming CONTROL_AF_TRIGGER_START on every incidental touch just makes
+                    // the lens hunt instead of settle (README §6 relies on continuous AF).
+                    if (!moved && event.y > topColumn.bottom && event.y < bottomColumn.top &&
+                        now - lastAutoFocusTriggerNanos > AUTO_FOCUS_COOLDOWN_NANOS
+                    ) {
+                        lastAutoFocusTriggerNanos = now
+                        renderer?.triggerAutoFocus(event.x / root.width.toFloat(), event.y / root.height.toFloat())
+                    }
                 }
             }
             false
@@ -1098,21 +1157,43 @@ class MainActivity : AppCompatActivity() {
 
         // ---- warning slot ----
         val nowUi = System.nanoTime()
-        val warning = when {
-            fatal || !scanning -> null
-            nowUi < relocalizedToastUntilNanos -> "✓ Re-aligned to Room Objects\nPoints snapped back to physical surfaces"
-            sample == null -> if (trackingLosses > 0) "Tracking lost\n" + trackingAdvice(r?.trackingState)
-                else "Finding position…\n" + trackingAdvice(r?.trackingState)
-            needsRelocalizationCheck -> "🔍 Aim at Previously Scanned Objects\nHold steady at familiar corners/furniture to restore alignment" 
+        val warning: String?
+        if (fatal || !scanning) {
+            resetWarningQueue()
+            warning = null
+        } else {
+            val active = mutableListOf<Pair<WarningKind, String>>()
+            if (nowUi < relocalizedToastUntilNanos) {
+                active += WarningKind.REALIGNED to "✓ Re-aligned to Room Objects\nPoints snapped back to physical surfaces"
+            }
+            if (sample == null) {
+                active += if (trackingLosses > 0) {
+                    WarningKind.TRACKING_LOST to "Tracking lost\n" + trackingAdvice(r?.trackingState)
+                } else {
+                    WarningKind.FINDING_POSITION to "Finding position…\n" + trackingAdvice(r?.trackingState)
+                }
+            }
+            if (needsRelocalizationCheck) {
+                active += WarningKind.RELOCALIZE to "🔍 Aim at Previously Scanned Objects\nHold steady at familiar corners/furniture to restore alignment"
+            }
             // If using the fallback depth worker and no landmarks have been triangulated yet, prompt walk forward.
             // Clears immediately once calibrated OR once parallax tracker has acquired landmarks.
-            (mono?.let { it.ready && !it.calibrated } == true && parallaxTracker.verifiedLandmarkCount < 5) ->
-                "Calibrating depth\nWalk forward a couple of steps"
-            lastVerdict == PhotometricGate.Verdict.BLOWN -> "Too bright\nAim away from the window or lamp"
-            lastVerdict == PhotometricGate.Verdict.TRANSITION -> "Adjusting to the light change…"
-            speedMetresPerSec > MAX_WALK_SPEED_MS -> "Slow down\nWalk slower for sharp frames"
-            angularRateDegPerSec > MAX_TURN_RATE_DEG_S -> "Turn more slowly"
-            else -> null
+            if (mono?.let { it.ready && !it.calibrated } == true && parallaxTracker.verifiedLandmarkCount < 5) {
+                active += WarningKind.CALIBRATING_DEPTH to "Calibrating depth\nWalk forward a couple of steps"
+            }
+            if (lastVerdict == PhotometricGate.Verdict.BLOWN) {
+                active += WarningKind.TOO_BRIGHT to "Too bright\nAim away from the window or lamp"
+            }
+            if (lastVerdict == PhotometricGate.Verdict.TRANSITION) {
+                active += WarningKind.LIGHT_TRANSITION to "Adjusting to the light change…"
+            }
+            if (speedMetresPerSec > MAX_WALK_SPEED_MS) {
+                active += WarningKind.TOO_FAST to "Slow down\nWalk slower for sharp frames"
+            }
+            if (angularRateDegPerSec > MAX_TURN_RATE_DEG_S) {
+                active += WarningKind.TURN_SLOWLY to "Turn more slowly"
+            }
+            warning = pickWarning(nowUi, active)
         }
         // Buzz once when a warning appears: the operator is looking at the room, not the screen.
         if (warning != null && warning != lastWarning) {
@@ -1249,9 +1330,16 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             else -> {
-                title = "Scan saved"
-                body = "$frames frames · " + (finishedPath?.let { "saved to $it" } ?: "saving…")
-                label = "Start new scan"
+                if (finishedPath == null) {
+                    title = "Saving scan…"
+                    body = "$frames frames · compressing and writing to disk. Keep the app open until this finishes."
+                    label = "Saving…"
+                    enabled = false
+                } else {
+                    title = "Scan saved"
+                    body = "$frames frames · saved to $finishedPath"
+                    label = "Start new scan"
+                }
             }
         }
         if ((System.nanoTime() - sessionErrorAtNanos) / 1e6f < SESSION_ERROR_NOTICE_MS) {
@@ -1379,6 +1467,17 @@ class MainActivity : AppCompatActivity() {
         /** Operator-facing kinematic limits (projet.md §2.4): warn here. */
         const val MAX_WALK_SPEED_MS = 0.4f
         const val MAX_TURN_RATE_DEG_S = 30f
+
+        /** Minimum gap between tap-to-focus triggers (see root.setOnTouchListener): continuous
+         * AF is already running, so this only exists to stop rapid incidental touches from
+         * making the lens hunt. Calibration knob. */
+        const val AUTO_FOCUS_COOLDOWN_NANOS = 1_200_000_000L
+
+        /** Every operator-facing warning stays up at least this long once triggered, queued
+         * behind whichever one is currently showing -- most underlying conditions (autofocus,
+         * overexposure, speed) clear in a fraction of a second, which made the banner
+         * unreadable before this floor existed. */
+        const val MIN_WARNING_DISPLAY_NANOS = 3_000_000_000L
         /** Keyframe rejection limits, deliberately above the warning ones: the banner should
          * appear before frames start being thrown away, otherwise the operator's first signal
          * that anything is wrong is a coverage bar that stopped moving. */

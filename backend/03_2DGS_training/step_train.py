@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Step 5 -- progressive multi-resolution 2DGS training.
 
-In:  ``<workspace>/`` (images, ``sparse/0/``, ``depth/points3D_depth.ply``).
-Out: ``<workspace>/2dgs/point_cloud/iteration_<N>/point_cloud.ply``.
+In:  ``<workspace>/`` (images, ``sparse/0/``, ``02_depth_estimation/depth/points3D_depth.ply``).
+Out: ``<workspace>/03_2DGS_training/2dgs/point_cloud/iteration_<N>/point_cloud.ply``.
 
 Four stages at 1/8 -> 1/4 -> 1/2 -> full resolution, chained through
 ``--start_checkpoint``. Coarse stages settle global structure cheaply, where an
@@ -41,7 +41,9 @@ from Utilities.pipeline_step import StepContext, is_done
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
 TRAIN_SCRIPT = _backend_dir / "03_2DGS_training" / "train.py"
-MODEL_DIRNAME = "2dgs"
+STAGE_DIRNAME = "03_2DGS_training"
+DEPTH_STAGE_DIRNAME = "02_depth_estimation"
+MODEL_DIRNAME = f"{STAGE_DIRNAME}/2dgs"
 
 # (resolution divisor, cumulative iteration target). A stage boundary sits
 # exactly on PHASE2_FROM so the densification phases never straddle a stage, and
@@ -95,7 +97,7 @@ def install_depth_cloud(
 ) -> None:
     sparse_dir = workspace / "sparse" / "0"
     target = sparse_dir / "points3D.ply"
-    depth_ply = workspace / "depth" / "points3D_depth.ply"
+    depth_ply = workspace / DEPTH_STAGE_DIRNAME / "depth" / "points3D_depth.ply"
     backup = sparse_dir / "points3D_colmap.ply"
 
     if not use_depth:
@@ -222,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(workspace / MODEL_DIRNAME, ignore_errors=True)
         print(f"[train] --force: cleared {workspace / MODEL_DIRNAME}")
 
-    with StepContext("train", workspace) as ctx:
+    with StepContext("train", workspace, artifacts_dir=workspace / STAGE_DIRNAME) as ctx:
         train(workspace, ctx, use_depth=not args.no_depth_cloud,
               refine_poses_stage4=not args.no_pose_refine,
               pose_lr=args.pose_lr,

@@ -49,6 +49,8 @@ from export_keyframes import (MAX_SAMPSON_REJECT_FRAC, filter_by_sampson,
 from scene.dataset_readers import storePly
 from scene_extent import scene_extent, write_scene_size_txt
 from select_keyframes_arcore import select_keyframes_arcore
+import floor_count
+import topdown_view
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
 MANIFEST_DIRNAME = "00_ingestion"    # transforms.json lives here; images/ stays at workspace root
@@ -273,6 +275,18 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     ctx.note(f"Wall-aligned scene size ({aligned['rotation_deg_about_up_axis']:.1f} deg "
              f"about up axis {aligned['up_axis']}): x={x:.2f} y={y:.2f} z={z:.2f} m, "
              f"written to scene_size.txt")
+
+    # Room-rotation/floor-count diagnostics (scene_extent_side.png, scene_extent_topdown.png,
+    # floors: row in scene_size.txt) -- eyeball-only, so a failure here shouldn't fail the step.
+    with ctx.timer("room_diagnostics"):
+        try:
+            floor_count.main(["--workspace", str(workspace)])
+            topdown_view.main(["--workspace", str(workspace)])
+            moved = workspace / "scene_extent_topdown.png"
+            if moved.exists():
+                moved.rename(stage_dir / "scene_extent_topdown.png")
+        except Exception as e:
+            ctx.note(f"room diagnostics failed (non-fatal): {e}")
 
 
 def main(argv: list[str] | None = None) -> int:

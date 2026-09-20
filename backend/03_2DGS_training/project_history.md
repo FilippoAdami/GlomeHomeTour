@@ -469,3 +469,10 @@ Outcome: worked — 87/87 backend tests pass. Step 5 deliberately not run yet.
    - Stage 2 ($r=1$) resumes and fine-tunes native resolution with multi-view consistency.
 
 
+
+## 2026-09-18: 2dgs/ model folder moved under 03_2DGS_training/
+Outcome: fixed — `step_train.py` wrote its `2dgs/` model dir (checkpoints, point_cloud/)
+at the workspace root, the only pipeline step still doing that; every other stage's
+outputs live inside its own numbered folder. `MODEL_DIRNAME` now resolves to
+`03_2DGS_training/2dgs`, and `StepContext`'s artifacts_dir was pointed at the stage folder
+to match. README and Pipeline.txt paths updated accordingly.

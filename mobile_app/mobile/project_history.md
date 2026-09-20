@@ -939,3 +939,21 @@ accumulation state; `whiteBalanceGains` stays as the one-shot fallback for a dev
 reports its AWB gains.
 Outcome: worked — rosemary reports them (`WB frozen: isp=true gains=1.1875, 1.0, 2.4824219`, i.e.
 scene-dependent), and the frozen preview looks natural instead of blue. 84 unit tests pass.
+
+## 2026-09-18: Save-completion race, tap-to-focus debounce, warning message queue
+Three field reports from a real scan: (1) `finishSession()` set `state = State.DONE` and the UI
+showed "Start new scan" (enabled) synchronously, while `DatasetWriter.finish()`'s zip/cleanup ran
+async on its own handler thread — closing the app during that window (which looked identical to
+being done) killed the write before the zip landed. (2) `root`'s tap-to-focus touch listener
+fired `CONTROL_AF_TRIGGER_START` on every `ACTION_UP` in the live-view area with no drag check and
+no cooldown, fighting the already-running continuous AF on any incidental touch. (3) the warning
+banner was level-triggered off per-frame conditions with no minimum dwell, so anything that
+cleared within a frame or two (autofocus settling, one overexposed frame) was unreadable, and
+lower-priority conditions co-occurring with a higher-priority one never surfaced at all.
+Fixed by: gating the DONE screen's button/label on `finishedPath != null` ("Saving…", disabled,
+until the callback fires); requiring `ACTION_DOWN`≈`ACTION_UP` within touch slop plus a 1.2s
+cooldown before re-triggering AF; and replacing the single-value warning `when` with a
+`WarningKind`-keyed queue (`pickWarning`) that shows each newly-triggered kind for a minimum 3s,
+dedupes same-kind while showing or queued, and pops the next distinct kind after.
+Outcome: worked — `compileDebugKotlin` clean; not yet re-verified against a real over-focusing
+scan on rosemary (originating bug report was from memory of the incident, not a live repro).

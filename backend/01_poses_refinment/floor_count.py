@@ -29,7 +29,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import find_peaks
 
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
@@ -49,6 +48,7 @@ from scene_extent import (
     horizontal_align_deg,
     rotate_horizontal,
 )
+from floor_bands import count_floor_bands as _count_floor_bands
 
 # Camera-center height histogram is what actually separates floors -- point
 # cloud density is dominated by walls/floor/ceiling clutter at every level,
@@ -103,32 +103,10 @@ def camera_height_stats(centers: np.ndarray, up_axis: int = 1) -> dict:
     }
 
 
-# A within-floor camera-height distribution has one mode (people don't
-# float mid-air); a second floor shows up as a second mode offset by
-# roughly a floor-to-floor rise. 2m is comfortably above handheld
-# crouch/reach wobble (~1m, see current_scene) and below any real
-# floor-to-floor height, so peaks farther apart than this are different floors.
-MIN_FLOOR_GAP_M = 2.0
-
-
 def count_floor_bands(centers: np.ndarray, up_axis: int = 1) -> int:
-    """Number of distinct peaks in the camera-height distribution, merging
-    peaks closer together than MIN_FLOOR_GAP_M (same floor, just a noisy
-    multi-modal walk)."""
-    heights = centers[:, up_axis]
-    lo, hi = heights.min(), heights.max()
-    n_bins = max(1, int(np.ceil((hi - lo) / HEIGHT_BIN_M))) + 1
-    counts, edges = np.histogram(heights, bins=n_bins, range=(lo, hi))
-    peak_idx, _ = find_peaks(counts, prominence=max(1, counts.max() * 0.1))
-    if peak_idx.size == 0:
-        return 1
-    peak_heights = (edges[peak_idx] + edges[peak_idx + 1]) / 2.0
-
-    floors = [peak_heights[0]]
-    for h in peak_heights[1:]:
-        if h - floors[-1] > MIN_FLOOR_GAP_M:
-            floors.append(h)
-    return len(floors)
+    """See floor_bands.count_floor_bands -- the shared threshold-crossing rule,
+    applied to this stage's (COLMAP-triangulated) camera centers."""
+    return _count_floor_bands(centers[:, up_axis])
 
 
 def write_floors_txt(workspace: Path, n_floors: int) -> Path:
@@ -199,13 +177,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _demo() -> None:
-    """Two clusters of camera heights 2.6m apart (typical floor-to-floor)
-    -> 2 peaks; a single noisy cluster with ~1m handheld wobble (matches
-    current_scene) -> 1 peak, not split by the wobble."""
-    two_floors = np.zeros((200, 3))
-    two_floors[:100, 1] = np.random.default_rng(0).normal(0.0, 0.15, 100)
-    two_floors[100:, 1] = np.random.default_rng(1).normal(2.6, 0.15, 100)
+    """count_floor_bands(centers, up_axis) on synthetic camera paths -- the
+    up_axis-selecting wrapper around floor_bands.count_floor_bands, which has
+    its own threshold-formula self-check (floor_bands.py --demo)."""
+    two_floors = np.zeros((60, 3))
+    two_floors[:30, 1] = 0.0
+    two_floors[30:, 1] = 3.5   # 30 points clear the 3.0m floor-2 threshold
     assert count_floor_bands(two_floors) == 2, "expected 2 floor bands"
+
+    three_floors = np.zeros((90, 3))
+    three_floors[:30, 1] = 0.0
+    three_floors[30:60, 1] = 3.5   # clears floor 2 (3.0m)
+    three_floors[60:, 1] = 6.0     # clears floor 3 (5.8m)
+    assert count_floor_bands(three_floors) == 3, "expected 3 floor bands"
+
+    not_enough_points = np.zeros((30, 3))
+    not_enough_points[:20, 1] = 0.0
+    not_enough_points[20:, 1] = 3.5   # only 10 points above 3.0m, <= FLOOR_MIN_POINTS
+    assert count_floor_bands(not_enough_points) == 1, "expected 1 floor band (not enough points)"
 
     one_floor = np.zeros((200, 3))
     one_floor[:, 1] = np.random.default_rng(2).normal(1.5, 0.3, 200)

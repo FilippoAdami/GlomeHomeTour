@@ -44,13 +44,40 @@ def _find_scene_root(directory: Path) -> Path:
     if (directory / "transforms.json").is_file():
         return directory
     candidates = sorted(p.parent for p in directory.glob("*/transforms.json"))
-    if not candidates:
-        raise FileNotFoundError(f"No transforms.json in {directory} or its immediate subdirectories")
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"{len(candidates)} scene roots under {directory} ({', '.join(c.name for c in candidates)}); "
-            "point --source at the one you want")
-    return candidates[0]
+    if candidates:
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"{len(candidates)} scene roots under {directory} ({', '.join(c.name for c in candidates)}); "
+                "point --source at the one you want")
+        return candidates[0]
+    unflattened = _unflatten_media_store_dump(directory)
+    if unflattened is not None:
+        return unflattened
+    raise FileNotFoundError(f"No transforms.json in {directory} or its immediate subdirectories")
+
+
+def _unflatten_media_store_dump(directory: Path) -> Path | None:
+    """Recover a scene from a loose MediaStore album dump: DatasetWriter's
+    ``zipFromMediaStore`` (see mobile_app DatasetWriter.kt) falls back to leaving flat,
+    session-prefixed files (``<session>_transforms.json``, ``<session>_images_frame_N.jpg``,
+    ...) in the shared album folder if the on-device zip write fails; someone can still zip
+    that folder by hand later. Mirrors the app's own ``unflattenMediaName`` to undo the prefix.
+    """
+    transforms_files = list(directory.glob("*/*_transforms.json")) + list(directory.glob("*_transforms.json"))
+    if len(transforms_files) != 1:
+        return None
+    transforms_file = transforms_files[0]
+    album_dir = transforms_file.parent
+    session = transforms_file.name.removesuffix("_transforms.json")
+
+    scene_root = directory / "_unflattened" / session
+    (scene_root / "images").mkdir(parents=True, exist_ok=True)
+    for f in album_dir.glob(f"{session}_*"):
+        rest = f.name.removeprefix(f"{session}_")
+        dest = scene_root / ("images/" + rest.removeprefix("images_")) if rest.startswith("images_") \
+            else scene_root / rest
+        shutil.move(str(f), dest)
+    return scene_root
 
 
 def extract(source: Path, workspace: Path, stage_dir: Path, ctx: StepContext) -> None:

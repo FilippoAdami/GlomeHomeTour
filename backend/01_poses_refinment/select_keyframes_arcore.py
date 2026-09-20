@@ -21,11 +21,13 @@ from typing import Any, Sequence
 import numpy as np
 from shapely.geometry import MultiPoint
 
+from floor_bands import count_floor_bands
+
 # Empirical indoor keyframe constants
 BASE_KEYFRAMES = 50.0
 KEYFRAMES_PER_M2_LO = 8.0
 KEYFRAMES_PER_M2_HI = 11.0
-DEFAULT_STANDOFF_M = 0.80  # 80 cm typical standoff from walls
+DEFAULT_STANDOFF_M = 1.0  # 1m typical standoff from walls
 
 # Safe dimensional floors (even if person stood stationary in the room center)
 MIN_ROOM_DIM_M = 2.5
@@ -65,8 +67,8 @@ def estimate_room_extent_from_arcore(
     span_vert = float(p_hi[up_axis] - p_lo[up_axis])
 
     # Each horizontal dimension extends 2 * standoff_m beyond the path (standoff on both sides)
-    dim_h0 = max(span_h0 + 2.0 * standoff_m, MIN_ROOM_DIM_M)
-    dim_h1 = max(span_h1 + 2.0 * standoff_m, MIN_ROOM_DIM_M)
+    dim_h0 = max(span_h0 + 2.5 * standoff_m, MIN_ROOM_DIM_M)
+    dim_h1 = max(span_h1 + 2.5 * standoff_m, MIN_ROOM_DIM_M)
 
     # Dilated 2D convex hull of the camera path in the horizontal plane:
     # Naturally models rectangular, angled, or non-convex walkthrough footprints
@@ -80,8 +82,12 @@ def estimate_room_extent_from_arcore(
 
     floor_area = max(poly_area, MIN_ROOM_AREA_M2)
 
-    # Multi-floor estimation: ceiling height is typically ~2.8m per story
-    floors = max(1, int(round(span_vert / 2.8))) if span_vert > 4.2 else 1
+    # Multi-floor estimation: same threshold-crossing rule as floor_count.py's
+    # post-COLMAP pass (floor_bands.count_floor_bands), applied here to the raw
+    # ARCore camera heights (already gravity-aligned, floor shifted to 0 via p_lo)
+    # so the keyframe budget below already accounts for every floor.
+    heights_shifted = centers[:, up_axis] - p_lo[up_axis]
+    floors = count_floor_bands(heights_shifted)
     total_floor_area = floor_area * float(floors)
 
     return {

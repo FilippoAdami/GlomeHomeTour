@@ -118,6 +118,10 @@ def load_scene(directory: Path | str, *, validate: bool = True,
         if images_root is None:
             images_root = directory
     data = json.loads(transforms_file.read_text(encoding="utf-8"))
+    # compass_heading_deg (mobile 2026-09-17) isn't in the frozen 1.0.0 schema and nothing
+    # downstream consumes it yet -- drop it rather than bend the frozen schema.
+    for frame in data.get("frames", ()):
+        frame.pop("compass_heading_deg", None)
     if validate:
         jsonschema.validate(instance=data, schema=transforms_schema())
     header = {k: v for k, v in data.items() if k != "frames"}

@@ -6,7 +6,7 @@
 
 ## What This Stage Does
 
-1. **Depth Prior Seeding (`step_train.py`):** Installs the high-density, filtered surfel cloud from Stage 4 (`depth/points3D_depth.ply`) into `sparse/0/points3D.ply` (backing up COLMAP's sparse cloud as `points3D_colmap.ply`), bootstrapping the optimizer on real metric geometry.
+1. **Depth Prior Seeding (`step_train.py`):** Installs the high-density, filtered surfel cloud from Stage 4 (`02_depth_estimation/depth/points3D_depth.ply`) into `sparse/0/points3D.ply` (backing up COLMAP's sparse cloud as `points3D_colmap.ply`), bootstrapping the optimizer on real metric geometry.
 2. **Progressive Multi-Stage Training:** Solves the scene across progressively increasing image resolutions (1/8 -> 1/4 -> 1/2 -> full) via `step_train.py` and `train_room.py`, establishing global low-frequency geometry before refining high-frequency texture.
 3. **Decoupled Pruning & Surfel Densification:** Continuously purges dead surfels (< 0.05 opacity) and monocular floaters every 100 iterations across the entire run, while strictly controlling cloning and splitting during fine detail stages.
 4. **Sensor Saturation & Glare Masking:** Dynamically masks overexposed light sources to prevent the optimizer from generating 3D floaters and hairballs around light fixtures.
@@ -116,9 +116,9 @@ backend/.venv/bin/pip install --no-build-isolation \
 - **Input:**
   - `<workspace>/images/`: Portrait keyframe images.
   - `<workspace>/sparse/0/`: COLMAP camera poses.
-  - `<workspace>/depth/points3D_depth.ply`: Filtered surfel point cloud (seeded as `sparse/0/points3D.ply`).
+  - `<workspace>/02_depth_estimation/depth/points3D_depth.ply`: Filtered surfel point cloud (seeded as `sparse/0/points3D.ply`).
 - **Output:**
-  - `<workspace>/2dgs/point_cloud/iteration_10000/point_cloud.ply`: Trained 2DGS model checkpoint.
+  - `<workspace>/03_2DGS_training/2dgs/point_cloud/iteration_10000/point_cloud.ply`: Trained 2DGS model checkpoint.
   - Novel view renders and full-reference PSNR/SSIM/LPIPS evaluation metrics.
 
 ## Usage
