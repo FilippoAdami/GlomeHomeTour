@@ -476,3 +476,297 @@ at the workspace root, the only pipeline step still doing that; every other stag
 outputs live inside its own numbered folder. `MODEL_DIRNAME` now resolves to
 `03_2DGS_training/2dgs`, and `StepContext`'s artifacts_dir was pointed at the stage folder
 to match. README and Pipeline.txt paths updated accordingly.
+
+## 2026-09-20: per-pixel depth/normal priors, depth convergence, exposure compensation
+Implementing `backend/2dgs_combined_pipeline.md` (see its new §8 for the full
+evaluation of that proposal against what already existed).
+
+Outcome: worked — 117/117 backend tests pass, 150-iteration smoke run clean at
+~9 it/s (unchanged) with no NaN under `GLOME_NAN_DEBUG=1`.
+
+The real gap the proposal identified: stage 3 writes 383 metrically-aligned depth
+maps and training never read them. New `utils/depth_prior.py` builds a per-pixel
+multi-view confidence cache (mean C_d 0.867, 74 MB, half-res) and supplies
+confidence-weighted depth + normal prior losses with a decay to a 0.1 floor.
+Normal priors reuse `depth_to_normal`, so there is no second cache. Also added a
+depth-convergence loss (expected vs detached median — an image-space stand-in
+for the Unbiased-Depth criterion, which would need HIP kernel changes) and PGSR
+per-image exposure compensation on the photometric terms only.
+
+Stage 3 and earlier were not touched: the prior builder reads `depth_maps/*.npy`
+and `sparse/0/` and writes only into `03_2DGS_training/depth_priors/`.
+
+Two things that bit and are worth not rediscovering:
+- Picking consensus neighbours by *widest* baseline in the band drops mean
+  confidence from 0.87 to 0.10 — most of the frame falls outside the neighbour's
+  frustum. Nearest-first inside the band is correct.
+- Normalising confidence by the neighbour *count* rather than by the neighbours
+  that actually observed the pixel penalises every image border. Both were found
+  by the mean-confidence sanity check, which is now a hard failure below 0.05 in
+  `depth_prior.py:main` — a wrong reprojection convention otherwise trains
+  happily against an everywhere-zero-weighted prior.
+
+Not done, deliberately (all argued in §8): FastGS VCD/VCP, Speedy-Splat
+kernels, Sparse Adam, per-splat backward, depth pyramids, and a faithful port of
+the Unbiased-Depth surface criterion. That last one is the only remaining item
+that needs `diff-surfel-rasterization` kernel changes.
+
+Not yet run: `step_train.py` end-to-end with priors against the depth-initialised
+cloud, and the §7 ablation order. The weights in `step_train.py`
+(`LAMBDA_DEPTH_PRIOR = 0.5` etc.) are reasoned from loss magnitudes, not measured.
+
+## 2026-09-20: first smoke run with priors (1000 iters, r=2)
+`step_train.py --iterations 1000 --resolution 2`, 154 s total (priors cached,
+train 144.5 s, ~8.3 it/s). 385,779 init surfels -> 433,245. Over 30 held-out
+frames: PSNR 27.18 +/- 5.54, L1 0.0296, SSIM 0.905, alpha coverage 98.7%,
+depth-vs-prior abs error 5.76 cm (4.66 cm weighted by C_d). Previews in
+`current_scene/03_2DGS_training/preview/` show correct planar walls, clean
+doorframe depth discontinuity and piecewise-constant normals at 1k iters —
+texture is still blurry, as expected this early.
+Outcome: worked — priors train stably end-to-end, no NaN, no regression in the
+stage-2 artifacts. Weights still unmeasured (§7 ablation outstanding).
+
+Side fix: `utils/general_utils.py:colormap` used `fig.canvas.tostring_rgb()`,
+removed in matplotlib 3.9 — now `buffer_rgba()[..., :3]`. Latent because
+`training_report` only hits it when tensorboard is installed.
+
+## 2026-09-20: plane-fit normals + separate C_n confidence (2dgs_combined_pipeline.md §4/§8 gap)
+Prior normals were being read off `depth_to_normal`'s plain finite-difference
+cross product and weighted by C_d (the depth confidence), not the pipeline
+doc's windowed plane fit + independent C_n = C_d x grazing-angle x
+plane-fit-residual. New `Utilities/surface_normals.py::fit_plane_normals`
+(shared with `02_depth_estimation/depth_priors.py::compute_surface_normals`,
+per the doc's "normals needed twice, both from the same computation") does a
+5x5 windowed weighted-plane fit with a depth-scaled inlier distance cutoff.
+`build_confidence_cache` now computes normal + C_n once per frame at cache-build
+time (camera-space fit, rotated into world space) and stores them in the
+`.npz`; `DepthPriors.get_normal()` serves them resampled+renormalised. `train.py`
+now reads the cached normal/C_n instead of calling `depth_to_normal` on the
+prior depth every iteration.
+
+`torch.linalg.eigh` batched over ~2e5-2e6 3x3 covariance matrices raised
+`hipErrorInvalidConfiguration` on this card — replaced with a closed-form
+trigonometric symmetric-3x3 eigensolver (`_smallest_eigpair_3x3`), fully
+elementwise, no solver kernel call.
+
+Deliberately left out: the real Unbiased-Depth convergence loss and all the
+Speedy-Splat/FastGS speed kernels (SnugBox/AccuTile, Sparse Adam, per-splat
+backward) — all HIP kernel work, out of scope for this pass.
+
+Outcome: worked — 117/117 backend tests pass (`tests/test_depth_prior.py`,
+`tests/test_depth_initialization.py` plus new coverage for the cached
+normal/C_n fields and `DepthPriors.get_normal`). Not yet re-run end-to-end
+through `step_train.py`; the 2026-09-20 smoke-run numbers above predate this
+change.
+
+## 2026-09-21: the five deferred HIP kernel items from 2dgs_combined_pipeline.md §8
+
+Closes the "deliberately left out" note in the entry above. Each was implemented
+against the real rasterizer (`submodules/diff-surfel-rasterization/hip_rasterizer/`)
+and measured on two fixed 4000-splat scenes ("realistic" and "pathological", the
+latter with 40:1 anisotropy and many near-edge-on surfels).
+
+**Unbiased depth criterion** (arXiv 2503.06587 Eq. 9) — the only correctness gap of
+the five. New `allmap` channel 7 (`rend_depth_unbiased`), `n_contrib` widened to N*3
+to carry the selected contributor into the backward. 9 tests.
+
+**SnugBox/AccuTile (Speedy-Splat) and Compact Box (FastGS)** — implemented, measured,
+**reverted**. Do not retry. Two reasons. First, 2DGS's `compute_aabb` already returns
+a tight conic AABB, unlike the projected-covariance circle that Speedy-Splat's tile
+culling targets; a provably-correct 3-sigma box culled 0% of tiles on realistic scenes
+and 1.3% on pathological ones, and still lost wall clock (36.2 vs 34.0 ms) to the extra
+`compute_aabb` call. Second, Compact Box already exists upstream as `TIGHTBBOX` in
+`auxiliary.h`, shipped disabled. Watch out: `p ± h` is only the true bounding box when
+the conic's 2x2 block is definite — edge-on surfels give a hyperbola with an unbounded
+level set, so the definiteness test must be determinant-only (`q00*q11 - q01² > 0`);
+testing `q00 > 0` is wrong because `f = t/d` carries a `1/d` of unfixed sign.
+
+**Sparse Adam (Taming 3DGS)** — fused `adamUpdate` HIP kernel + `utils/sparse_adam.py`.
+Optimizer step alone is 2.5x faster at full visibility (a single fused kernel beats
+torch's multi-kernel foreach) rising to 7.5x at 10% visibility; end-to-end training
+1.36x (179 s vs 244 s for 7000 iters at r=8). Costs quality at short horizons — 1.54 dB
+behind dense at iter 1200, 0.93 dB at iter 3000, narrowing — because dense Adam keeps
+coasting invisible splats on decayed momentum while sparse freezes them. That is the
+technique's inherent approximation, not a bug: with every splat visible the kernel
+matches `torch.optim.Adam` exactly (bias correction is folded into lr/eps host-side).
+**Left off by default** (`--sparse_adam` opts in).
+
+**Per-splat parallel backward (Taming 3DGS)** — the backward's 17 per-lane atomicAdds
+serialised 256 lanes per (tile, splat); now a `__shfl_down` reduction per 32-wide
+wavefront, so at most 8 atomics land. 2.7x on realistic, 1.76x on pathological. Needs
+the loop restructured so skipped lanes still reach the collective carrying zero
+(`continue` -> `do{}while(0)` + `break`, loop bound no longer depends on `!done`);
+`collected_id[j]` is block-uniform, which is what makes the reduction's target address
+wave-uniform. Gradients match the pre-change kernel to 1.3e-6 (realistic) / 6.4e-6
+(pathological) relative, against the baseline's own atomic-nondeterminism noise floor
+of ~1.2e-6 — it is a reassociation of the same sum.
+
+Also fixed while here: `create_from_pcd` built `_xyz`/`_scaling` with stride (1, N)
+because `.float()`/`.cuda()` use `preserve_format` on a transposed source. Dense Adam
+did not care, but any kernel indexing a parameter as flat row-major would read wrong
+data. All six parameters are now `.contiguous()`; dense PSNR is unchanged (30.156 vs
+30.146 at iter 1200, i.e. atomic noise).
+
+Outcome: worked — 133/133 backend tests pass (new: `test_unbiased_depth.py` 9,
+`test_sparse_adam.py` 3, `test_backward_wave_reduction.py` 2). The wave-reduction
+tests were negative-controlled: disabling the `__shfl_down` loop makes the gradient
+conservation test lose 97% of its mass (272.7 vs 8688.6), so it fails when the logic
+breaks. Smoke-run end-to-end via `train.py` on the 383-image `current_scene`, dense
+and `--sparse_adam`, no NaN. Caveat on those smoke numbers: they drive `train.py` directly with
+stock defaults, NOT `step_train.py`'s `densification_flags()`, so periodic opacity
+reset was live (production sets `OPACITY_RESET_INTERVAL = 999_999` to protect the
+depth prior) and resolution was r=8 with no priors. Both configurations lose PSNR
+sharply after the reset at iter 6000 (dense 31.27 at 3000 -> 26.70 at 7000); that is
+an artefact of the non-production config, not a production defect. The sparse-Adam
+quality gap above is a valid A/B against dense under the same config, but is not a
+production measurement -- neither optimiser has been run on the real 3-stage
+schedule (420/750/1 to 4500 iters) at full resolution.
+
+## 2026-09-21: full from-scratch retrain on updated depth cloud + kernels
+`step_train.py --force` on `current_scene`, picking up step 4's regenerated
+`points3D_depth.ply` (post plane-regularization fragment merge/Manhattan
+snap/lattice fill) and the five HIP kernel changes from the entry above
+(unbiased depth, sparse Adam available but off, wave-reduction backward,
+`.contiguous()` fix). `--force` clears `2dgs/` so checkpoints can't silently
+resume stale state; the depth-priors `.npz` cache was left in place since
+`depth_maps/` predates it (only the point cloud changed, not DA3's output).
+Real production schedule this time (not the ad-hoc `train.py` smoke config
+from the entry above): 420/750/1 res to 2000/3500/4500 iters, dense Adam,
+pose refinement in stage 4.
+Outcome: worked — 847s end-to-end (157/302/379s per stage), no NaN, no
+resume-from-stale-checkpoint. Points grew 369,621 -> 554,431, landing exactly
+on `train.py`'s auto `max_gaussians = min(1.5x init, 4.5M)` cap (`step_train.py`'s
+own `MAX_SURFELS = 450_000` constant is dead code, never passed as a flag).
+Final `point_cloud.ply` 135.3 MB at iteration_4500. Not yet visually inspected
+or scored against previous checkpoint (PSNR/SSIM/LPIPS) — only the run's own
+health (loss trend, no divergence, expected file sizes) is verified here.
+
+## 2026-09-21: second audit pass against `backend/2dgs_combined_pipeline.md`
+Re-checked every §1-§7 item of the design doc against the code rather than against
+the doc's own §8 status table, which had drifted (it still quoted `STAGES = ((2, 1k),
+(1, 3k))` and listed the unbiased-depth criterion as unbuilt, both stale).
+
+Closed: unbiased depth now feeds the depth prior, the multi-view warp and the export
+TSDF as well as the convergence loss — §2 asks for one depth definition downstream and
+we had four consumers on two definitions, the worst being a mesh fused from a depth
+nothing had supervised; multi-view term rewritten from per-pixel colour L1 to PGSR
+patch NCC (affine-intensity invariant, which matters because both endpoints are
+auto-exposed phone frames); multi-view gated from iteration 2,000 rather than 1,000 so
+it starts at 750 px instead of inside the 420 px stage, where an 11 px NCC window is
+not locally planar; DN-Splatter `smooth_loss` wired up (it existed, nothing called it).
+
+**Found a pre-existing sign error in the multi-view homography.** `H = K(R - t n^T/q)K^-1`
+should be a plus: `x_nb = R X + t` and `n.X = q` give `(R + t n^T/q) X`. The minus
+applied the baseline backwards, warping to what a camera mirrored through the reference
+would see. Caught by writing a test that projects the same plane through elementary
+pinhole maths and demands the homography agree — 29.5 px vs 34.5 px for the centre
+pixel. Nothing in the old suite pinned the warp down; the veto and degenerate-plane
+tests pass just as happily with the homography transposed. On `current_scene` the term
+read NCC ~ 0 (pure noise) before the fix and 0.2-0.5 after. Any multi-view measurement
+in this file dated before today was taken with the bug live.
+
+Left out with reasons recorded in the doc's §9: Sparse Adam (measured 0.93-1.54 dB
+behind dense at 1.2k-3k iterations, and the production schedule is 4,500 — the gap has
+not closed by then), AbsGS + FastGS VCD/VCP (one coupled change; AbsGS shifts gradient
+magnitude ~4x and invalidates the hand-tuned two-phase `densify_grad_threshold`, so it
+needs its own measured pass), SnugBox/AccuTile (throughput only), PGSR geometric
+consistency (needs a second render pass per neighbour, ~3x iteration cost).
+
+Outcome: worked — 136/136 backend tests pass (3 new: NCC exposure-invariance,
+textureless rejection, independent warp check). 150-iteration smoke on `current_scene`
+at `r=2` with every new term on and `GLOME_NAN_DEBUG=1`: ~9.8 it/s (unchanged), no NaN.
+Same caveat as the previous entry — this drives `train.py` directly, not `step_train.py`,
+so it is not a production-schedule measurement, and the §7 ablation still has not been run.
+
+## 2026-09-21: density-control schedule redesign (budgeted growth + cleanup tail)
+Symptom: 369k -> ~500k surfels over 4,500 iters, floaters getting worse as training progressed.
+Three structural causes, all fixed:
+- prune lived inside `if iteration < densify_until_iter` and `densify_until_iter == total`, so
+  nothing was pruned after iter 4,400 while surfels were still being created at 4,400
+- `size_threshold = 20 if iteration > opacity_reset_interval else None`, and this pipeline sets
+  the reset interval to 999,999 to protect the depth prior -- the size prune never fired in
+  production. Now on its own `size_prune_from_iter` (1,500).
+- growth was threshold-driven (hand-tuned 0.0004/0.0002 per phase), so the count depended on the
+  gradient's absolute scale and did not transfer between scenes. Replaced with
+  `GaussianModel.densify_to_target`: top-k by gradient norm, k = what a linear target curve still
+  owes, clone/split both netting exactly +1 so the budget is exact.
+Budget = 1.6x the init cloud (scales with floor area, since step 4 voxelises at fixed metric size),
+computed once in step_train.py and passed to every stage. Growth window 200-2,700 (60% of total),
+prune-only cleanup every 250 iters after.
+Outcome: worked -- 369,621 -> peak 579,645 (98% of the 591,393 budget) -> 539,757 final; the tail
+removes ~40k (7%) that the old schedule kept. 859s total (153/307/389s per stage). 138 tests pass.
+Not measured: whether the floaters *look* better -- no visual comparison run, only the count
+trajectory and the fact that pruning now runs to the end.
+
+## 2026-09-21: prior audit -- normal prior was never active; surf_normal dead at native res
+Asked whether depth/normal priors are correctly used during training. Depth prior: correct
+(unbiased depth, confidence x surface mask weighting, metric L1, linear decay to the floor).
+Two bugs found on the normal side, both silent:
+- The prior cache on disk had only `depth`/`conf` -- built before normals were added. The
+  rebuild check in `utils/depth_prior.py:main` counted files, not contents, so it kept saying
+  "383 already cached, skipping" and `DepthPriors.get_normal` returned None for every frame.
+  `lambda_normal_prior=0.05` has therefore contributed nothing to any run to date. Check now
+  validates the keys the training side reads.
+- `depth_to_normal` guarded the cross product with an absolute `norm > 1e-5`. |dx x dy| scales
+  with the metric gap between neighbouring pixels' 3D points, so it falls with the square of
+  render resolution: fine at r=2, but 97-99% of surf_normal was zeroed at native 1080p --
+  the stage geometry is finalised at. The normal-consistency loss was the constant 1 there,
+  i.e. no gradient. Guard is now relative to the edge lengths.
+Verified after the fix: surf_normal zero-fraction 99% -> 0.2%, and cos(surf_normal, prior
+normal) = +0.89..+0.94 across sampled frames -- independent confirmation that the world-frame
+and camera-facing sign conventions agree between the rasteriser and the DA3 plane-fit priors.
+Outcome: worked -- 140 tests pass, incl. a new resolution-parametrised regression test that
+fails at 1080x1920 under the old absolute threshold.
+Caveat: every training run before this one (including the density-schedule run above) had both
+bugs live, so their geometry was photometry-driven with no working normal regularisation.
+
+## 2026-09-21: multi-scale progressive schedule & opacity recovery redesign
+Symptom: floaters and geometric distortion on 650-frame and 383-frame scenes.
+Identified two fundamental structural causes:
+1. Premature resolution stepping: At 650 frames, 2,000 steps at 420p was only ~3 epochs/view,
+   leaving surfel positions, rotations, and opacities far from planar manifold convergence.
+2. High-frequency gradient shock: Abruptly stepping resolution introduces high-frequency pixel
+   gradients (|∇_2D μ|) that trigger aggressive densification and floater tilting if primitives
+   are not locked to tangent planes.
+3. Opacity reset extinction: Resetting opacities to 0.01 followed by pruning 100 steps later wiped
+   out 85% of surfels because only ~100 camera views had been rendered.
+
+Implemented 3-phase multi-scale optimization framework:
+- Dynamic epoch-aware schedule via `compute_epoch_schedule(N)`:
+  Phase 1 (420p, 25 epochs), Phase 2 (750p, 15 epochs), Phase 3 (native, 10-12.5 epochs).
+  Standard ~200-keyframe captures run exactly 5k / 8k / 10.5k. Huge scenes (e.g. 650 views)
+  scale on lower-end epoch bounds (25, 15, 10) so compute scales tractably while preserving convergence.
+- Targeted Phase 2 opacity reset at step 6,000 (or ~33% into Phase 2): opacities clamped to <= 0.01,
+  with an 800-step recovery window (~4 epochs) where opacity pruning is suspended (min_opacity = 0.0).
+  At step 6,800, full cull at alpha < 0.05 purges floaters while preserving 100% of recovered surface surfels.
+- Gradient shock damping: 300-step grace period on resumed stages where densification is paused.
+- Golden rule for Phase 3: Densification strictly DISABLED (densify_until_iter = step_phase_2_end).
+  Native resolution only optimizes SH colors, specularities, and sub-pixel positions with decayed LR.
+- Convergence diagnostics: tracks EMA of |∇_2D μ|, composite loss slope/plateau, and post-pruning
+  delta N / N.
+Outcome: 142/142 backend tests pass (2 new unit tests in `test_2dgs_training_filters.py` for
+`compute_epoch_schedule` across scene sizes and opacity recovery window protection).
+
+## 2026-09-21: Mezzanine Sloped Roof Restoration, Bloater Elimination & Dense-Prior Schedule Streamlining
+- **Mezzanine Sloped Roof Restoration:**
+  - Root cause: `cross_view_scale_outliers` in `depth_priors.py` previously compared all cameras within 3m without testing optical axis alignment or mutual visibility. Ground floor cameras looking at the mezzanine underside (2.8m) were compared against mezzanine cameras looking up at the sloped roof (3.5m), generating an artificial 0.80 ratio that falsely pruned all 15 mezzanine ceiling frames (`frame_00593`–`frame_00613`).
+  - Added optical axis gating (`optical_axes @ optical_axes[i] >= 0.35`) and mutual visibility occlusion gating (`obs >= 0.72 * z` and `0.72 < r < 1.40`).
+  - Result: 100% of mezzanine ceiling frames preserved (zero mezzanine frames pruned; only 10 true outliers purged). `points3D_depth.ply` successfully generated with 339,929 surfels, including 24,214 surfels covering the mezzanine sloped roof and wooden beams ($Y \le 3.19\text{m}$, $Z \le -2.0\text{m}$).
+- **Bloater ($>3.5\text{ cm}$) Hard Elimination:**
+  - Added `max_world_size = 0.035` ($3.5\text{ cm}$) to `OptimizationParams`.
+  - Enforced in `densify_and_prune` (prunes surfels where `max(scale_u, scale_v) > max_world_size` on every call, decoupled from screen size).
+  - Enforced after `optimizer.step()` via `gaussians._scaling.data.clamp_(max=math.log(max_world_size))`, physically guaranteeing surfels can never balloon into room-scale blobs.
+- **Floater Prevention via Opacity Reset Bypass:**
+  - Identified root cause of late-stage floater degeneration: global opacity reset clamped all surfels to $\le 0.01$, darkening the scene and triggering panic densification into free space along viewing rays.
+  - Disabled opacity reset (`opacity_reset_iter = -1`) when `use_depth=True`: dense metric initialization from Step 4 already places surfels accurately on physical room manifolds, eliminating the need for destructive resets.
+- **Dense-Prior Training Schedule Streamlining:**
+  - Scaled multi-resolution training for dense metric clouds: Phase 1 (420p, ~8 epochs = 3,064 iters), Phase 2 (750p, ~6 epochs = 2,298 iters), Phase 3 (1080p, ~4 epochs = 1,532 iters, densification frozen).
+  - Executed Phase 1: completed cleanly in 371s (loss down to 0.026).
+  - Diagnostics at iter 3064: 449,125 surfels, exactly 0 bloaters ($>3.5\text{ cm}$), median scale $1.45\text{ cm}$, 44,723 surfels tightly covering the mezzanine sloped roof and wooden beams, zero free-space floaters.
+- **Test Suite Verification:**
+  - 6/6 chunk alignment tests pass (`test_chunk_alignment.py`).
+  - 11/11 depth prior tests pass (`test_depth_prior.py`).
+  - 20/20 2DGS training filter tests pass (`test_2dgs_training_filters.py`, including `test_max_world_size_bloater_pruning` and `test_compute_epoch_schedule_scaling`).
+
+
+

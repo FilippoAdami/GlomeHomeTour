@@ -69,3 +69,9 @@ python 01_poses_refinment/step_colmap.py --workspace backend/current_scene [--fo
 python 01_poses_refinment/colmap_diagnostics.py --colmap-dir backend/current_scene/sparse/0
 ```
 
+or
+
+```bash
+python3 run_pipeline.py --only-step colmap
+```
+

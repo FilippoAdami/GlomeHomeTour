@@ -40,6 +40,10 @@ from keyframe_selector import DynamicKeyframeSelector, estimate_scene_depths
 from pose_aligner import PoseAligner
 from quality_gate import QualityGate, prune_redundant
 
+from Utilities.pipeline_step import update_pipeline_stats
+
+KEYFRAMES_SELECTION_AGGRESSIVENESS = 0.5
+
 # ARCore captures landscape sensor frames for a phone held upright; everything
 # downstream (depth priors, 2DGS) works in the upright portrait frame.
 R_ROLL = np.array([
@@ -60,8 +64,6 @@ def to_portrait_intrinsics(raw: CameraIntrinsics) -> CameraIntrinsics:
         cy=float(raw.cx),
         w=raw.h,
         h=raw.w,
-        # Derived, not a hardcoded FOV constant: the two staging scripts this
-        # replaces disagreed (55.4 vs 40.8 deg) and at most one could be right.
         camera_angle_x=2.0 * math.atan(raw.h / (2.0 * raw.fl_y)),
         k1=raw.k1,
         k2=raw.k2,
@@ -133,6 +135,8 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("scene", help="scene name under backend/scenes (dir or .zip)")
     parser.add_argument("--out", default=None, help="output dir (default: scenes/<scene>_staged)")
+    parser.add_argument("--aggressiveness", type=float, default=None,
+                        help="keyframe selection aggressiveness in [0.0, 1.0] (default: KEYFRAMES_SELECTION_AGGRESSIVENESS = 0.5)")
     parser.add_argument("--blur-thresh", type=float, default=None,
                         help="absolute sharpness floor on top of the scene-relative one")
     parser.add_argument("--min-translation", type=float, default=0.03,
@@ -147,6 +151,8 @@ def main() -> None:
                         help="write transforms.json only (fast dry run)")
     args = parser.parse_args()
 
+    aggressiveness = args.aggressiveness if args.aggressiveness is not None else KEYFRAMES_SELECTION_AGGRESSIVENESS
+
     scenes = _backend_dir / "scenes"
     source = scenes / args.scene
     if not source.exists():
@@ -160,24 +166,39 @@ def main() -> None:
 
     out_root = Path(args.out) if args.out else scenes / f"{args.scene}_staged"
 
+    # Substep 1: Extraction & Coordinates Alignment
+    t0_extract = time.time()
     package = PackageLoader().load(source)
     intrinsics = to_portrait_intrinsics(package.intrinsics)
-    total = len(package.keyframes)
-    print(f"Loaded {total} raw frames from {source}")
+    total_extract_time = time.time() - t0_extract
+    total_extract_frames = len(package.keyframes)
+    update_pipeline_stats(out_root, "extraction_and_coordinates_alignment", total_extract_time, total_extract_frames)
+    update_pipeline_stats(out_root, "extraction", total_extract_time, total_extract_frames)
+    print(f"Loaded {total_extract_frames} raw frames from {source}")
 
-    # Stage 1: image quality.
+    # Substep 2: Quality Filter (Stage 1)
+    t0_quality = time.time()
     gate = QualityGate(blur_threshold=args.blur_thresh)
     result = gate.evaluate(package.keyframes)
     q_kfs = PoseAligner(package.trajectory).synchronize_keyframes(result.accepted_keyframes)
+    total_quality_time = time.time() - t0_quality
+    total_quality_frames = len(package.keyframes)
+    update_pipeline_stats(out_root, "quality_filter", total_quality_time, total_quality_frames)
+
+    # Substep 3: Rotation
+    t0_rotate = time.time()
     # Roll the poses into the upright frame here rather than at write time: stage 3
     # measures frustum overlap, and doing that with portrait intrinsics against an
     # un-rolled landscape pose transposes the frustum and mismeasures the overlap.
     q_kfs = [replace(kf, transform_matrix=np.dot(kf.transform_matrix, R_ROLL)) for kf in q_kfs]
-    print(f"[1/3] quality   {len(q_kfs):5d}/{total} kept ({100*len(q_kfs)/max(1,total):.1f}%)  "
+    print(f"[1/3] quality   {len(q_kfs):5d}/{total_extract_frames} kept ({100*len(q_kfs)/max(1,total_extract_frames):.1f}%)  "
           f"blur={result.summary['rejected_blur']} "
           f"exposure={result.summary['rejected_exposure']} "
           f"texture={result.summary['rejected_texture']}")
     write_stage(out_root / "01_quality", q_kfs, intrinsics, not args.no_images)
+    total_rotate_time = time.time() - t0_rotate
+    total_rotate_frames = len(q_kfs)
+    update_pipeline_stats(out_root, "rotation", total_rotate_time, total_rotate_frames)
 
     # Stage 2: near-duplicate viewpoints.
     kept, dropped = prune_redundant(q_kfs, args.min_translation, args.min_rotation)
@@ -186,26 +207,26 @@ def main() -> None:
           f"({100*len(p_kfs)/max(1,len(q_kfs)):.1f}%)  dropped={len(dropped)}")
     write_stage(out_root / "02_parallax", p_kfs, intrinsics, not args.no_images)
 
-    # Stage 3: anchor set. Overlap thresholds are scene-dependent, so the band is
-    # enforced explicitly: back-fill under 15% of stage 2, tighten over 50%. The
-    # band is wide on purpose -- coverage beats compactness here, and the selector
-    # only ever hits it by re-walking at a different overlap threshold, never by
-    # subsampling a chain it just built.
-    # Measure how far away each frame's subject actually is. Overlap between two
-    # views is meaningless without it: the same 50 cm sidestep keeps most of a
-    # 3 m wall in frame and loses a 0.5 m one entirely.
+    # Substep 4: Dynamic Keyframe Selection (Stage 3)
+    t0_select = time.time()
     scene_depths = estimate_scene_depths(p_kfs, intrinsics)
     print(f"      scene depth: median {np.median(scene_depths):.2f} m, "
           f"p10 {np.percentile(scene_depths, 10):.2f} m, p90 {np.percentile(scene_depths, 90):.2f} m")
 
-    selector = DynamicKeyframeSelector.for_2dgs_training()
+    selector = DynamicKeyframeSelector.for_2dgs_training(aggressiveness=aggressiveness)
     selection = selector.select_keyframes(
         p_kfs, intrinsics,
         scene_depths=scene_depths,
-        min_keyframes=args.min_keyframes if args.min_keyframes is not None else int(0.15 * len(p_kfs)),
-        max_keyframes=args.max_keyframes if args.max_keyframes is not None else int(0.50 * len(p_kfs)),
+        min_keyframes=args.min_keyframes,
+        max_keyframes=args.max_keyframes,
+        aggressiveness=aggressiveness,
     )
     k_kfs = selection.selected_keyframes
+    total_select_time = time.time() - t0_select
+    total_select_frames = len(p_kfs)
+    update_pipeline_stats(out_root, "dynamic_keyframe_selection", total_select_time, total_select_frames)
+    update_pipeline_stats(out_root, "keyframe_selection", total_select_time, total_select_frames)
+
     print(f"[3/3] keyframes {len(k_kfs):5d}/{len(p_kfs)} kept "
           f"({100*len(k_kfs)/max(1,len(p_kfs)):.1f}%)  {selection.reasons}")
     write_stage(out_root / "03_keyframes", k_kfs, intrinsics, not args.no_images)

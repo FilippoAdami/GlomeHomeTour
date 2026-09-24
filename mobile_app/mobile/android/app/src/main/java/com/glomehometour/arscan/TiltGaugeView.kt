@@ -23,7 +23,7 @@ class TiltGaugeView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null,
 ) : View(context, attrs) {
 
-    /** Downward tilt in degrees, positive is down (MainActivity.tiltDownDeg). */
+    /** Downward tilt in degrees, positive is down (CaptureActivity.tiltDownDeg). */
     var tiltDeg: Float = 0f
         set(value) {
             val clamped = value.coerceIn(0f, MAX_DEG)

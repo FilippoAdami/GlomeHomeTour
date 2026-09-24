@@ -343,6 +343,32 @@ def test_quality_gate_reject_cap():
     assert res.summary["accepted"] >= 8
 
 
+def test_quality_gate_consecutive_discard_cap():
+    """Consecutive discards are capped to prevent visual gaps in camera trajectory."""
+    # Sequence of 10 low-texture / blurred frames
+    soft = cv2.GaussianBlur(_block_pattern(), (0, 0), 3.0)
+    frames = []
+    for i in range(10):
+        mat = np.eye(4)
+        mat[0, 3] = 0.1 * i
+        img = Image.fromarray(soft)
+        frames.append(Keyframe(f"f{i}.jpg", 100, 500.0, 500.0, 120.0, 120.0, mat, lambda: img))
+
+    gate = QualityGate(blur_threshold=5000.0, max_consecutive_discard=3, max_reject_fraction=1.0)
+    res = gate.evaluate(frames)
+    # Consecutive discarded frames must not exceed 3 anywhere in the sequence
+    discarded = set(res.discarded_indices)
+    max_run = 0
+    cur_run = 0
+    for i in range(10):
+        if i in discarded:
+            cur_run += 1
+            max_run = max(max_run, cur_run)
+        else:
+            cur_run = 0
+    assert max_run <= 3
+
+
 def test_full_ingestion_pipeline(mock_package_dir: Path):
     """Integration test chaining package loading -> quality gating -> pose sync."""
     # 1. Package loading
@@ -361,4 +387,24 @@ def test_full_ingestion_pipeline(mock_package_dir: Path):
     assert len(synced_kfs) == 2
     for kf in synced_kfs:
         assert kf.transform_matrix.shape == (4, 4)
+
+
+def test_pipeline_stats_file_generation(tmp_path: Path):
+    from Utilities.pipeline_step import update_pipeline_stats
+
+    stats_path = update_pipeline_stats(tmp_path, "extraction", 1.25, 100)
+    assert stats_path.exists()
+
+    data = json.loads(stats_path.read_text())
+    assert "extraction" in data
+    assert data["extraction"]["total_time"] == 1.25
+    assert data["extraction"]["frames_processed"] == 100
+    assert data["extraction"]["time_per_frame"] == pytest.approx(0.0125, abs=1e-4)
+
+    update_pipeline_stats(tmp_path, "quality_filter", 2.50, 100)
+    data2 = json.loads(stats_path.read_text())
+    assert "quality_filter" in data2
+    assert data2["quality_filter"]["frames_processed"] == 100
+    assert data2["quality_filter"]["time_per_frame"] == pytest.approx(0.0250, abs=1e-4)
+
 

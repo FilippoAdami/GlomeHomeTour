@@ -323,6 +323,10 @@ renderCUDA(
 	float median_depth = {0};
 	// float median_weight = {0};
 	float median_contributor = {-1};
+	// Unbiased depth (Eq. 9) accumulator and its selected splat.
+	float O_acc = {0};
+	float unbiased_depth = {0};
+	float unbiased_contributor = {-1};
 
 #endif
 
@@ -391,7 +395,8 @@ renderCUDA(
 			// Obtain alpha by multiplying with Gaussian opacity
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, opa * exp(power));
+			const float G = exp(power);
+			float alpha = min(0.99f, opa * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
@@ -411,6 +416,14 @@ renderCUDA(
 			D  += depth * w;
 			M1 += m * w;
 			M2 += m * m * w;
+
+			// Unbiased depth criterion (Eq. 9): keep overwriting while O_{i-1} <= thresh, so the
+			// last write is the first splat whose O_i crosses it.
+			if (O_acc <= UNBIASED_O_THRESH) {
+				unbiased_depth = depth;
+				unbiased_contributor = contributor;
+			}
+			O_acc += alpha + UNBIASED_EPS * G;
 
 			if (T > 0.5) {
 				median_depth = depth;
@@ -443,6 +456,7 @@ renderCUDA(
 
 #if RENDER_AXUTILITY
 		n_contrib[pix_id + H * W] = median_contributor;
+		n_contrib[pix_id + 2 * H * W] = unbiased_contributor;
 		final_T[pix_id + H * W] = M1;
 		final_T[pix_id + 2 * H * W] = M2;
 		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
@@ -450,6 +464,7 @@ renderCUDA(
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + UNBIASED_OFFSET * H * W] = unbiased_depth;
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}

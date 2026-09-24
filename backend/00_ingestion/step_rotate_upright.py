@@ -104,6 +104,7 @@ def rotate_upright(workspace: Path, manifest_dir: Path, ctx: StepContext) -> Non
         write_scene(manifest_dir, new_header, new_frames)
 
     ctx.metric("frames_rotated", len(new_frames))
+    ctx.metric("frames_processed", len(scene.frames))
     ctx.metric("from_wh", [raw_w, raw_h])
     ctx.metric("to_wh", [header_intr["w"], header_intr["h"]])
     ctx.note(f"Rotated {len(new_frames)} frame(s) 90 deg CW: "

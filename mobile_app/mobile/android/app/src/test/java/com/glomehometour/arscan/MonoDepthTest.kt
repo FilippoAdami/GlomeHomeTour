@@ -182,10 +182,10 @@ class MonoDepthTest {
     fun `angle between forward vectors is small for small turns`() {
         val a = floatArrayOf(0f, 0f, -1f)
         val b = floatArrayOf(kotlin.math.sin(0.01).toFloat(), 0f, -kotlin.math.cos(0.01).toFloat())
-        assertEquals(Math.toDegrees(0.01).toFloat(), MainActivity.angleBetweenDeg(a, b), 1e-3f)
-        assertEquals(0f, MainActivity.angleBetweenDeg(a, a), 1e-4f)
-        assertEquals(90f, MainActivity.angleBetweenDeg(a, floatArrayOf(1f, 0f, 0f)), 1e-3f)
-        assertEquals(180f, MainActivity.angleBetweenDeg(a, floatArrayOf(0f, 0f, 1f)), 1e-3f)
+        assertEquals(Math.toDegrees(0.01).toFloat(), CaptureActivity.angleBetweenDeg(a, b), 1e-3f)
+        assertEquals(0f, CaptureActivity.angleBetweenDeg(a, a), 1e-4f)
+        assertEquals(90f, CaptureActivity.angleBetweenDeg(a, floatArrayOf(1f, 0f, 0f)), 1e-3f)
+        assertEquals(180f, CaptureActivity.angleBetweenDeg(a, floatArrayOf(0f, 0f, 1f)), 1e-3f)
     }
 
     @Test
@@ -200,7 +200,7 @@ class MonoDepthTest {
         val jittered = FloatArray(3)
         val half = kotlin.math.sin(Math.toRadians(0.5) / 2).toFloat()
         Unproject.rotate(floatArrayOf(0f, half, 0f, kotlin.math.cos(Math.toRadians(0.5) / 2).toFloat()), 0f, 0f, -1f, jittered)
-        val rate = MainActivity.angleBetweenDeg(forward, jittered) / (1f / 30f)
-        assertTrue("rate was $rate", rate < MainActivity.MAX_TURN_RATE_DEG_S)
+        val rate = CaptureActivity.angleBetweenDeg(forward, jittered) / (1f / 30f)
+        assertTrue("rate was $rate", rate < CaptureActivity.MAX_TURN_RATE_DEG_S)
     }
 }

@@ -138,6 +138,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # get depth distortion map
     render_dist = allmap[6:7]
 
+    # get unbiased depth map (Unbiased Depth for 2DGS, Eq. 9): depth of the first splat
+    # whose accumulated O_i = sum_j (alpha_j + eps) * G_j crosses UNBIASED_O_THRESH.
+    render_depth_unbiased = allmap[7:8]
+    render_depth_unbiased = torch.nan_to_num(render_depth_unbiased, 0, 0)
+
     # psedo surface attributes
     # surf depth is either median or expected by setting depth_ratio to 1 or 0
     # for bounded scene, use median depth, i.e., depth_ratio = 1; 
@@ -157,6 +162,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             'rend_dist': render_dist,
             'surf_depth': surf_depth,
             'surf_normal': surf_normal,
+            # Both raw depth buffers, for the depth-convergence loss. They only
+            # differ where a ray's opacity is spread over more than one surface,
+            # which is exactly the bias the loss exists to remove.
+            'rend_depth_median': render_depth_median,
+            'rend_depth_expected': render_depth_expected,
+            'rend_depth_unbiased': render_depth_unbiased,
     })
 
     return rets

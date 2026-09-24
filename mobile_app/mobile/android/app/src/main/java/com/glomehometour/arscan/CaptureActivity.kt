@@ -47,7 +47,7 @@ import kotlin.math.sqrt
  * the render thread to pick up on its next tracked frame -- a click handler has no pose, and
  * starting a session needs one.
  */
-class MainActivity : AppCompatActivity() {
+class CaptureActivity : AppCompatActivity() {
 
     private enum class State { IDLE, PREFLIGHT, SCANNING, DONE }
 
@@ -224,8 +224,20 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateCompassHeading() {
         if (!SensorManager.getRotationMatrix(compassRotationMatrix, null, gravityVec, magneticVec)) return
-        SensorManager.getOrientation(compassRotationMatrix, compassOrientation)
-        val deg = Math.toDegrees(compassOrientation[0].toDouble()).toFloat()
+        // The camera optical axis is -Z in device coordinates (pointing out the back of the phone).
+        // Row 2 of compassRotationMatrix (R[6], R[7], R[8]) represents the device +Z axis (screen normal)
+        // in world coordinates [East, North, Up].
+        // Therefore, the camera optical axis in world coordinates is -[R[6], R[7], R[8]]:
+        // - East component = -R[6]
+        // - North component = -R[7]
+        // Standard Android SensorManager.getOrientation() tracks the top of the phone (+Y device axis).
+        // When holding the phone nearly vertical (~90 deg), slight tilts (>90 deg vs <90 deg) cause the top of the phone
+        // to flip between tilting forward and backward, producing a 180 deg compass jump (gimbal flip).
+        // By deriving heading directly from the camera optical axis (-Z), the horizontal azimuth is continuous,
+        // stable, and correctly reflects the camera line of sight regardless of vertical tilt.
+        val camEast = -compassRotationMatrix[6]
+        val camNorth = -compassRotationMatrix[7]
+        val deg = Math.toDegrees(kotlin.math.atan2(camEast.toDouble(), camNorth.toDouble())).toFloat()
         compassHeadingDeg = (deg + 360f) % 360f
     }
 
@@ -238,6 +250,13 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var lastVerdict = PhotometricGate.Verdict.OK
     @Volatile private var finishedPath: String? = null
+
+    /** Which property/room this capture belongs to, supplied by PropertyDetailActivity. Null
+     * when the capture screen was opened without one -- the scan is still written normally and
+     * shows up under "Unassigned" in the gallery, it just isn't indexed against a property. */
+    private var propertyId: String? = null
+    private var roomLabel: String? = null
+    private val propertyStore by lazy { PropertyStore(this) }
 
     // Milestone haptic flags to give physical tactile feedback on landmark targets
     private var hapticMilestone200 = false
@@ -302,6 +321,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Operator-set capture thresholds, if any (SettingsActivity); defaults otherwise.
+        Tunables.load(this)
+        propertyId = intent.getStringExtra(PropertyStore.EXTRA_PROPERTY_ID)
+        roomLabel = intent.getStringExtra(PropertyStore.EXTRA_ROOM_LABEL)
         installCameraRaceGuard()
         setContentView(R.layout.activity_main)
         root = findViewById(R.id.root)
@@ -703,6 +726,18 @@ class MainActivity : AppCompatActivity() {
         ) { path ->
             finishedPath = path
             android.util.Log.i(TAG, "dataset written to $path")
+            // Index the finished zip against its property only once the write actually landed,
+            // so a row can never point at a zip that isn't there (see the 2026-09-18
+            // save-completion race).
+            val id = propertyId
+            if (id != null) {
+                propertyStore.recordRoomScan(
+                    propertyId = id,
+                    label = roomLabel ?: "Room",
+                    sessionName = w.sessionName,
+                    coveragePercent = (stats?.coverage ?: 0f) * 100f,
+                )
+            }
         }
         state = State.DONE
         renderer?.guidanceTarget = null
@@ -1096,7 +1131,7 @@ class MainActivity : AppCompatActivity() {
         val r = renderer
         val stats = worker?.stats
         val coverage = stats?.coverage ?: 0f
-        val complete = coverage >= COMPLETION_FRACTION
+        val complete = coverage >= Tunables.coverageCompleteFraction
         // CLAUDE.md's enforced entry-door loop closure: the only hard requirement to finish.
         // Coverage stays advisory (see the Pending.FINISH comment in applyPending).
         val distanceToStart = distance(translation, startPosition)
@@ -1540,7 +1575,7 @@ class MainActivity : AppCompatActivity() {
 
         /** README §4/§5 decimation: true on the Nth gate-passed frame, 1-indexed so the very
          * first frame of a session isn't always kept regardless of stride. */
-        fun isDecimationKeyframe(gatePassedCounter: Long, stride: Long = DECIMATION_STRIDE): Boolean =
+        fun isDecimationKeyframe(gatePassedCounter: Long, stride: Long = Tunables.decimationStride): Boolean =
             gatePassedCounter % stride == 0L
 
         /** README §6 step 3: downward tilt of the camera's forward vector, degrees, positive is

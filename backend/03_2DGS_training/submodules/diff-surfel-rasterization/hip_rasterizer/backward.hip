@@ -210,7 +210,9 @@ renderCUDA(
 	float dL_daccum;
 	float dL_dnormal2D[3];
 	const int median_contributor = inside ? n_contrib[pix_id + H * W] : 0;
+	const int unbiased_contributor = inside ? n_contrib[pix_id + 2 * H * W] : 0;
 	float dL_dmedian_depth;
+	float dL_dunbiased_depth = 0.0f;
 	float dL_dmax_dweight;
 
 	if (inside) {
@@ -221,6 +223,7 @@ renderCUDA(
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
 
 		dL_dmedian_depth = dL_depths[MIDDEPTH_OFFSET * H * W + pix_id];
+		dL_dunbiased_depth = dL_depths[UNBIASED_OFFSET * H * W + pix_id];
 		// dL_dmax_dweight = dL_depths[MEDIAN_WEIGHT_OFFSET * H * W + pix_id];
 	}
 
@@ -273,13 +276,27 @@ renderCUDA(
 		block.sync();
 
 		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		// Per-splat parallel accumulation (Taming 3DGS): every lane of the wavefront is on
+		// the same j, i.e. the same splat, so each of the 17 atomics below had 32 lanes
+		// serialising on one address. Accumulate per lane, then reduce once per wavefront.
+		// Lanes with nothing to contribute still have to reach the reduction, so the
+		// early-outs break out of a do{}while(0) rather than skipping the iteration.
+		// The body is deliberately left un-reindented to keep the diff readable.
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
 		{
+			float g_color[C] = { 0 };
+			float g_normal[3] = { 0 };
+			float g_T[9] = { 0 };
+			float2 g_m2 = { 0.0f, 0.0f };
+			float g_opa = 0.0f;
+			do {
+			if (done)
+				break;
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
 			contributor--;
 			if (contributor >= last_contributor)
-				continue;
+				break;
 
 			// compute ray-splat intersection as before
 			// Fisrt compute two homogeneous planes, See Eq. (8)
@@ -290,7 +307,7 @@ renderCUDA(
 			float3 k = pix.x * Tw - Tu;
 			float3 l = pix.y * Tw - Tv;
 			float3 p = cross(k, l);
-			if (p.z == 0.0) continue;
+			if (p.z == 0.0) break;
 			float2 s = {p.x / p.z, p.y / p.z};
 			float rho3d = (s.x * s.x + s.y * s.y); 
 			float2 d = {xy.x - pixf.x, xy.y - pixf.y};
@@ -301,7 +318,7 @@ renderCUDA(
 			float c_d = (s.x * Tw.x + s.y * Tw.y) + Tw.z; // Tw * [u,v,1]
 			// if a point is too small, its depth is not reliable?
 			// c_d = (rho3d <= rho2d) ? c_d : Tw.z; 
-			if (c_d < near_n) continue;
+			if (c_d < near_n) break;
 			
 			float4 nor_o = collected_normal_opacity[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
@@ -311,12 +328,12 @@ renderCUDA(
 
 			float power = -0.5f * rho;
 			if (power > 0.0f)
-				continue;
+				break;
 
 			const float G = exp(power);
 			const float alpha = min(0.99f, opa * G);
 			if (alpha < 1.0f / 255.0f)
-				continue;
+				break;
 
 			T = T / (1.f - alpha);
 			const float dchannel_dcolor = alpha * T;
@@ -338,7 +355,7 @@ renderCUDA(
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				g_color[ch] = dchannel_dcolor * dL_dchannel;
 			}
 
 			float dL_dz = 0.0f;
@@ -349,6 +366,10 @@ renderCUDA(
 			if (contributor == median_contributor-1) {
 				dL_dz += dL_dmedian_depth;
 				// dL_dweight += dL_dmax_dweight;
+			}
+			// Unbiased depth (Eq. 9): hard selection, same treatment as the median depth above.
+			if (contributor == unbiased_contributor-1) {
+				dL_dz += dL_dunbiased_depth;
 			}
 #if DETACH_WEIGHT 
 			// if not detached weight, sometimes 
@@ -376,7 +397,7 @@ renderCUDA(
 				accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
 				last_normal[ch] = normal[ch];
 				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+				g_normal[ch] = alpha * T * dL_dnormal2D[ch];
 			}
 #endif
 
@@ -420,29 +441,41 @@ renderCUDA(
 
 
 				// Update gradients w.r.t. 3D covariance (3x3 matrix)
-				atomicAdd(&dL_dtransMat[global_id * 9 + 0],  dL_dTu.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 1],  dL_dTu.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 2],  dL_dTu.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 3],  dL_dTv.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 4],  dL_dTv.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 5],  dL_dTv.z);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  dL_dTw.x);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  dL_dTw.y);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dTw.z);
+				g_T[0] = dL_dTu.x;
+				g_T[1] = dL_dTu.y;
+				g_T[2] = dL_dTu.z;
+				g_T[3] = dL_dTv.x;
+				g_T[4] = dL_dTv.y;
+				g_T[5] = dL_dTv.z;
+				g_T[6] = dL_dTw.x;
+				g_T[7] = dL_dTw.y;
+				g_T[8] = dL_dTw.z;
 			} else {
 				// // Update gradients w.r.t. center of Gaussian 2D mean position
 				const float dG_ddelx = -G * FilterInvSquare * d.x;
 				const float dG_ddely = -G * FilterInvSquare * d.y;
-				atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx); // not scaled
-				atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely); // not scaled
+				g_m2.x = dL_dG * dG_ddelx; // not scaled
+				g_m2.y = dL_dG * dG_ddely; // not scaled
 				// // Propagate the gradients of depth
-				atomicAdd(&dL_dtransMat[global_id * 9 + 6],  s.x * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 7],  s.y * dL_dz);
-				atomicAdd(&dL_dtransMat[global_id * 9 + 8],  dL_dz);
+				g_T[6] = s.x * dL_dz;
+				g_T[7] = s.y * dL_dz;
+				g_T[8] = dL_dz;
 			}
 
 			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			g_opa = G * dL_dalpha;
+			} while (0);
+
+			const int gid = collected_id[j];
+			for (int ch = 0; ch < C; ch++)
+				waveAtomicAdd(&dL_dcolors[gid * C + ch], g_color[ch]);
+			for (int ch = 0; ch < 3; ch++)
+				waveAtomicAdd(&dL_dnormal3D[gid * 3 + ch], g_normal[ch]);
+			for (int e = 0; e < 9; e++)
+				waveAtomicAdd(&dL_dtransMat[gid * 9 + e], g_T[e]);
+			waveAtomicAdd(&dL_dmean2D[gid].x, g_m2.x);
+			waveAtomicAdd(&dL_dmean2D[gid].y, g_m2.y);
+			waveAtomicAdd(&dL_dopacity[gid], g_opa);
 		}
 	}
 }

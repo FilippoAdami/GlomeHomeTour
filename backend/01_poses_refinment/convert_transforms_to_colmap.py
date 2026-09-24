@@ -16,6 +16,14 @@
 
 import os
 import sys
+from pathlib import Path
+
+_backend_dir = Path(__file__).resolve().parents[1]
+if str(_backend_dir) not in sys.path:
+    sys.path.insert(0, str(_backend_dir))
+from Utilities.pipeline_paths import bootstrap, subprocess_env
+bootstrap()
+
 import json
 import shutil
 import sqlite3
@@ -39,12 +47,16 @@ OPENGL_TO_OPENCV = np.diag([1.0, -1.0, -1.0, 1.0])
 MAX_NUM_IMAGES = 2147483647
 
 
+
 def run(cmd):
+    if cmd and cmd[0] == "colmap" and os.path.exists("/usr/local/bin/colmap"):
+        cmd = ["/usr/local/bin/colmap"] + cmd[1:]
     print("+ " + " ".join(cmd))
     # ponytail: COLMAP's SiftGPU needs an offscreen GL context; under a Wayland
     # session Qt's native backend fails to create one, so force xcb. Harmless
     # (a no-op) under X11.
-    env = {**os.environ, "QT_QPA_PLATFORM": "xcb"}
+    display = os.environ.get("DISPLAY") or ":1"
+    env = subprocess_env({"QT_QPA_PLATFORM": "xcb", "DISPLAY": display})
     subprocess.run(cmd, check=True, env=env)
 
 

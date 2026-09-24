@@ -124,6 +124,7 @@ class SurfelCloud:
         try:
             import torch
             if torch.cuda.is_available() and n_pts > 500:
+                torch.cuda.empty_cache()
                 device = torch.device("cuda")
                 pos_t = torch.from_numpy(self.positions).to(device)
                 norm_t = torch.from_numpy(self.normals).to(device)
@@ -697,6 +698,7 @@ def filter_multiview_consistency(
     keyframes: Sequence[Keyframe],
     depth_maps: Sequence[np.ndarray],
     intrinsics: CameraIntrinsics,
+    normals_world: Optional[np.ndarray] = None,
     max_neighbors: int = 6,
     min_consensus: int = 1,
     enable_freespace_filter: bool = True,
@@ -714,6 +716,7 @@ def filter_multiview_consistency(
        point reprojects into an unobstructed adjacent view with sufficient parallax and
        lands on empty space (proj_z < obs_depth - margin), it represents a floating phantom
        or depth-bleed artifact and is culled when violations exceed max_freespace_violations.
+       For oblique/grazing surfaces (ceilings, sloped roofs, beams), margin is adaptively scaled.
     """
     n_pts = len(pts_world)
     if n_pts == 0 or len(keyframes) <= 1:
@@ -798,26 +801,49 @@ def filter_multiview_consistency(
             vec_other = pts_world - t_cw
             norm_cur = np.maximum(np.linalg.norm(vec_cur, axis=-1, keepdims=True), 1e-6)
             norm_other = np.maximum(np.linalg.norm(vec_other, axis=-1, keepdims=True), 1e-6)
-            cos_parallax = np.sum((vec_cur / norm_cur) * (vec_other / norm_other), axis=-1)
+            unit_other = vec_other / norm_other
+            cos_parallax = np.sum((vec_cur / norm_cur) * unit_other, axis=-1)
 
             has_parallax = (baseline >= min_neighbor_baseline_m) | (cos_parallax <= cos_max_parallax)
 
-            tol_free = freespace_margin_m + 0.05 * proj_z
+            # Grazing angle adaptive scaling: oblique rays (sloped roofs, beams, ceilings) have higher depth uncertainty
+            if normals_world is not None and len(normals_world) == n_pts:
+                cos_grazing = np.abs(np.sum(normals_world * unit_other, axis=-1))
+                tol_scale = np.clip(1.0 / np.maximum(cos_grazing, 0.35), 1.0, 2.5)
+            else:
+                tol_scale = 1.0
+
+            tol_free = (freespace_margin_m + 0.05 * proj_z) * tol_scale
             empty_space = valid_obs & has_parallax & (proj_z < (obs_depth - tol_free))
             freespace_violations += empty_space.astype(np.int32)
 
-    # 1. Consensus rule: If observed by other views, require at least min_consensus matches.
-    # Uniquely seen points (views_in_frustum == 0) are kept -- no distance cap. A point no
-    # other camera can see is not evidence of anything except a surface only this view covers,
-    # and culling the far ones just eats the far wall of a large room.
-    if min_consensus > 0:
-        valid_mask = (views_in_frustum == 0) | (consensus_count >= min_consensus)
+    # 1. Regional coherence check: reject isolated atomic outliers.
+    # A valid surface point must belong to a small coherent regional patch (at least 4 neighbors within 6cm).
+    if n_pts >= 10:
+        tree = KDTree(pts_world)
+        # query_ball_point with count
+        neighbor_counts = np.array([len(tree.query_ball_point(p, r=0.06)) for p in pts_world], dtype=np.int32)
+        coherent_region_mask = neighbor_counts >= 4
     else:
-        valid_mask = np.ones(n_pts, dtype=bool)
+        coherent_region_mask = np.ones(n_pts, dtype=bool)
 
-    # 2. Free-space rule: Cull points that violate free space in unobstructed side views
+    # 2. Three-way Multi-View Logic:
+    # - Confirmed: Another picture looks at this area and confirms a surface exists (consensus_count >= min_consensus). -> KEEP
+    # - Contradicted: Another picture looks through this area to a surface behind it (freespace_violations > max_violations). -> CARVE / REJECT
+    # - Neutral: No other picture looks at this area (views_in_frustum == 0) or no other picture confirms nor contradicts.
+    #   -> Trust the single-view prediction, provided it belongs to a coherent regional patch.
+    if min_consensus > 0:
+        # Confirmed by other view(s) OR uncontradicted single-view regional surface
+        valid_mask = (consensus_count >= min_consensus) | ((views_in_frustum == 0) & coherent_region_mask)
+    else:
+        valid_mask = coherent_region_mask
+
+    # 3. Free-space rule: Cull points that violate free space in unobstructed side views (contradicted)
     if enable_freespace_filter:
         valid_mask = valid_mask & (freespace_violations <= max_freespace_violations)
+
+    # Atomic outliers that are not confirmed by any other view are dropped
+    valid_mask = valid_mask & (coherent_region_mask | (consensus_count >= 1))
 
     return valid_mask
 
@@ -1264,6 +1290,7 @@ class SurfelCloudInitializer:
                     keyframes,
                     depth_maps,
                     intrinsics,
+                    normals_world=n_world,
                     min_consensus=self.min_consensus,
                     enable_freespace_filter=self.enable_freespace_filter,
                     max_freespace_violations=self.max_freespace_violations,

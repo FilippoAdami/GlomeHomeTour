@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -114,7 +115,63 @@ def footprint_area_m2(points_aligned: np.ndarray, up_axis: int = 1,
     return float(hull.area)
 
 
-def scene_extent(sparse_dir: Path, up_axis: int = 1) -> dict:
+def estimate_north_heading_deg(sparse_dir: Path, transforms_path: Path | None = None) -> float | None:
+    """Estimate the angle of Magnetic North in degrees [0, 360) clockwise from +Y_plot (-Z_world).
+
+    Returns None if no valid compass_heading_deg entries are found.
+    """
+    if transforms_path is None or not transforms_path.exists():
+        workspace = sparse_dir.parents[1] if len(sparse_dir.parents) >= 2 else sparse_dir.parent
+        candidates = [
+            workspace / "00_ingestion" / "transforms.json",
+            workspace / "transforms.json",
+            sparse_dir.parent / "transforms.json",
+        ]
+        for c in candidates:
+            if c.exists():
+                transforms_path = c
+                break
+
+    if transforms_path is None or not transforms_path.exists():
+        return None
+
+    try:
+        data = json.loads(transforms_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    diffs = []
+    for f in data.get("frames", []):
+        compass_deg = f.get("compass_heading_deg")
+        if compass_deg is None:
+            continue
+        try:
+            mat = np.array(f["transform_matrix"], dtype=np.float64)
+            # Look direction is -Z in camera coordinates: R @ [0, 0, -1].T = [-R02, -R12, -R22]
+            # Horizontal forward vector in (X, Z) is (-R02, -R22).
+            # In (X, -Z) top-down plot coordinates, (v_x, v_y_plot) is (-R02, R22).
+            vx = -mat[0, 2]
+            vy_plot = mat[2, 2]
+            cam_yaw_deg = float(np.degrees(np.arctan2(vx, vy_plot))) % 360.0
+
+            # Delta is the angle of Magnetic North in (X, -Z) top-down coordinates
+            delta = (cam_yaw_deg - float(compass_deg)) % 360.0
+            diffs.append(delta)
+        except Exception:
+            continue
+
+    if not diffs:
+        return None
+
+    # Circular mean across frames
+    rads = np.radians(diffs)
+    c = float(np.mean(np.cos(rads)))
+    s = float(np.mean(np.sin(rads)))
+    north_deg = float(np.degrees(np.arctan2(s, c))) % 360.0
+    return north_deg
+
+
+def scene_extent(sparse_dir: Path, up_axis: int = 1, transforms_path: Path | None = None) -> dict:
     cloud = fetchPly(str(sparse_dir / "points3D.ply"))
     cameras = read_extrinsics_text(str(sparse_dir / "images.txt"))
     centers = np.array([-e.qvec2rotmat().T @ e.tvec for e in cameras.values()])
@@ -122,7 +179,15 @@ def scene_extent(sparse_dir: Path, up_axis: int = 1) -> dict:
     lo, hi = np.percentile(cloud.points, PCT_LO, axis=0), np.percentile(cloud.points, PCT_HI, axis=0)
     trimmed = cloud.points[np.all((cloud.points >= lo) & (cloud.points <= hi), axis=1)]
 
-    align_deg = horizontal_align_deg(trimmed, up_axis)
+    north_deg = estimate_north_heading_deg(sparse_dir, transforms_path)
+    if north_deg is not None:
+        # Align scene so +X is North (which is 90 deg clockwise from +Y_plot)
+        align_deg = float((90.0 - north_deg) % 360.0)
+        alignment_mode = "compass"
+    else:
+        align_deg = horizontal_align_deg(trimmed, up_axis)
+        alignment_mode = "wall"
+
     points_aligned = rotate_horizontal(cloud.points, align_deg, up_axis)
     trimmed_aligned = rotate_horizontal(trimmed, align_deg, up_axis)
     centers_aligned = rotate_horizontal(centers, align_deg, up_axis)
@@ -142,9 +207,9 @@ def scene_extent(sparse_dir: Path, up_axis: int = 1) -> dict:
         "point_cloud": extent_from_points(cloud.points),
         "camera_path": extent_from_points(centers),
         "aligned": {
-            # Dominant wall-edge orientation about up_axis, mod 90 deg -- see
-            # horizontal_align_deg(); not true wall orientation, just close to it.
-            "rotation_deg_about_up_axis": align_deg,
+            "alignment_mode": alignment_mode,
+            "north_heading_deg": round(north_deg, 2) if north_deg is not None else None,
+            "rotation_deg_about_up_axis": round(align_deg, 2),
             "up_axis": up_axis,
             "point_cloud": aligned_point_cloud_extent,
             "camera_path": extent_from_points(centers_aligned),
@@ -158,22 +223,63 @@ def scene_extent(sparse_dir: Path, up_axis: int = 1) -> dict:
     }
 
 
-def write_scene_size_txt(workspace: Path, extent: dict, floors: int = 1) -> Path:
-    """``x``/``z`` from the wall-aligned footprint, ``y`` is height -- world Y
-    is gravity-locked by ARCore at session start regardless of portrait/
-    landscape capture, and horizontal alignment never touches it."""
-    x, y, z = extent["aligned"]["point_cloud"]["size_m"]
-    area = extent["aligned"]["footprint_area_m2"]
+def write_scene_size_txt(workspace: Path, extent: dict[str, Any], floors: int = 1) -> Path:
+    """Write scene spatial dimensions, per-floor breakdowns, and total floor area to scene_size.txt.
+
+    ``x``/``z`` are horizontal axes, ``y`` is gravity-locked vertical height.
+    Writes each floor's x_span, avg_y, z_span, and floor_area, followed by total_floor_area.
+    """
     out_path = workspace / "scene_size.txt"
-    # Preserve existing floor count if already present
-    if out_path.exists():
+
+    # Extract global dimensions if present in the extent dict
+    if "aligned" in extent and "point_cloud" in extent["aligned"]:
+        x, y, z = extent["aligned"]["point_cloud"]["size_m"]
+    else:
+        x = extent.get("room_dim_x", extent.get("camera_span_x", 0.0))
+        y = extent.get("height_m", 0.0)
+        z = extent.get("room_dim_z", extent.get("camera_span_z", 0.0))
+
+    # Retrieve per-floor breakdown and total area
+    floors_details: list[dict[str, float]] = extent.get("floors_details", [])
+    total_floor_area: float = extent.get(
+        "total_floor_area",
+        extent.get("floor_area_m2", extent.get("aligned", {}).get("footprint_area_m2", 0.0)),
+    )
+
+    # Determine floor count: prefer explicit floors_details length, then extent dict, then fallback
+    floor_count = len(floors_details) if floors_details else extent.get("floors", floors)
+
+    # Preserve existing floor count from disk if not resolved above
+    if not floors_details and out_path.exists():
         for line in out_path.read_text().splitlines():
             if line.startswith("floors:"):
                 try:
-                    floors = int(float(line.split(":", 1)[1].strip()))
+                    floor_count = int(float(line.split(":", 1)[1].strip()))
                 except ValueError:
                     pass
-    out_path.write_text(f"x: {x:.3f}\ny: {y:.3f}\nz: {z:.3f}\narea_m2: {area:.3f}\nfloors: {floors}\n")
+
+    # Build structured text output
+    lines = [
+        f"x: {x:.3f}",
+        f"y: {y:.3f}",
+        f"z: {z:.3f}",
+        f"floors: {floor_count}",
+    ]
+
+    # Write itemized per-floor metrics
+    for idx, f_info in enumerate(floors_details):
+        f_idx = f_info.get("floor_index", idx)
+        lines.append(f"floor_{f_idx}_x_span: {f_info['x_span']:.3f}")
+        lines.append(f"floor_{f_idx}_avg_y: {f_info['avg_y']:.3f}")
+        lines.append(f"floor_{f_idx}_z_span: {f_info['z_span']:.3f}")
+        lines.append(f"floor_{f_idx}_area_m2: {f_info['floor_area']:.3f}")
+
+    # Terminate with the cumulative total area
+    lines.append(f"total_floor_area_m2: {total_floor_area:.3f}")
+    if "aligned" in extent and extent["aligned"].get("north_heading_deg") is not None:
+        lines.append(f"north_heading_deg: {extent['aligned']['north_heading_deg']:.2f}")
+
+    out_path.write_text("\n".join(lines) + "\n")
     return out_path
 
 
@@ -256,13 +362,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
+    parser.add_argument("--transforms", default=None, help="Optional explicit path to transforms.json")
     args = parser.parse_args(argv)
 
     workspace = Path(args.workspace)
     stage_dir = workspace / STAGE_DIRNAME
     stage_dir.mkdir(parents=True, exist_ok=True)
     sparse_dir = workspace / "sparse" / "0"
-    result = scene_extent(sparse_dir)
+    if not (sparse_dir / "points3D.ply").exists():
+        for alt in ["sparse_full", "sparse_large", "sparse_medium", "sparse_lite"]:
+            if (workspace / alt / "0" / "points3D.ply").exists():
+                sparse_dir = workspace / alt / "0"
+                break
+    transforms_path = Path(args.transforms) if args.transforms else None
+    result = scene_extent(sparse_dir, transforms_path=transforms_path)
     out_path = stage_dir / "scene_extent.json"
     out_path.write_text(json.dumps(result, indent=2))
     size_path = write_scene_size_txt(stage_dir, result)
@@ -271,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[scene_extent] raw room footprint (points, {PCT_LO}-{PCT_HI} pct): "
          f"{size[0]:.2f} x {size[1]:.2f} x {size[2]:.2f} m")
     aligned_size = result["aligned"]["point_cloud"]["size_m"]
-    print(f"[scene_extent] wall-aligned footprint ({result['aligned']['rotation_deg_about_up_axis']:.1f} deg "
+    mode = result["aligned"].get("alignment_mode", "wall")
+    print(f"[scene_extent] {mode}-aligned footprint ({result['aligned']['rotation_deg_about_up_axis']:.1f} deg "
          f"about up axis {result['aligned']['up_axis']}): "
          f"{aligned_size[0]:.2f} x {aligned_size[1]:.2f} x {aligned_size[2]:.2f} m")
     print(f"[scene_extent] concave-hull footprint area: {result['aligned']['footprint_area_m2']:.2f} m^2 "

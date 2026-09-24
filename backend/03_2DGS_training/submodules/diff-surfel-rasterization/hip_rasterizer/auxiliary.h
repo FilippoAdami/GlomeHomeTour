@@ -27,6 +27,11 @@
 #define MIDDEPTH_OFFSET 5
 #define DISTORTION_OFFSET 6
 // #define MEDIAN_WEIGHT_OFFSET 7
+// Unbiased Depth for 2DGS (arXiv 2503.06587) Eq. (9): the surface is the first splat
+// whose accumulated O_i = sum_j (alpha_j + eps) * G_j exceeds the threshold.
+#define UNBIASED_OFFSET 7
+#define UNBIASED_O_THRESH 0.6f
+#define UNBIASED_EPS 0.1f
 
 // distortion helper macros
 #define BACKFACE_CULL 1
@@ -63,6 +68,19 @@ __device__ const float SH_C3[] = {
 __forceinline__ __device__ float ndc2Pix(float v, int S)
 {
 	return ((v + 1.0) * S - 1.0) * 0.5;
+}
+
+// Per-splat parallel accumulation (Taming 3DGS): in the backward pass every lane of a
+// wavefront is working on the same splat, so a per-lane atomicAdd has all 32 lanes
+// serialising on one address. Reduce across the wavefront first and let one lane do the
+// atomic. Every lane of the wavefront must reach this call with its own contribution --
+// zero if it has none -- because __shfl_down reads from lanes that have to be active.
+__forceinline__ __device__ void waveAtomicAdd(float* addr, float v)
+{
+	for (int off = warpSize / 2; off > 0; off >>= 1)
+		v += __shfl_down(v, off);
+	if (v != 0.0f && (threadIdx.x + threadIdx.y * blockDim.x) % warpSize == 0)
+		atomicAdd(addr, v);
 }
 
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)

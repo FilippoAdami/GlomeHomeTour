@@ -60,6 +60,7 @@ from depth_priors import (
     guided_filter_depth,
 )
 from initialization import SurfelCloudInitializer
+from regularize_planes import planes_of, diagnose_planes_quads
 from tsdf_fusion import TSDFVolume
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
@@ -79,7 +80,8 @@ TARGET_SURFELS = MAX_SURFELS = 450_000
 
 # Boundary-floater filters (tuned hole-safe thresholds)
 MAX_DEPTH_GRADIENT = 0.15
-MAX_GRAZING_ANGLE_DEG = 82.0
+MAX_GRAZING_ANGLE_DEG = 89.5  # Hole-safe threshold: eliminates degenerate parallel rays without clipping oblique ceilings/floors (83-88 deg)
+
 
 # A window prediction still off by more than this after its scale/shift fit to the COLMAP
 # tracks is not a scale error but a wrong surface, and gets dropped instead of blended.
@@ -496,7 +498,6 @@ def run_tsdf_substep(
         intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
         im_list = sorted(extr.values(), key=lambda im: im.name)
         step = max(1, len(im_list) // 8)
-        rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
         for im in im_list[::step][:8]:
             cam = intr[im.camera_id]
             fx, fy, cx, cy = colmap_intrinsics(cam)
@@ -549,6 +550,7 @@ def run_surfels_substep(
     ctx: StepContext,
     voxel_downsample_m: float = VOXEL_DOWNSAMPLE_M,
     min_consensus: int = 1,
+    max_grazing_angle_deg: float = MAX_GRAZING_ANGLE_DEG,
     enable_sor: bool = True,
     sor_k: int = 20,
     sor_std_mul: float = 2.8,
@@ -557,7 +559,7 @@ def run_surfels_substep(
     enable_freespace_filter: bool = True,
     max_freespace_violations: int = 2,
     freespace_margin_m: float = 0.08,
-    enable_tube_collapse: bool = True,
+    enable_tube_collapse: bool = False,
     tube_radius_m: float = 0.02,
     tube_length_m: float = 0.15,
     tube_min_normal_cos: float = 0.75,
@@ -565,6 +567,9 @@ def run_surfels_substep(
     enable_hybrid_sampling: bool = True,
     hybrid_energy_threshold: float = 0.08,
     hybrid_coarse_stride: int = 3,
+    enable_plane_diagnostics: bool = True,
+    enable_plane_regularization: bool = True,
+    plane_fill_spacing: float = 0.02,
 ) -> None:
     """Substep 4b: Standard unprojection surfel initializer with geometric filtering."""
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
@@ -596,11 +601,12 @@ def run_surfels_substep(
     dropped_drift = []
     dropped_align = []
     for i, n in enumerate(pose_names):
-        if n in unreliable:
+        c2w_c = c2w_gl[i]
+        is_upward = -c2w_c[1, 2] > np.sin(np.radians(2.0))
+        if n in unreliable and not is_upward:
             dropped_align.append(n)
             continue
         if n in by_name_arcore:
-            c2w_c = c2w_gl[i]
             c2w_a = by_name_arcore[n]
             r_diff = c2w_c[:3, :3].T @ c2w_a[:3, :3]
             trace_val = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
@@ -636,7 +642,7 @@ def run_surfels_substep(
             max_surfels=MAX_SURFELS,
             min_consensus=min_consensus,
             max_depth_gradient=MAX_DEPTH_GRADIENT,
-            max_grazing_angle_deg=MAX_GRAZING_ANGLE_DEG,
+            max_grazing_angle_deg=max_grazing_angle_deg,
             enable_sor=enable_sor,
             sor_k=sor_k,
             sor_std_mul=sor_std_mul,
@@ -669,12 +675,65 @@ def run_surfels_substep(
     depth_ply_path = depth_dir / "points3D_depth.ply"
     cloud.to_ply(depth_ply_path)
 
+    # Planar Regularization: Snap Manhattan walls and horizontal floors/ceilings,
+    # and re-sample planar surfaces into equidistant lattices with harmonized colors
+    reg_report = None
+    if enable_plane_regularization:
+        try:
+            from regularize_planes import regularize, default_args
+            reg_args = default_args(
+                min_bbox_area=3.8,
+                fill=plane_fill_spacing,
+                fill_cell=0.08,
+                fill_close=1,
+                fill_max_hole=1.5,
+                no_storeys=True,
+            )
+            reg_report = regularize(depth_ply_path, depth_ply_path, reg_args)
+            ctx.note(
+                f"Plane Regularization applied: {len(reg_report['groups'])} groups, "
+                f"{len(reg_report.get('fill', []))} surfaces regularized into {plane_fill_spacing*100:.1f}cm lattices. "
+                f"Output: {depth_ply_path}"
+            )
+        except Exception as e:
+            ctx.note(f"Plane regularization notice: {e}")
+
+    # Read the final regularized point cloud for downstream stats & previews
+    from plyfile import PlyData
+    ply_final = PlyData.read(str(depth_ply_path))
+    v_data = ply_final["vertex"].data
+    pos = np.stack([v_data["x"], v_data["y"], v_data["z"]], axis=1).astype(np.float64)
+    if "red" in v_data.dtype.names and "green" in v_data.dtype.names and "blue" in v_data.dtype.names:
+        rgb_u8 = np.stack([v_data["red"], v_data["green"], v_data["blue"]], axis=1).astype(np.uint8)
+    else:
+        rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
+    n_surfels = len(pos)
+    mean_scale = float(np.mean(v_data["scale_u"])) if "scale_u" in v_data.dtype.names else float(np.mean(cloud.scales_2d))
+
+    # Diagnostic 4-vertex non-orthogonal plane enclosure analysis (MEQ)
+    plane_report = None
+    if enable_plane_diagnostics:
+        try:
+            from regularize_planes import diagnose_planes_quads
+
+            artifact_dir = Path("/home/monday/.gemini/antigravity/brain/37b923db-4194-4f75-9cfd-025a501bbbcd")
+            plane_report = diagnose_planes_quads(
+                depth_ply_path=depth_ply_path,
+                output_dir=depth_dir,
+                artifact_dir=artifact_dir if artifact_dir.is_dir() else None,
+                min_area=2.0,
+            )
+            ctx.note(
+                f"Plane MEQ diagnostic: extracted {len(plane_report['planes'])} planes with 4-vertex enclosures. "
+                f"Artifact report: {plane_report['report_path']}"
+            )
+        except Exception as e:
+            ctx.note(f"Plane MEQ diagnostic skipped: {e}")
+
     # Compute bounding box and geometry stats
-    pos = cloud.positions
     min_b = np.min(pos, axis=0)
     max_b = np.max(pos, axis=0)
     dims = max_b - min_b
-    mean_scale = float(np.mean(cloud.scales_2d))
 
     preview_dir = depth_dir / "preview"
     preview_dir.mkdir(exist_ok=True)
@@ -685,7 +744,6 @@ def run_surfels_substep(
         intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
         im_list = sorted(extr.values(), key=lambda im: im.name)
         step = max(1, len(im_list) // 8)
-        rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
         for im in im_list[::step][:8]:
             cam = intr[im.camera_id]
             fx, fy, cx, cy = colmap_intrinsics(cam)
@@ -702,7 +760,7 @@ def run_surfels_substep(
         "",
         f"**Workspace:** `{workspace}`  ",
         f"**Output PLY:** [`{depth_ply_path}`](file://{depth_ply_path})  ",
-        f"**Total Surfels:** **`{len(cloud):,}`**  ",
+        f"**Total Surfels:** **`{n_surfels:,}`**  ",
         f"**Bounding Box:** `{dims[0]:.2f}m` (W) × `{dims[1]:.2f}m` (L) × `{dims[2]:.2f}m` (H)  ",
         rf"**Mean Surfel Scale ($\sigma$):** `{mean_scale * 100:.2f} cm`  ",
         "",
@@ -716,12 +774,18 @@ def run_surfels_substep(
         f"- **Cross-View Free-Space Carving:** `{'Enabled' if enable_freespace_filter else 'Disabled'}`",
         f"- **Multi-View Normal Consensus Regularization:** `{'Enabled' if enable_normal_consensus else 'Disabled'}`",
         f"- **Depth Discontinuity Gradient Filter:** `max_grad = {MAX_DEPTH_GRADIENT}`",
+        f"- **Plane Regularization & Snapping:** `{'Enabled' if reg_report else 'Disabled'}`"
+        + (f" ({len(reg_report['groups'])} groups, {len(reg_report.get('fill', []))} lattices resampled at {plane_fill_spacing*100:.1f}cm)" if reg_report else ""),
+        f"- **Plane Non-Orthogonal MEQ Diagnostics:** `{'Enabled' if plane_report else 'Disabled'}`"
+        + (f" ({len(plane_report['planes'])} planes detected with 4-vertex enclosures)" if plane_report else ""),
         f"- **Grazing Angle Filter:** `max_angle = {MAX_GRAZING_ANGLE_DEG}°`",
         "",
         "## Diagnostic Artifacts",
         "",
         f"- **Camera Projections Preview:** [`{preview_dir}`](file://{preview_dir})",
-        f"- **Surfel Binary PLY:** [`{depth_ply_path}`](file://{depth_ply_path})",
+        f"- **Surfel Binary PLY (snapped & regularized):** [`{depth_ply_path}`](file://{depth_ply_path})",
+        f"- **Colored Diagnostic PLY:** [`{depth_dir / 'points3D_depth_planes_colored.ply'}`](file://{depth_dir / 'points3D_depth_planes_colored.ply'})",
+        f"- **Planes Legend:** [`{depth_dir / 'planes_legend.md'}`](file://{depth_dir / 'planes_legend.md'})",
     ]
     summary_file = depth_dir / "surfel_init_summary.md"
     summary_file.write_text("\n".join(surfel_summary_md), encoding="utf-8")
@@ -732,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
-    parser.add_argument("--substep", choices=["all", "depth", "surfels", "tsdf"],
+    parser.add_argument("--substep", choices=["all", "depth", "surfels", "tsdf", "enclosure", "diagnostics"],
                         default="all", help="Substep to run (default 'all')")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
     parser.add_argument("--overlap", type=int, default=OVERLAP)
@@ -755,16 +819,21 @@ def main(argv: list[str] | None = None) -> int:
                         help="Disable cross-view surface normal consensus regularization")
     parser.add_argument("--no-saturation-mask", action="store_true",
                         help="Disable dynamic saturation/bloom masking before unprojection")
+    parser.add_argument("--no-plane-diagnostics", action="store_false",
+                        dest="enable_plane_diagnostics", default=True,
+                        help="Skip diagnostic 4-vertex MEQ plane extraction and visualization")
     parser.add_argument("--no-tube-collapse", action="store_false", dest="enable_tube_collapse",
                         help="Disable normal tube collapse projection")
-    parser.add_argument("--enable-tube-collapse", action="store_true", dest="enable_tube_collapse", default=True,
-                        help="Enable normal tube collapse projection (default: True)")
+    parser.add_argument("--enable-tube-collapse", action="store_true", dest="enable_tube_collapse", default=False,
+                        help="Enable normal tube collapse projection (default: False)")
     parser.add_argument("--tube-radius", type=float, default=0.02,
                         help="Normal tube cylinder radius in meters (default 0.02 = 2cm)")
     parser.add_argument("--tube-length", type=float, default=0.15,
                         help="Normal tube cylinder search length in meters (default 0.15 = 15cm)")
     parser.add_argument("--min-consensus", type=int, default=1,
-                        help="Min consensus views required for surfel corroboration (default 1)")
+                        help="Min consensus views required for surfel corroboration (default 1; multi-view requires consensus, single-view is trusted)")
+    parser.add_argument("--max-grazing-angle", type=float, default=MAX_GRAZING_ANGLE_DEG,
+                        help="Max grazing angle in degrees before culling (default 89.5; hole-safe for ceilings)")
     parser.add_argument("--enable-multiscale-pyramid", action="store_true", default=False,
                         help="Enable multi-scale surfel decimation for planar regions")
     parser.add_argument("--no-multiscale-pyramid", action="store_false", dest="enable_multiscale_pyramid",
@@ -783,6 +852,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="Enable cross-view epipolar/reprojection free-space filter (default: True)")
     parser.add_argument("--max-freespace-violations", type=int, default=2,
                         help="Max allowed free-space violations before culling (default 2)")
+    parser.add_argument("--no-plane-regularization", action="store_false",
+                        dest="enable_plane_regularization", default=True,
+                        help="Disable planar snapping, lattice infill and color harmonization")
+    parser.add_argument("--enable-plane-regularization", action="store_true",
+                        dest="enable_plane_regularization", default=True,
+                        help="Enable planar snapping, lattice infill and color harmonization (default: True)")
+    parser.add_argument("--plane-fill-spacing", type=float, default=0.01,
+                        help="Equidistant point lattice spacing for regularized planar surfaces in meters (default: 0.01 = 1cm)")
     # Legacy flags for compatibility
     parser.add_argument("--only-depth", action="store_true",
                         help="Alias for --substep depth")
@@ -807,6 +884,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     with StepContext("depth", workspace, artifacts_dir=workspace / STAGE_DIRNAME) as ctx:
+        if substep in ("enclosure", "diagnostics"):
+            depth_dir = workspace / STAGE_DIRNAME / "depth"
+            depth_ply_path = depth_dir / "points3D_depth.ply"
+            if not depth_ply_path.exists():
+                raise FileNotFoundError(f"Cannot run enclosure diagnostics: {depth_ply_path} does not exist.")
+            artifact_dir = Path("/home/monday/.gemini/antigravity/brain/37b923db-4194-4f75-9cfd-025a501bbbcd")
+            plane_report = diagnose_planes_quads(
+                depth_ply_path=depth_ply_path,
+                output_dir=depth_dir,
+                artifact_dir=artifact_dir if artifact_dir.is_dir() else None,
+                min_area=2.0,
+                max_vertices=5,
+            )
+            ctx.note(
+                f"Plane polygon enclosure diagnostic: extracted {len(plane_report['planes'])} planes with up to 5-vertex enclosures. "
+                f"Artifact report: {plane_report['report_path']}"
+            )
+            return 0
+
         if substep in ("all", "depth"):
             run_depth_estimation_substep(
                 workspace=workspace,
@@ -830,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
                 ctx=ctx,
                 voxel_downsample_m=VOXEL_DOWNSAMPLE_M,
                 min_consensus=args.min_consensus,
+                max_grazing_angle_deg=args.max_grazing_angle,
                 enable_normal_consensus=not args.no_normal_consensus,
                 enable_saturation_mask=not args.no_saturation_mask,
                 enable_freespace_filter=args.enable_freespace_filter and not args.no_freespace_filter,
@@ -841,6 +938,9 @@ def main(argv: list[str] | None = None) -> int:
                 enable_hybrid_sampling=args.enable_hybrid_sampling,
                 hybrid_energy_threshold=args.hybrid_energy_threshold,
                 hybrid_coarse_stride=args.hybrid_coarse_stride,
+                enable_plane_diagnostics=args.enable_plane_diagnostics,
+                enable_plane_regularization=args.enable_plane_regularization,
+                plane_fill_spacing=args.plane_fill_spacing,
             )
 
     return 0

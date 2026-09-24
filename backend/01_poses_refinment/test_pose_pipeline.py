@@ -266,10 +266,43 @@ def test_sampson_filter():
     print("sampson filter           OK")
 
 
+def test_compass_heading_estimation_and_alignment():
+    from scene_extent import estimate_north_heading_deg, rotate_horizontal
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        frames = []
+        for i in range(5):
+            mat = np.eye(4)
+            mat[:3, 3] = [float(i), 1.5, float(i)]
+            frames.append({
+                "file_path": f"images/f{i}.jpg",
+                "timestamp_ns": 1000 + i,
+                "transform_matrix": mat.tolist(),
+                "compass_heading_deg": 90.0,
+            })
+        tf_path = tmp_path / "transforms.json"
+        tf_path.write_text(json.dumps({"frames": frames}))
+
+        north_deg = estimate_north_heading_deg(tmp_path / "sparse" / "0", transforms_path=tf_path)
+        assert north_deg is not None
+        assert abs(north_deg - 270.0) < 1e-4
+
+        align_deg = (90.0 - north_deg) % 360.0
+        assert abs(align_deg - 180.0) < 1e-4
+
+        # A point along North (x=-1, y=0, z=0) rotates to +X (x=1, y=0, z=0)
+        pt_north = np.array([[-1.0, 0.0, 0.0]])
+        pt_aligned = rotate_horizontal(pt_north, align_deg, up_axis=1)
+        assert np.allclose(pt_aligned, [[1.0, 0.0, 0.0]], atol=1e-5)
+    print("compass heading alignment OK")
+
+
 if __name__ == "__main__":
     test_zoom_grouping()
     test_keyframe_export()
     test_sampson_filter()
+    test_compass_heading_estimation_and_alignment()
     test_pose_prior_roundtrip()
     test_se3_exp()
     test_neighbor_selection()

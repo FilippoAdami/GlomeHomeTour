@@ -203,9 +203,8 @@ standalone script that can be run, inspected and resumed on its own:
 | 0 | extract | `Utilities/step_extract.py` | `images/`, `transforms.json` |
 | 1 | filter_quality | `00_ingestion/step_filter_quality.py` | `discarded/` |
 | 2 | colmap | `01_poses_refinment/step_colmap.py` | `sparse/0/`, `colmap_diagnostics/` |
-| 3 | filter_depth | `02_depth_estimation/step_filter_depth.py` | `depth_discarded_images/`, `depth_discarded_sparse/` |
-| 4 | depth | `02_depth_estimation/step_depth.py` | `depth/depth_maps/`, `depth/points3D_depth.ply` |
-| 5 | train | `03_2DGS_training/step_train.py` | `2dgs/point_cloud/iteration_10000/` |
+| 3 | depth | `02_depth_estimation/step_depth.py` | `02_depth_estimation/depth/depth_maps/`, `depth/points3D_depth.ply` |
+| 4 | train | `03_2DGS_training/step_train.py` | `03_2DGS_training/2dgs/point_cloud/iteration_10000/` |
 
 **Nothing is deleted mid-pipeline.** A frame a step rejects is *moved* into that
 step's own discard folder together with its camera entry, so every discard folder
@@ -213,18 +212,7 @@ is itself a loadable scene and any step can be re-run in isolation. Frame
 basenames are never renumbered — depth maps, COLMAP image names and stats keys
 are all keyed by basename.
 
-One exception, and it is not cosmetic: **step 3 prunes `sparse/0/` in place**, and
-`merge_back()` restores images and `transforms.json` but cannot un-prune a COLMAP
-model. Re-running step 3 with `--force` therefore selects against a model already
-missing the frames it just restored, and emits a scene whose model covers fewer
-cameras than its own `transforms.json` — silently, since step 5 simply trains on
-the smaller set. Step 2 owns `sparse/0/`, so re-running step 3 against a different
-threshold means re-running step 2 first. `filter_depth()` enforces this: it
-refuses to start when `sparse/0/` does not cover every frame in `transforms.json`.
-
-Each step writes `<name>_log.txt`, `<name>_stats.json` and an entry in
-`pipeline_state.json`; a completed step skips on re-run, and the run ends with
-`pipeline_summary.txt`.
+Each step writes `<name>_log.txt`, `<name>_stats.json` and updates `pipeline_stats.json`; a completed step skips on re-run.
 
 ```bash
 --from-step colmap      # start there, skip everything earlier

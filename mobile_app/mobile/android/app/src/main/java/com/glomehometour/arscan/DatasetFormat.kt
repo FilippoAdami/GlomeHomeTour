@@ -148,7 +148,7 @@ object DatasetFormat {
         append("  \"duration_s\": ${f(durationSeconds)},\n")
         append("  \"coverage_fraction\": ${f(coverageFraction)},\n")
         append("  \"voxel_size_m\": ${f(voxelSizeM)},\n")
-        append("  \"parallax_min_deg\": ${f(VoxelGrid.PARALLAX_MIN_DEG)},\n")
+        append("  \"parallax_min_deg\": ${f(Tunables.parallaxMinDeg)},\n")
         append("  \"voxels\": {\"occupied\": $occupiedVoxels, \"parallax_verified\": $verifiedVoxels, ")
         append("\"free\": $freeVoxels, \"occluded\": $occludedVoxels, \"grid_full\": $gridFull},\n")
         append("  \"frames\": {\"seen\": $framesSeen, \"exported\": $framesExported},\n")

@@ -27,6 +27,17 @@ from PIL import Image
 from package_loader import CameraIntrinsics, Keyframe
 from pose_aligner import opengl_to_opencv
 
+_utilities_path = Path(__file__).resolve().parent.parent / "Utilities"
+if str(_utilities_path) not in sys.path:
+    sys.path.insert(0, str(_utilities_path))
+from surface_normals import fit_plane_normals, orient_towards  # noqa: E402
+
+# 2dgs_combined_pipeline.md Stage 0 step 4: "fit plane in small window (about
+# 3-5 px radius)". radius=2 -> 5x5 window.
+SURFACE_NORMAL_PLANE_FIT_RADIUS = 2
+SURFACE_NORMAL_DIST_TOL_ABS_M = 0.03
+SURFACE_NORMAL_DIST_TOL_REL = 0.03
+
 # Patch PyTorch quantile on AMD ROCm to avoid HIP sort_stable CUDAGuard SIGABRT crashes
 if hasattr(torch, "quantile"):
     _orig_torch_quantile = torch.quantile
@@ -121,6 +132,13 @@ class DepthPriorEstimator:
 
     def _init_model(self) -> None:
         """Attempt to load Depth Anything V3 (DA3), fallback to V2 or mock."""
+        if self.model_name == "mock" or self.model_name.lower().startswith("mock"):
+            self._model = None
+            self._da3_model = None
+            self._use_da3 = False
+            self._is_mock = True
+            return
+
         os.environ.setdefault("MPLCONFIGDIR", "/tmp")
         os.environ.setdefault("MIOPEN_USER_DB_PATH", "/tmp/miopen")
         # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here.
@@ -764,6 +782,7 @@ def cross_view_scale_outliers(
     w2c = np.asarray(w2c, dtype=np.float64)
     c2w = np.linalg.inv(w2c)
     centres = c2w[:, :3, 3]
+    optical_axes = c2w[:, :3, 2]  # +Z is viewing direction in OpenCV camera frame
 
     world = []
     for i, d in enumerate(small):
@@ -777,9 +796,12 @@ def cross_view_scale_outliers(
         if len(pts) < min_pixels:
             continue
         dist = np.linalg.norm(centres - centres[i], axis=1)
+        cos_sim = optical_axes @ optical_axes[i]
         per_pair = []
         for j in range(len(world)):
-            if j == i or not (0.05 < dist[j] < max_camera_dist_m):
+            # Optical axis co-visibility: skip cameras looking in divergent directions
+            # (e.g. ground floor looking forward vs mezzanine looking upward).
+            if j == i or not (0.05 < dist[j] < max_camera_dist_m) or cos_sim[j] < 0.35:
                 continue
             pc = pts @ w2c[j][:3, :3].T + w2c[j][:3, 3]
             z = pc[:, 2]
@@ -788,14 +810,18 @@ def cross_view_scale_outliers(
             m = (z > 0.3) & (u >= 0) & (u < w - 1) & (v >= 0) & (v < h - 1)
             if int(m.sum()) < min_pixels:
                 continue
-            obs = small[j][v[m].astype(np.int32), u[m].astype(np.int32)]
-            g = np.isfinite(obs) & (obs > 0.3)
+            v_int = np.clip(np.round(v[m]).astype(int), 0, h - 1)
+            u_int = np.clip(np.round(u[m]).astype(int), 0, w - 1)
+            obs = small[j][v_int, u_int]
+            # Mutual visibility gate: if obs < 0.72 * z, camera j sees a foreground occluder
+            # in front of camera i's surface (e.g. mezzanine floor blocking view of the roof),
+            # so the ray cannot measure scale consensus.
+            g = np.isfinite(obs) & (obs > 0.3) & (obs >= 0.72 * z[m])
             if int(g.sum()) < min_pixels:
                 continue
             r = obs[g] / z[m][g]
-            # Keep scale-like ratios only; the rest is occlusion, where the two cameras
-            # are looking at different surfaces and no ratio is meaningful.
-            r = r[(r > 0.5) & (r < 2.0)]
+            # Keep scale-like ratios only; the rest is occlusion
+            r = r[(r > 0.72) & (r < 1.40)]
             if len(r) < min_pixels:
                 continue
             per_pair.append((float(np.median(r)), len(r)))
@@ -876,6 +902,9 @@ class ChunkTrackAligner:
             if np.any(good):
                 self._tracks[idx] = (np.asarray(img["obs_xy"])[keep][good], z_gt[good])
 
+        self._history_scales: list[float] = []
+        self._history_shifts: list[float] = []
+
     def _sample(self, idx: int, dmap: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray]]:
         tr = self._tracks.get(idx)
         if tr is None:
@@ -896,12 +925,25 @@ class ChunkTrackAligner:
             if s is not None:
                 samples[gi] = s
         if not samples:
-            return list(depths)  # no ground truth in this window -- leave it untouched
+            # Zero ground truth tracks in this window (e.g. looking up at smooth ceiling/roof)
+            # Use sequence's robust median scale & shift from preceding windows so ceiling
+            # is metrically aligned and preserved rather than discarded.
+            def_s = float(np.median(self._history_scales)) if self._history_scales else 1.0
+            def_t = float(np.median(self._history_shifts)) if self._history_shifts else 0.0
+            out_fallback: list[Optional[np.ndarray]] = []
+            for gi, dmap in zip(frame_indices, depths):
+                name = self.names[gi]
+                self.frame_kept[name] += 1
+                self.frame_scale[name] = def_s
+                out_fallback.append((def_s * dmap + def_t).astype(np.float32))
+            return out_fallback
 
         pooled_s, pooled_t, pooled_mad = robust_affine(
             np.concatenate([s[0] for s in samples.values()]),
             np.concatenate([s[1] for s in samples.values()]),
         )
+        self._history_scales.append(pooled_s)
+        self._history_shifts.append(pooled_t)
 
         out: list[Optional[np.ndarray]] = []
         for gi, dmap in zip(frame_indices, depths):
@@ -915,7 +957,7 @@ class ChunkTrackAligner:
             if mad < self.frame_residual_m.get(name, math.inf):
                 self.frame_residual_m[name] = mad
                 self.frame_scale[name] = pooled_s
-            if mad > self.max_residual_m:
+            if mad > self.max_residual_m and sample is not None:
                 out.append(None)
                 continue
             self.frame_kept[name] += 1
@@ -1303,33 +1345,29 @@ def compute_surface_normals(
     y_cam = -(y_grid - cy) * depth_metric / fy
     z_cam = -depth_metric
 
-    p_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)  # (H, W, 3)
+    p_cam = np.stack([x_cam, y_cam, z_cam], axis=-1).astype(np.float32)  # (H, W, 3)
 
-    # Central difference spatial gradients: dP/dx and dP/dy
-    dx = np.zeros_like(p_cam)
-    dy = np.zeros_like(p_cam)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    points = torch.from_numpy(p_cam).to(device)
+    valid = torch.from_numpy(depth_metric > 1e-6).to(device)
+    depth_t = torch.from_numpy(depth_metric.astype(np.float32)).to(device)
 
-    dx[:, 1:-1, :] = (p_cam[:, 2:, :] - p_cam[:, :-2, :]) * 0.5
-    dx[:, 0, :] = p_cam[:, 1, :] - p_cam[:, 0, :]
-    dx[:, -1, :] = p_cam[:, -1, :] - p_cam[:, -2, :]
+    normal, _residual, _count = fit_plane_normals(
+        points, valid,
+        radius=SURFACE_NORMAL_PLANE_FIT_RADIUS,
+        dist_thresh_abs=SURFACE_NORMAL_DIST_TOL_ABS_M,
+        dist_thresh_rel=SURFACE_NORMAL_DIST_TOL_REL,
+        depth=depth_t,
+    )
 
-    dy[1:-1, :, :] = (p_cam[2:, :, :] - p_cam[:-2, :, :]) * 0.5
-    dy[0, :, :] = p_cam[1, :, :] - p_cam[0, :, :]
-    dy[-1, :, :] = p_cam[-1, :, :] - p_cam[-2, :, :]
+    # OpenGL camera convention (+Z out of the screen, camera at origin): the ray
+    # from camera to surface is +z_cam is negative-forward, so p_cam itself is
+    # that ray. Orient toward camera, matching the previous cross-product's
+    # "flip so +Z" convention.
+    ray_dir = torch.nn.functional.normalize(points, dim=-1, eps=1e-8)
+    normal = orient_towards(normal, ray_dir)
 
-    # Cross product: n = dP/dx x dP/dy
-    normals = np.cross(dx, dy)  # (H, W, 3)
-
-    # Normalize vectors
-    norm = np.linalg.norm(normals, axis=-1, keepdims=True)
-    norm = np.maximum(norm, 1e-6)
-    normals = normals / norm
-
-    # Normal orientation: surface normals should point toward camera (+Z in camera frame)
-    flip_mask = normals[..., 2] < 0
-    normals[flip_mask] = -normals[flip_mask]
-
-    return normals.astype(np.float32)
+    return normal.cpu().numpy().astype(np.float32)
 
 
 class GlobalDepthGraphOptimizer:

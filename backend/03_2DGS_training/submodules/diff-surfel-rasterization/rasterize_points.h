@@ -66,3 +66,12 @@ torch::Tensor markVisible(
 		torch::Tensor& means3D,
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
+
+void adamUpdate(
+	torch::Tensor& param,
+	const torch::Tensor& param_grad,
+	torch::Tensor& exp_avg,
+	torch::Tensor& exp_avg_sq,
+	const torch::Tensor& visible,
+	const float lr, const float b1, const float b2, const float eps,
+	const int N, const int M);

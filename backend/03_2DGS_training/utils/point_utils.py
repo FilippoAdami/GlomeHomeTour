@@ -42,7 +42,16 @@ def depth_to_normal(view, depth):
     dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
     dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
     cross_prod = torch.cross(dx, dy, dim=-1)
-    norm = torch.norm(cross_prod, dim=-1, keepdim=True)
-    normal_map = torch.where(norm > 1e-5, cross_prod / norm.clamp_min(1e-5), torch.zeros_like(cross_prod))
+    # The guard has to be relative, not absolute. |dx x dy| scales with the
+    # metric spacing between neighbouring pixels' 3D points, so it shrinks with
+    # the square of the render resolution: at r=2 a wall gives ~1e-4, at native
+    # 1080p the same wall gives ~1e-6. An absolute 1e-5 cut therefore zeroed
+    # 97-99% of surf_normal at exactly the resolution the geometry is finalised
+    # at, which silently reduced the normal-consistency loss to the constant 1
+    # (no gradient). Scale by the edge lengths that produced the cross product.
+    scale = dx.norm(dim=-1, keepdim=True) * dy.norm(dim=-1, keepdim=True)
+    degenerate = torch.norm(cross_prod, dim=-1, keepdim=True) <= 1e-4 * scale
+    normal_map = torch.where(degenerate, torch.zeros_like(cross_prod),
+                             F.normalize(cross_prod, dim=-1, eps=1e-20))
     output[1:-1, 1:-1, :] = normal_map
     return output

@@ -28,7 +28,7 @@ from Utilities.pipeline_paths import bootstrap
 
 bootstrap()
 
-from Utilities.pipeline_step import StepContext, is_done, read_state
+from Utilities.pipeline_step import StepContext, is_done, read_pipeline_stats
 from Utilities.scene_io import load_scene, merge_back, split_scene, write_scene
 
 N_FRAMES = 5
@@ -117,9 +117,9 @@ def test_completed_step_skips_and_failed_step_does_not():
         with StepContext("demo", ws) as ctx:
             ctx.metric("ok", True)
         assert is_done(ws, "demo", [marker]), "completed step did not record itself"
-        assert read_state(ws)["demo"]["status"] == "ok"
+        assert "demo" in read_pipeline_stats(ws)
 
-        # A missing output invalidates the record: the state file alone is not
+        # A missing output invalidates the record: the stats file alone is not
         # enough, or a hand-deleted output would be silently skipped over.
         marker.unlink()
         assert not is_done(ws, "demo", [marker]), "skipped despite a missing output"
@@ -129,7 +129,7 @@ def test_completed_step_skips_and_failed_step_does_not():
                 raise RuntimeError("deliberate")
         except RuntimeError:
             pass
-        assert read_state(ws)["boom"]["status"] != "ok"
+        assert "boom" not in read_pipeline_stats(ws)
         assert not is_done(ws, "boom", []), "failed step reported done"
 
 

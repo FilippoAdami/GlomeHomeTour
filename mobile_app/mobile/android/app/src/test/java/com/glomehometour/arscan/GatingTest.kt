@@ -71,25 +71,25 @@ class GatingTest {
         assertEquals(PhotometricGate.Verdict.OK, verdict)
     }
 
-    // ---- keyframe / kinematic helpers (MainActivity companion) ----
+    // ---- keyframe / kinematic helpers (CaptureActivity companion) ----
 
     @Test
     fun `quaternion angle is symmetric and sign-independent`() {
         val identity = floatArrayOf(0f, 0f, 0f, 1f)
-        assertEquals(0f, MainActivity.quaternionAngleDeg(identity, identity), 1e-3f)
+        assertEquals(0f, CaptureActivity.quaternionAngleDeg(identity, identity), 1e-3f)
         // Same rotation, negated representation: must read as 0 degrees apart, not 180.
-        assertEquals(0f, MainActivity.quaternionAngleDeg(identity, floatArrayOf(0f, 0f, 0f, -1f)), 1e-3f)
+        assertEquals(0f, CaptureActivity.quaternionAngleDeg(identity, floatArrayOf(0f, 0f, 0f, -1f)), 1e-3f)
 
         val yaw90 = floatArrayOf(0f, kotlin.math.sin(Math.PI / 4).toFloat(), 0f, kotlin.math.cos(Math.PI / 4).toFloat())
-        assertEquals(90f, MainActivity.quaternionAngleDeg(identity, yaw90), 1e-2f)
-        assertEquals(90f, MainActivity.quaternionAngleDeg(yaw90, identity), 1e-2f)
+        assertEquals(90f, CaptureActivity.quaternionAngleDeg(identity, yaw90), 1e-2f)
+        assertEquals(90f, CaptureActivity.quaternionAngleDeg(yaw90, identity), 1e-2f)
     }
 
     @Test
     fun `distance is euclidean`() {
         assertEquals(
             5f,
-            MainActivity.distance(floatArrayOf(1f, 2f, 3f), floatArrayOf(4f, 6f, 3f)),
+            CaptureActivity.distance(floatArrayOf(1f, 2f, 3f), floatArrayOf(4f, 6f, 3f)),
             1e-5f,
         )
     }
@@ -100,7 +100,7 @@ class GatingTest {
     @Test
     fun `decimation keeps exactly one frame per stride`() {
         val stride = 8L
-        val kept = (1L..stride * 5).count { MainActivity.isDecimationKeyframe(it, stride) }
+        val kept = (1L..stride * 5).count { CaptureActivity.isDecimationKeyframe(it, stride) }
         assertEquals(5, kept)
     }
 
@@ -109,33 +109,33 @@ class GatingTest {
         // Unlike the displacement-gated policy this replaced, decimation has no notion of
         // "hasn't moved" -- a stationary stream still yields a keyframe every `stride` frames.
         val stride = 6L
-        assertFalse(MainActivity.isDecimationKeyframe(1L, stride))
-        assertFalse(MainActivity.isDecimationKeyframe(5L, stride))
-        assertTrue(MainActivity.isDecimationKeyframe(6L, stride))
-        assertTrue(MainActivity.isDecimationKeyframe(12L, stride))
+        assertFalse(CaptureActivity.isDecimationKeyframe(1L, stride))
+        assertFalse(CaptureActivity.isDecimationKeyframe(5L, stride))
+        assertTrue(CaptureActivity.isDecimationKeyframe(6L, stride))
+        assertTrue(CaptureActivity.isDecimationKeyframe(12L, stride))
     }
 
     @Test
     fun `default stride is within README's 6-10 range`() {
-        assertTrue(MainActivity.DECIMATION_STRIDE in 6L..10L)
+        assertTrue(CaptureActivity.DECIMATION_STRIDE in 6L..10L)
     }
 
     @Test
     fun `tilt is zero for a level phone and positive looking down`() {
         // The argument is the camera forward's world-Y, which updateUi feeds as -gravityUpZ:
         // phone upright (up_z = 0) is level, phone flat on its back (up_z = +1) is straight down.
-        assertEquals(0f, MainActivity.tiltDownDeg(0f), 1e-4f)
-        assertEquals(90f, MainActivity.tiltDownDeg(-1f), 1e-3f)
-        assertEquals(-90f, MainActivity.tiltDownDeg(1f), 1e-3f)
+        assertEquals(0f, CaptureActivity.tiltDownDeg(0f), 1e-4f)
+        assertEquals(90f, CaptureActivity.tiltDownDeg(-1f), 1e-3f)
+        assertEquals(-90f, CaptureActivity.tiltDownDeg(1f), 1e-3f)
         // README §6 step 3's 30-45 deg guidance band, roughly: a forward vector tipped about
         // halfway to straight down should land in the middle of it.
         val fortyFiveDown = kotlin.math.sin(Math.toRadians(-45.0)).toFloat()
-        assertEquals(45f, MainActivity.tiltDownDeg(fortyFiveDown), 0.1f)
+        assertEquals(45f, CaptureActivity.tiltDownDeg(fortyFiveDown), 0.1f)
     }
 
     @Test
     fun `white balance gains are neutral for a neutral grey wall`() {
-        val gains = MainActivity.whiteBalanceGains(128f, 128f, 128f)
+        val gains = CaptureActivity.whiteBalanceGains(128f, 128f, 128f)
         assertEquals(1f, gains[0], 1e-6f) // red
         assertEquals(1f, gains[1], 1e-6f) // green
         assertEquals(1f, gains[3], 1e-6f) // blue
@@ -145,13 +145,13 @@ class GatingTest {
     fun `white balance gains correct a blue or red cast`() {
         // U (Cb) above 128: image reads too blue, so the blue gain must come down to compensate.
         // Red is decoded purely from Cr, so a Cb-only cast leaves it untouched.
-        val blueCast = MainActivity.whiteBalanceGains(128f, 180f, 128f)
+        val blueCast = CaptureActivity.whiteBalanceGains(128f, 180f, 128f)
         assertTrue(blueCast[3] < 1f)
         assertEquals(1f, blueCast[0], 1e-6f)
 
         // V (Cr) above 128: image reads too red/warm, so the red gain must come down. Blue is
         // decoded purely from Cb, so a Cr-only cast leaves it untouched.
-        val redCast = MainActivity.whiteBalanceGains(128f, 128f, 180f)
+        val redCast = CaptureActivity.whiteBalanceGains(128f, 128f, 180f)
         assertTrue(redCast[0] < 1f)
         assertEquals(1f, redCast[3], 1e-6f)
     }
@@ -163,7 +163,7 @@ class GatingTest {
         // pinned green's gain to a fixed 1.0 regardless of the sample. The fixed decode-and-solve
         // approach has to pull green's own gain down (and, since it's still solving for a neutral
         // patch, push red/blue up) to compensate.
-        val greenCast = MainActivity.whiteBalanceGains(128f, 100f, 110f)
+        val greenCast = CaptureActivity.whiteBalanceGains(128f, 100f, 110f)
         assertTrue("expected green gain to drop below 1, was ${greenCast[1]}", greenCast[1] < 1f)
         assertTrue(greenCast[0] > 1f) // red
         assertTrue(greenCast[3] > 1f) // blue
@@ -175,7 +175,7 @@ class GatingTest {
     @Test
     fun `white balance trim keeps the ISP gain order`() {
         val frozen = floatArrayOf(1.9f, 1f, 1.4f) // a typical warm-light AWB estimate
-        val gains = MainActivity.whiteBalanceTrim(frozen)
+        val gains = CaptureActivity.whiteBalanceTrim(frozen)
         assertEquals(1.9f, gains[0], 1e-6f) // red
         assertEquals(1f, gains[1], 1e-6f)   // greenEven
         assertEquals(1f, gains[2], 1e-6f)   // greenOdd
@@ -184,63 +184,63 @@ class GatingTest {
 
     @Test
     fun `white balance gains stay within a sane clamp for extreme chroma`() {
-        val gains = MainActivity.whiteBalanceGains(128f, 255f, 0f)
+        val gains = CaptureActivity.whiteBalanceGains(128f, 255f, 0f)
         for (g in gains) assertTrue("$g out of range", g in 0.5f..4f)
     }
 
     @Test
     fun `white balance warm-cool bias trims red and blue in opposite directions`() {
-        val neutral = MainActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = 0f)
+        val neutral = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = 0f)
         assertEquals(1f, neutral[0], 1e-6f)
         assertEquals(1f, neutral[3], 1e-6f)
 
         // Positive bias (slider pushed warm): red up, blue down.
-        val warm = MainActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = 1f)
+        val warm = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = 1f)
         assertTrue(warm[0] > 1f)
         assertTrue(warm[3] < 1f)
 
         // Negative bias (slider pushed cool): red down, blue up.
-        val cool = MainActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = -1f)
+        val cool = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, warmCoolBias = -1f)
         assertTrue(cool[0] < 1f)
         assertTrue(cool[3] > 1f)
     }
 
     @Test
     fun `white balance tint bias trims only green, independent of warm-cool`() {
-        val neutral = MainActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = 0f)
+        val neutral = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = 0f)
         assertEquals(1f, neutral[1], 1e-6f)
 
         // Positive bias (slider pushed magenta): green comes down.
-        val magenta = MainActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = 1f)
+        val magenta = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = 1f)
         assertTrue(magenta[1] < 1f)
         assertEquals(1f, magenta[0], 1e-6f) // red untouched by tint
         assertEquals(1f, magenta[3], 1e-6f) // blue untouched by tint
 
         // Negative bias (slider pushed green): green goes up.
-        val green = MainActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = -1f)
+        val green = CaptureActivity.whiteBalanceGains(128f, 128f, 128f, tintBias = -1f)
         assertTrue(green[1] > 1f)
     }
 
     @Test
     fun `validation passes a full-length scan with room in the grid`() {
-        assertTrue(MainActivity.validationIssues(gridFull = false, keyframeCount = 200).isEmpty())
+        assertTrue(CaptureActivity.validationIssues(gridFull = false, keyframeCount = 200).isEmpty())
     }
 
     @Test
     fun `validation flags a scan ended seconds in`() {
-        val issues = MainActivity.validationIssues(gridFull = false, keyframeCount = 3)
+        val issues = CaptureActivity.validationIssues(gridFull = false, keyframeCount = 3)
         assertEquals(1, issues.size)
     }
 
     @Test
     fun `validation flags a full grid even with plenty of frames`() {
-        val issues = MainActivity.validationIssues(gridFull = true, keyframeCount = 200)
+        val issues = CaptureActivity.validationIssues(gridFull = true, keyframeCount = 200)
         assertEquals(1, issues.size)
     }
 
     @Test
     fun `validation can report both issues at once`() {
-        val issues = MainActivity.validationIssues(gridFull = true, keyframeCount = 1)
+        val issues = CaptureActivity.validationIssues(gridFull = true, keyframeCount = 1)
         assertEquals(2, issues.size)
     }
 
@@ -248,7 +248,7 @@ class GatingTest {
 
     @Test
     fun `metered exposure holds steady once luma is already on target`() {
-        val exposure = MainActivity.meteredExposure(175f, 100, CameraPipeline.FASTEST_SHUTTER_NS)
+        val exposure = CaptureActivity.meteredExposure(175f, 100, CameraPipeline.FASTEST_SHUTTER_NS)
         assertEquals(100, exposure.iso)
         assertEquals(CameraPipeline.FASTEST_SHUTTER_NS, exposure.shutterNs)
     }
@@ -258,7 +258,7 @@ class GatingTest {
         // A near-black frame like a dim indoor room at the default fast shutter: the meter should
         // spend shutter range first (fast toward slow), only raising ISO once shutter alone isn't
         // enough -- shutter is the "free" knob, ISO is the one that costs grain.
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 30f, currentIso = 100, currentShutterNs = CameraPipeline.FASTEST_SHUTTER_NS,
         )
         assertTrue(exposure.shutterNs > CameraPipeline.FASTEST_SHUTTER_NS)
@@ -267,7 +267,7 @@ class GatingTest {
     @Test
     fun `metered exposure raises iso once shutter has bottomed out and luma is still low`() {
         // Already at the slowest shutter and still dark: only ISO can move further.
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 8f, currentIso = 100, currentShutterNs = CameraPipeline.SLOWEST_SHUTTER_NS,
         )
         assertTrue(exposure.iso > 100)
@@ -276,7 +276,7 @@ class GatingTest {
 
     @Test
     fun `metered exposure falls for a bright outdoor scene`() {
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 220f, currentIso = 400, currentShutterNs = CameraPipeline.FASTEST_SHUTTER_NS,
         )
         assertTrue(exposure.iso < 400)
@@ -285,7 +285,7 @@ class GatingTest {
 
     @Test
     fun `metered exposure never exceeds the app iso ceiling or slowest shutter even for a pitch black frame`() {
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 1f, currentIso = 100, currentShutterNs = CameraPipeline.FASTEST_SHUTTER_NS,
         )
         assertTrue(exposure.iso <= CameraPipeline.MAX_ISO)
@@ -294,7 +294,7 @@ class GatingTest {
 
     @Test
     fun `metered exposure never drops below the app iso floor or fastest shutter for a blown-out frame`() {
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 255f, currentIso = 50, currentShutterNs = CameraPipeline.FASTEST_SHUTTER_NS,
         )
         assertTrue(exposure.iso >= CameraPipeline.MIN_ISO)
@@ -306,7 +306,7 @@ class GatingTest {
         // A fully black frame at the default outdoor-bright starting point (iso 100, 1/500s) is
         // exactly the state a dim indoor room starts in -- if this froze instead of pushing
         // exposure up, it could never leave the default and would stay black forever.
-        val exposure = MainActivity.meteredExposure(
+        val exposure = CaptureActivity.meteredExposure(
             measuredLuma = 0f, currentIso = 100, currentShutterNs = CameraPipeline.FASTEST_SHUTTER_NS,
         )
         assertTrue(exposure.shutterNs > CameraPipeline.FASTEST_SHUTTER_NS || exposure.iso > 100)
@@ -318,14 +318,14 @@ class GatingTest {
         // "PAUSED/INSUFFICIENT_FEATURES" is not that.
         assertEquals(
             "Point at furniture or a door frame, not a blank wall",
-            MainActivity.trackingAdvice("PAUSED/INSUFFICIENT_FEATURES"),
+            CaptureActivity.trackingAdvice("PAUSED/INSUFFICIENT_FEATURES"),
         )
-        assertEquals("Move the phone more slowly", MainActivity.trackingAdvice("PAUSED/EXCESSIVE_MOTION"))
-        assertEquals("Turn on the room lights", MainActivity.trackingAdvice("PAUSED/INSUFFICIENT_LIGHT"))
-        assertEquals("Tracking", MainActivity.trackingAdvice("TRACKING"))
+        assertEquals("Move the phone more slowly", CaptureActivity.trackingAdvice("PAUSED/EXCESSIVE_MOTION"))
+        assertEquals("Turn on the room lights", CaptureActivity.trackingAdvice("PAUSED/INSUFFICIENT_LIGHT"))
+        assertEquals("Tracking", CaptureActivity.trackingAdvice("TRACKING"))
         // Unknown reason and not-yet-started both still say something actionable.
-        assertFalse(MainActivity.trackingAdvice("PAUSED/BAD_STATE").isEmpty())
-        assertFalse(MainActivity.trackingAdvice(null).isEmpty())
+        assertFalse(CaptureActivity.trackingAdvice("PAUSED/BAD_STATE").isEmpty())
+        assertFalse(CaptureActivity.trackingAdvice(null).isEmpty())
     }
 
     @Test

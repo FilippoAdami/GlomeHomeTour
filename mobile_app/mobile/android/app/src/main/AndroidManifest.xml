@@ -12,7 +12,7 @@
         android:theme="@style/Theme.GlomeArScan">
         <meta-data android:name="com.google.ar.core" android:value="required" />
         <activity
-            android:name=".MainActivity"
+            android:name=".HomeActivity"
             android:exported="true"
             android:screenOrientation="portrait">
             <intent-filter>
@@ -21,8 +21,21 @@
             </intent-filter>
         </activity>
         <activity
+            android:name=".CaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".PropertyDetailActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+        <activity
             android:name=".ScanGalleryActivity"
             android:exported="false"
+            android:screenOrientation="portrait"
             android:theme="@style/Theme.GlomeArScan" />
     </application>
 </manifest>

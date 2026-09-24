@@ -40,7 +40,8 @@ from Utilities.pipeline_paths import bootstrap, subprocess_env
 
 bootstrap()
 
-from Utilities.pipeline_step import StepContext, is_done
+import time
+from Utilities.pipeline_step import StepContext, is_done, update_pipeline_stats
 from Utilities.scene_io import load_scene, merge_back, split_scene
 from colmap_diagnostics import parse_points3D_txt
 from densify_pointcloud import remove_outliers, voxel_dedup
@@ -163,13 +164,45 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     raw_total = len(raw_names)
     ctx.note(f"Input scene has {raw_total} frames")
 
-    # Keyframe selection based on room extent & ARCore trajectory geometry
-    selected_frames, kf_meta = select_keyframes_arcore(scene.frames)
+    # 1. Dynamic keyframe selector (pre-COLMAP ARCore keyframe selection)
+    t0_select = time.time()
+    sharpness_scores = None
+    fq_stats_path = manifest_dir / "filter_quality_stats.json"
+    if fq_stats_path.exists():
+        try:
+            fq_stats = json.loads(fq_stats_path.read_text())
+            per_frame = fq_stats.get("per_frame_sharpness", {})
+            if per_frame:
+                sharpness_scores = [float(per_frame.get(Path(f["file_path"]).name, 25.0)) for f in scene.frames]
+        except Exception:
+            sharpness_scores = None
+
+    if sharpness_scores is None:
+        try:
+            import cv2
+            from quality_gate import QualityGate
+            qg = QualityGate()
+            sharpness_scores = []
+            img_root = workspace / "images"
+            for f in scene.frames:
+                img_p = img_root / Path(f["file_path"]).name
+                if img_p.exists():
+                    im = cv2.imread(str(img_p))
+                    rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+                    sharpness_scores.append(float(qg.compute_blur_score(rgb)))
+                else:
+                    sharpness_scores.append(0.0)
+        except Exception as e:
+            ctx.note(f"Could not compute sharpness scores for keyframe selection: {e}")
+            sharpness_scores = None
+
+    selected_frames, kf_meta = select_keyframes_arcore(scene.frames, sharpness_scores=sharpness_scores)
     ctx.metric("arcore_keyframe_selection", kf_meta)
     extent = kf_meta.get("extent", {})
-    area = extent.get("floor_area_m2", "?")
-    ctx.note(f"ARCore room extent: {extent.get('room_dim_x', '?')}m x {extent.get('room_dim_z', '?')}m, "
-             f"estimated floor area {area} m² (standoff {extent.get('standoff_m', 0.8)}m)")
+    path = workspace / STAGE_DIRNAME
+    write_scene_size_txt(workspace=path, extent=extent)
+    area = extent.get("total_floor_area", "?")
+    ctx.note(f"ARCore room estimated floors total area {area} m²")
 
     selected_names = {Path(f["file_path"]).name for f in selected_frames}
     non_kf_names = raw_names - selected_names
@@ -178,6 +211,8 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
                  f"(budget [{kf_meta.get('budget', [0, 0])[0]}..{kf_meta.get('budget', [0, 0])[1]}])")
         non_kf_dir = stage_dir / "colmap_non_keyframes"
         split_scene(manifest_dir, non_kf_dir, non_kf_names, images_root=workspace)
+    t_select = time.time() - t0_select
+    update_pipeline_stats(workspace, "dynamic_keyframe_selector", t_select, raw_total)
 
     # Re-read scene containing only selected keyframes for COLMAP
     scene = load_scene(manifest_dir, images_root=workspace)
@@ -185,7 +220,11 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     total = len(all_names)
     ctx.note(f"Running COLMAP on {total} frames")
 
+    # 2. COLMAP processing (feature matching, manual model, triangulation, pose prior mapper)
+    t0_colmap = time.time()
     run_colmap(workspace, diagnostics_dir, ctx, matcher)
+    t_colmap = time.time() - t0_colmap
+    update_pipeline_stats(workspace, "colmap_processing", t_colmap, total)
 
     sparse_dir = workspace / "sparse" / "0"
     db_path = workspace / STAGE_DIRNAME / "colmap_database.db"
@@ -204,6 +243,8 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
             f"{MIN_REGISTERED_FRAC:.0%} floor. The capture or the matcher is at fault; "
             f"inspect {diagnostics_dir}/ before continuing.")
 
+    # 3. Sampson error gating & model pruning
+    t0_sampson = time.time()
     with ctx.timer("sampson"):
         rejects = sampson_rejects(str(db_path), str(sparse_dir), MAX_SAMPSON_PX)
     keep, refused = filter_by_sampson(registered, rejects)
@@ -215,8 +256,6 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
         worst = sorted(rejects.items(), key=lambda kv: -kv[1])
         ctx.metric("sampson_worst", {n: round(e, 2) for n, e in worst[:10]})
     if refused:
-        # Deliberately not fatal: the model may still be usable, and the operator
-        # is better placed than this script to judge from the diagnostics.
         ctx.note(f"REFUSED to apply the Sampson filter: {len(rejects)}/{len(registered)} frames "
                  f"exceed {MAX_SAMPSON_PX} px, over the {MAX_SAMPSON_REJECT_FRAC:.0%} cap. "
                  "That many bad poses means the model is suspect, not the frames. "
@@ -228,7 +267,6 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
 
     log_diagnostics(diagnostics_dir, ctx)
 
-    # Filter catastrophic bundle adjustment drift against ARCore VIO prior
     drift_outliers = set()
     per_frame_deltas_path = diagnostics_dir / "per_frame_deltas.csv"
     if per_frame_deltas_path.exists():
@@ -239,23 +277,23 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
                 try:
                     rot_err = float(r["rotation_delta_deg"])
                     trans_err = float(r["translation_delta_m"])
-                    if rot_err > MAX_ROTATION_DRIFT_DEG or trans_err > MAX_TRANSLATION_DRIFT_M:
+                    if rot_err > 30.0 or trans_err > 0.80:
                         drift_outliers.add(r["image"])
                 except (ValueError, KeyError):
                     continue
     if drift_outliers:
         ctx.metric("pose_drift_outliers", len(drift_outliers))
-        ctx.note(f"Pose drift filter: dropping {len(drift_outliers)} frame(s) with severe ARCore drift "
-                 f"(>{MAX_ROTATION_DRIFT_DEG} deg or >{MAX_TRANSLATION_DRIFT_M*100:.0f} cm): {sorted(drift_outliers)}")
+        ctx.note(f"Pose drift filter: dropping {len(drift_outliers)} frame(s) with catastrophic tracking glitch "
+                 f"(>30 deg or >80 cm): {sorted(drift_outliers)}")
         keep = keep - drift_outliers
 
     drop = sorted(all_names - keep)
     kept, rejected = split_scene(manifest_dir, discard_dir, drop, images_root=workspace)
     if drop:
         with ctx.timer("prune_model"):
-            # The model must name exactly what images/ holds: the 2DGS loader
-            # opens every image listed and dies on the first one missing.
             prune_model(str(sparse_dir), set(drop))
+    t_sampson = time.time() - t0_sampson
+    update_pipeline_stats(workspace, "sampson_error_gating_and_model_pruning", t_sampson, total)
 
     ctx.metric("kept", kept)
     ctx.metric("discarded", rejected)
@@ -264,29 +302,36 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     ctx.note(f"Kept {kept}/{total} ({100.0 * kept / max(1, total):.1f}%), "
              f"moved {rejected} to {discard_dir}/")
 
+    # 4. Point cloud refinement
+    t0_cloud = time.time()
     clean_point_cloud(sparse_dir, ctx)
+    t_cloud = time.time() - t0_cloud
+    update_pipeline_stats(workspace, "pointcloud_refinement", t_cloud, kept)
 
-    extent = scene_extent(sparse_dir)
+    # 5. Scene alignment & diagnostics
+    t0_align = time.time()
+    extent = scene_extent(sparse_dir, transforms_path=manifest_dir / "transforms.json")
     (stage_dir / "scene_extent.json").write_text(json.dumps(extent, indent=2))
-    write_scene_size_txt(stage_dir, extent)
     ctx.metric("scene_extent", extent)
     aligned = extent["aligned"]
     x, y, z = aligned["point_cloud"]["size_m"]
-    ctx.note(f"Wall-aligned scene size ({aligned['rotation_deg_about_up_axis']:.1f} deg "
+    mode = aligned.get("alignment_mode", "wall")
+    ctx.note(f"{mode.capitalize()}-aligned scene size ({aligned['rotation_deg_about_up_axis']:.1f} deg "
              f"about up axis {aligned['up_axis']}): x={x:.2f} y={y:.2f} z={z:.2f} m, "
              f"written to scene_size.txt")
 
-    # Room-rotation/floor-count diagnostics (scene_extent_side.png, scene_extent_topdown.png,
-    # floors: row in scene_size.txt) -- eyeball-only, so a failure here shouldn't fail the step.
     with ctx.timer("room_diagnostics"):
         try:
             floor_count.main(["--workspace", str(workspace)])
-            topdown_view.main(["--workspace", str(workspace)])
+            topdown_view.main(["--workspace", str(workspace), "--transforms", str(manifest_dir / "transforms.json")])
             moved = workspace / "scene_extent_topdown.png"
             if moved.exists():
                 moved.rename(stage_dir / "scene_extent_topdown.png")
         except Exception as e:
             ctx.note(f"room diagnostics failed (non-fatal): {e}")
+    t_align = time.time() - t0_align
+    update_pipeline_stats(workspace, "scene_alignment_and_diagnostics", t_align, kept)
+    ctx.metric("frames_processed", total)
 
 
 def main(argv: list[str] | None = None) -> int:

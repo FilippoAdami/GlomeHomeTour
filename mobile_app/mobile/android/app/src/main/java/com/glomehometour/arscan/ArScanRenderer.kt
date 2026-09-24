@@ -37,7 +37,7 @@ import javax.microedition.khronos.opengles.GL10
  * marker rather than a bearing shell.
  *
  * Everything ARCore-facing stays on the GL thread. The voxel grid is deliberately *not* touched
- * here: it runs on its own worker (see MainActivity) and publishes back a plain FloatArray.
+ * here: it runs on its own worker (see CaptureActivity) and publishes back a plain FloatArray.
  */
 class ArScanRenderer(
     private val context: Context,
@@ -74,7 +74,7 @@ class ArScanRenderer(
     @Volatile var trackingState: String = "?"
         private set
 
-    /** Set by MainActivity for the *next* frame. Image acquisition is what the photometric gate
+    /** Set by CaptureActivity for the *next* frame. Image acquisition is what the photometric gate
      * and the keyframe writer both feed on; depth is throttled to the voxel worker's rate. */
     @Volatile var captureImage: Boolean = false
     @Volatile var wantDepth: Boolean = false

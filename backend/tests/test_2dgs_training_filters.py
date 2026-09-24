@@ -116,25 +116,44 @@ class MockCamera:
         self.world_view_transform = W2C
 
 
+def _smooth_texture(h, w, device):
+    """Band-limited test texture.
+
+    White noise is useless for testing an NCC: it has no spatial correlation, so
+    the sub-pixel resampling of any warp decorrelates it and the NCC reads ~0 even
+    for a perfect warp. Real images are band-limited; this stands in for that.
+    """
+    y = torch.arange(h, device=device, dtype=torch.float32).unsqueeze(1)
+    x = torch.arange(w, device=device, dtype=torch.float32).unsqueeze(0)
+    t = 0.5 + 0.25 * torch.sin(2 * math.pi * x / 13.0) * torch.cos(2 * math.pi * y / 17.0)
+    return t.unsqueeze(0).repeat(3, 1, 1)
+
+
 def test_asymmetric_veto_weighting():
     """Verify asymmetric veto weight penalizes worst mismatch instead of diluting."""
     H, W = 40, 40
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # The loss is an NCC, which is invariant to affine intensity change: a
+    # constant patch correlates with every other constant patch and is discarded
+    # as textureless. So both agreement and disagreement have to be expressed as
+    # *structure*, not as brightness.
+    texture = _smooth_texture(H, W, device)
+
     # Reference camera looking at planar wall at z=2.0
     R_ref = torch.eye(3, device=device)
     T_ref = torch.zeros(3, device=device)
-    ref_img = torch.full((3, H, W), 0.5, device=device)
+    ref_img = texture
     view = MockCamera(R_ref, T_ref, ref_img, name="cam_0", uid=0)
 
-    # Neighbor 1: small baseline, identical image (error ~ 0.0)
+    # Neighbor 1: small baseline, identical structure (NCC ~ 1, loss ~ 0)
     T_nb1 = torch.tensor([0.05, 0.0, 0.0], device=device)
     nb1_img = ref_img.clone()
     nb1 = MockCamera(R_ref, T_nb1, nb1_img, name="cam_1", uid=1)
 
-    # Neighbor 2: side view with completely contradictory texture (error ~ 0.5)
+    # Neighbor 2: inverted structure (NCC ~ -1, loss ~ 1)
     T_nb2 = torch.tensor([0.1, 0.0, 0.0], device=device)
-    nb2_img = torch.full((3, H, W), 1.0, device=device)
+    nb2_img = 1.0 - texture
     nb2 = MockCamera(R_ref, T_nb2, nb2_img, name="cam_2", uid=2)
 
     # Synthetic planar surfel render outputs
@@ -391,3 +410,253 @@ def test_rotate_matches_matmul_past_rocm_row_limit():
     # The rows the buggy kernel drops must carry real values.
     assert out[524_288:].abs().sum() > 0
     assert torch.allclose(out[-1], points[-1] @ M, atol=1e-5)
+
+
+def test_multiview_ncc_is_invariant_to_exposure_but_not_to_structure():
+    """The NCC must ignore a brightness/contrast change and catch a structural one.
+
+    This is the whole reason the loss is an NCC rather than a colour difference:
+    the two views of a phone capture differ by auto-exposure, and only a
+    structural mismatch means the geometry is wrong.
+    """
+    H, W = 40, 40
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    texture = _smooth_texture(H, W, device)
+
+    R = torch.eye(3, device=device)
+    view = MockCamera(R, torch.zeros(3, device=device), texture, name="cam_0", uid=0)
+    # Zero baseline, so the homography is the identity and the only thing under
+    # test is the comparison itself. With a real baseline the mock neighbour
+    # image would also have to be shifted by the induced disparity
+    # (f * t / z = 2.5 px here) or the patches legitimately would not match, and
+    # the test would be measuring the fixture rather than the loss.
+    T_nb = torch.zeros(3, device=device)
+
+    # Same structure, different exposure (affine in intensity).
+    exposed = (texture * 0.6 + 0.3).clamp(0.0, 1.0)
+    nb_exposed = MockCamera(R, T_nb, exposed, name="cam_1", uid=1)
+    # Same brightness statistics, structure inverted (NCC -> -1).
+    inverted = 1.0 - texture
+    nb_inverted = MockCamera(R, T_nb, inverted, name="cam_2", uid=2)
+
+    depth = torch.full((1, H, W), 2.0, device=device)
+    normal = torch.zeros((3, H, W), device=device)
+    normal[2, :, :] = -1.0
+    alpha = torch.ones((1, H, W), device=device)
+
+    kw = dict(num_samples=1000, veto_weight=0.0, saturation_threshold=0.0)
+    loss_exposed = multiview_photometric_loss(view, [nb_exposed], depth, normal, alpha, **kw)
+    loss_inverted = multiview_photometric_loss(view, [nb_inverted], depth, normal, alpha, **kw)
+
+    assert loss_exposed.item() < 0.02, f"exposure change must not cost: {loss_exposed.item()}"
+    assert loss_inverted.item() > 0.9, f"structural mismatch must cost: {loss_inverted.item()}"
+
+
+def test_multiview_ncc_skips_textureless_patches():
+    """A flat wall has no structure to correlate; the depth prior owns those pixels."""
+    H, W = 40, 40
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    flat = torch.full((3, H, W), 0.5, device=device)
+
+    R = torch.eye(3, device=device)
+    view = MockCamera(R, torch.zeros(3, device=device), flat, name="cam_0", uid=0)
+    nb = MockCamera(R, torch.tensor([0.05, 0.0, 0.0], device=device),
+                    torch.full((3, H, W), 0.9, device=device), name="cam_1", uid=1)
+
+    depth = torch.full((1, H, W), 2.0, device=device)
+    normal = torch.zeros((3, H, W), device=device)
+    normal[2, :, :] = -1.0
+    alpha = torch.ones((1, H, W), device=device)
+
+    loss = multiview_photometric_loss(view, [nb], depth, normal, alpha,
+                                      num_samples=1000, saturation_threshold=0.0)
+    assert loss.item() == 0.0
+
+
+def test_multiview_warp_lands_on_the_corresponding_pixel():
+    """The plane-induced homography must match plain pinhole projection.
+
+    Built without reference to the loss's internals: the neighbour image is
+    synthesised by projecting the same fronto-parallel plane through elementary
+    pinhole maths, so a correct homography has to score NCC ~ 1 against it and a
+    mis-derived one cannot. Nothing else in the suite pins down the warp itself --
+    the other tests would pass just as happily with the homography transposed.
+    """
+    H, W = 64, 64
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    texture = _smooth_texture(H, W, device)
+
+    z = 2.0
+    tx = 0.05
+    R = torch.eye(3, device=device)
+    view = MockCamera(R, torch.zeros(3, device=device), texture, name="cam_0", uid=0)
+    fx = (W / 2.0) / math.tan(view.FoVx / 2.0)
+
+    # MockCamera documents x_cam = x_world @ W2C, and the reference camera is the
+    # identity, so world == reference camera frame. A point at (X, Y, z) there is
+    # at (X + tx, Y, z) in the neighbour, i.e. the neighbour sees it shifted by
+    # fx * tx / z pixels. Synthesise the neighbour image by that shift.
+    shift = fx * tx / z
+    xs = torch.arange(W, device=device, dtype=torch.float32) - shift
+    grid_x = (xs / (W - 1) * 2.0 - 1.0).unsqueeze(0).repeat(H, 1)
+    grid_y = (torch.arange(H, device=device, dtype=torch.float32) / (H - 1) * 2.0 - 1.0).unsqueeze(1).repeat(1, W)
+    nb_img = torch.nn.functional.grid_sample(
+        texture.unsqueeze(0), torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0),
+        mode="bilinear", padding_mode="border", align_corners=True).squeeze(0)
+    nb = MockCamera(R, torch.tensor([tx, 0.0, 0.0], device=device), nb_img, name="cam_1", uid=1)
+
+    depth = torch.full((1, H, W), z, device=device)
+    normal = torch.zeros((3, H, W), device=device)
+    normal[2, :, :] = -1.0
+    alpha = torch.ones((1, H, W), device=device)
+
+    loss = multiview_photometric_loss(view, [nb], depth, normal, alpha,
+                                      num_samples=1000, veto_weight=0.0,
+                                      saturation_threshold=0.0)
+    assert loss.item() < 0.05, f"correct warp must score NCC ~ 1, got loss {loss.item()}"
+
+
+def test_growth_target_is_linear_and_clamped():
+    from train import growth_target
+
+    assert growth_target(100, 1000, 2000, 200, 1200) == 1000   # before start
+    assert growth_target(700, 1000, 2000, 200, 1200) == 1500   # halfway
+    assert growth_target(9999, 1000, 2000, 200, 1200) == 2000  # clamped at budget
+
+
+def test_densify_to_target_honours_the_budget_exactly(mock_gaussians):
+    """k candidates -> exactly k new surfels, whether they clone or split."""
+    g = mock_gaussians
+    n0 = g.get_xyz.shape[0]
+    grads = torch.tensor([[1.0], [0.5], [0.25], [0.125]], device=g._xyz.device)
+    # Half the candidates oversized, so both the clone and the split path run.
+    g._scaling = nn.Parameter(torch.tensor([[0.0, 0.0], [0.0, 0.0], [5.0, 5.0], [5.0, 5.0]],
+                                           device=g._xyz.device))
+    g.optimizer.param_groups[4]["params"][0] = g._scaling
+
+    added = g.densify_to_target(grads, extent=1.0, target_count=n0 + 3)
+    assert added == 3
+    assert g.get_xyz.shape[0] == n0 + 3
+
+    # Already at target: no growth, no error.
+    assert g.densify_to_target(grads[:1].repeat(g.get_xyz.shape[0], 1), 1.0, n0) == 0
+
+
+@pytest.mark.parametrize("width,height", [(540, 960), (1080, 1920)])
+def test_depth_to_normal_is_not_degenerate_at_native_resolution(width, height):
+    """surf_normal must survive full resolution.
+
+    |dx x dy| scales with the metric gap between neighbouring pixels' 3D points,
+    so it falls off as resolution rises. An absolute cutoff zeroed 97-99% of the
+    normal map at 1080p -- the resolution the final stage trains at -- which turned
+    the normal consistency loss into the constant 1, with no gradient.
+    """
+    from scene.cameras import MiniCam
+    from utils.graphics_utils import getProjectionMatrix
+    from utils.point_utils import depth_to_normal
+
+    fovx, fovy = math.radians(47.0), math.radians(72.0)  # phone portrait capture
+    w2c = torch.eye(4, device="cuda")
+    proj = getProjectionMatrix(znear=0.01, zfar=100.0, fovX=fovx, fovY=fovy).transpose(0, 1).cuda()
+    view = MiniCam(width, height, fovy, fovx, 0.01, 100.0, w2c, w2c @ proj)
+
+    # A fronto-parallel wall 1.5 m away -- indoor capture distance -- where the
+    # per-pixel 3D spacing is ~1 mm and |dx x dy| lands around 1e-6.
+    depth = torch.full((1, height, width), 1.5, device="cuda")
+    normal = depth_to_normal(view, depth)
+
+    interior = normal[1:-1, 1:-1]
+    lengths = interior.norm(dim=-1)
+    assert (lengths > 0.9).float().mean() > 0.99
+
+
+# ==============================================================================
+# 4. Multi-Scale Scheduling, Opacity Recovery & Gradient Shock Damping
+# ==============================================================================
+
+def test_compute_epoch_schedule_calibrated_and_scaling():
+    """Verify compute_epoch_schedule yields calibrated 5k/8k/10.5k for 200 cams and scales for huge scenes."""
+    import sys
+    from pathlib import Path
+    backend_dir = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(backend_dir / "03_2DGS_training"))
+    from step_train import compute_epoch_schedule
+
+    # Case 1: Dense depth prior (use_depth=True) - fast, streamlined schedule, no opacity reset
+    stages_200, params_200 = compute_epoch_schedule(200, use_depth=True)
+    assert stages_200 == ((420, 3_000), (750, 5_000), (1, 6_500))
+    assert params_200["total_iterations"] == 6_500
+    assert params_200["densify_until_iter"] == 5_000
+    assert params_200["opacity_reset_iter"] == -1
+    assert params_200["prior_decay_from"] == 3_000
+    assert params_200["prior_decay_until"] == 5_000
+
+    stages_383, params_383 = compute_epoch_schedule(383, use_depth=True)
+    assert stages_383[0][1] == round(8.0 * 383)
+    assert stages_383[1][1] == stages_383[0][1] + round(6.0 * 383)
+    assert stages_383[2][1] == stages_383[1][1] + round(4.0 * 383)
+    assert params_383["opacity_reset_iter"] == -1
+
+    # Case 2: Sparse SfM fallback (use_depth=False) - traditional 25/15/10 epochs with targeted reset
+    stages_sfm_200, params_sfm_200 = compute_epoch_schedule(200, use_depth=False)
+    assert stages_sfm_200 == ((420, 5_000), (750, 8_000), (1, 10_500))
+    assert params_sfm_200["opacity_reset_iter"] == 6_000
+
+    stages_sfm_650, params_sfm_650 = compute_epoch_schedule(650, use_depth=False)
+    assert stages_sfm_650[0][1] == 25 * 650
+    assert stages_sfm_650[1][1] == stages_sfm_650[0][1] + 15 * 650
+    assert stages_sfm_650[2][1] == stages_sfm_650[1][1] + 10 * 650
+
+
+def test_max_world_size_bloater_pruning(mock_gaussians):
+    """Verify max_world_size (3.5 cm) prunes oversized surfels and prevents bloaters."""
+    g = mock_gaussians
+    # Set scales: surfels 0 and 1 are valid (1.5cm, 2.5cm); surfels 2 and 3 are bloaters (5cm, 20cm)
+    scales_m = torch.tensor([
+        [0.015, 0.015],
+        [0.025, 0.020],
+        [0.050, 0.040],
+        [0.200, 0.150],
+    ], dtype=torch.float32, device=g.get_xyz.device)
+    g._scaling.data = torch.log(scales_m)
+
+    # Densify and prune with max_world_size = 0.035 (3.5 cm)
+    g.densify_and_prune(
+        max_grad=0.0002, min_opacity=0.01, extent=4.0, max_screen_size=None,
+        allow_densification=False, view_evidence_cull=False,
+        max_world_size=0.035
+    )
+
+    # Only surfels 0 and 1 must survive
+    assert g.get_xyz.shape[0] == 2, f"Expected 2 surfels, got {g.get_xyz.shape[0]}"
+    assert (g.get_scaling <= 0.035).all(), "Surviving surfels must all be <= 3.5 cm"
+
+    # Verify log-scale clamping physically bounds maximum scaling
+    g._scaling.data.fill_(0.0)  # exp(0) = 1.0 meter (huge bloater)
+    g._scaling.data.clamp_(max=math.log(0.035))
+    assert (g.get_scaling <= 0.035001).all()
+
+
+def test_opacity_recovery_window_prevents_premature_extinction(mock_gaussians):
+    """Verify opacity recovery window (min_opacity=0.0) protects surfels until cull step."""
+    g = mock_gaussians
+    device = g.frustum_counter.device
+
+    # Simulate post-reset state: opacities clamped to 0.01 (logit ~ -4.6)
+    g._opacity.data.fill_(-4.6)
+    assert (g.get_opacity < 0.05).all()
+
+    # During recovery window: effective_opacity_cull is 0.0 -> all surfels survive!
+    g.densify_and_prune(
+        max_grad=0.0002, min_opacity=0.0, extent=1.0, max_screen_size=None,
+        allow_densification=False, view_evidence_cull=False
+    )
+    assert g.get_xyz.shape[0] == 4, "Recovery window must not cull surfels at min_opacity=0.0"
+
+    # End of recovery window (cull step): effective_opacity_cull = 0.05 -> low opacity surfels culled!
+    g.densify_and_prune(
+        max_grad=0.0002, min_opacity=0.05, extent=1.0, max_screen_size=None,
+        allow_densification=False, view_evidence_cull=False
+    )
+    assert g.get_xyz.shape[0] == 0, "Cull step must purge surfels that failed to recover"
+

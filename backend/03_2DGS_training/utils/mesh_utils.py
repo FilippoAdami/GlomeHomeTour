@@ -108,7 +108,11 @@ class GaussianExtractor(object):
             rgb = render_pkg['render']
             alpha = render_pkg['rend_alpha']
             normal = torch.nn.functional.normalize(render_pkg['rend_normal'], dim=0)
-            depth = render_pkg['surf_depth']
+            # Unbiased depth, matching what the depth prior and the multi-view
+            # loss were trained against -- fusing a different depth definition
+            # than the one that was supervised puts the mesh where nothing in
+            # training ever said the surface was.
+            depth = render_pkg['rend_depth_unbiased']
             depth_normal = render_pkg['surf_normal']
             self.rgbmaps.append(rgb.cpu())
             self.depthmaps.append(depth.cpu())

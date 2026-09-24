@@ -123,6 +123,7 @@ def extract(source: Path, workspace: Path, stage_dir: Path, ctx: StepContext) ->
 
     h = scene.header
     ctx.metric("frames", len(scene))
+    ctx.metric("frames_processed", len(scene))
     ctx.metric("resolution", [h["w"], h["h"]])
     ctx.metric("intrinsics", {k: h[k] for k in ("fl_x", "fl_y", "cx", "cy", "camera_angle_x")})
     ctx.metric("distortion", {k: h[k] for k in ("k1", "k2", "p1", "p2")})

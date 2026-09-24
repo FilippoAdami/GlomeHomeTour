@@ -176,3 +176,26 @@ def test_overlap_depends_on_scene_depth(mock_intrinsics: CameraIntrinsics):
     # The nearer frame governs: it is the close geometry that leaves frame first.
     mixed = selector._mutual_covisibility(0, 1, kfs, mock_intrinsics, np.array([3.0, 0.5]))
     assert mixed == pytest.approx(near, abs=1e-6)
+
+
+def test_keyframe_selection_aggressiveness_levels(mock_intrinsics: CameraIntrinsics):
+    """Test aggressiveness parameter behavior at 0.0, 0.5, and 1.0."""
+    # 20 keyframes walking in a line
+    kfs = [make_keyframe(i, [i * 0.15, 0.0, 0.0]) for i in range(20)]
+
+    selector = DynamicKeyframeSelector.for_2dgs_training()
+
+    # Aggressiveness 0.0 -> skips selection, keeps 100% of frames
+    res_zero = selector.select_keyframes(kfs, mock_intrinsics, aggressiveness=0.0)
+    assert len(res_zero.selected_keyframes) == len(kfs)
+    assert res_zero.selection_ratio == 1.0
+
+    # Aggressiveness 0.5 -> default behavior
+    res_half = selector.select_keyframes(kfs, mock_intrinsics, aggressiveness=0.5)
+
+    # Aggressiveness 1.0 -> max aggressiveness, keeps minimum keyframes
+    res_one = selector.select_keyframes(kfs, mock_intrinsics, aggressiveness=1.0)
+
+    assert len(res_one.selected_keyframes) <= len(res_half.selected_keyframes)
+    assert len(res_half.selected_keyframes) <= len(res_zero.selected_keyframes)
+

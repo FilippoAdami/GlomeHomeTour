@@ -131,6 +131,11 @@ def coverage_prune(
     covisibility: Callable[[int, int], float],
     min_covisibility: float,
     views_per_cell: int = VIEWS_PER_CELL,
+    max_frame_gap: int = 10,
+    protected_indices: set[int] | None = None,
+    motion_delta: Callable[[int, int], tuple[float, float]] | None = None,
+    max_rotation_deg: float = 16.0,
+    max_translation_m: float = 0.40,
 ) -> list[int]:
     """Drop frames down to ``max_keyframes``, cheapest-in-coverage first.
 
@@ -168,8 +173,16 @@ def coverage_prune(
         # Endpoints stay: the first frame anchors the walk and the last is the
         # capture's loop closure back at the entry door.
         for k in range(1, len(chain) - 1):
+            if chain[k + 1] - chain[k - 1] > max_frame_gap:
+                continue
+            if protected_indices and chain[k] in protected_indices:
+                continue
             if covisibility(chain[k - 1], chain[k + 1]) < min_covisibility:
                 continue
+            if motion_delta is not None:
+                trans, rot = motion_delta(chain[k - 1], chain[k + 1])
+                if rot > max_rotation_deg or trans > max_translation_m:
+                    continue
             unique = sum(1 for c in coverage[chain[k]] if counts[c] <= 1)
             thin = sum(1 for c in coverage[chain[k]] if 1 < counts[c] <= views_per_cell)
             cost = (unique, thin)

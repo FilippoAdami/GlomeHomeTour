@@ -71,3 +71,9 @@ python 00_ingestion/step_filter_quality.py \
     --workspace backend/current_scene \
     [--force]
 ```
+
+or
+
+```bash
+python3 run_pipeline.py --to-step rotate_upright
+```

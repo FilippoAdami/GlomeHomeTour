@@ -56,7 +56,24 @@ class Camera(nn.Module):
         self.base_world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.pose_delta = None
+        self.exposure = None
         self.refresh_pose()
+
+    def enable_exposure_compensation(self):
+        """Attach a learnable per-image [log gain, bias] (PGSR exposure model).
+
+        Phone capture runs auto-exposure, so the same wall is a different
+        brightness in consecutive frames. Without this the photometric loss can
+        only explain that with geometry, and it pays for the difference in
+        floaters.
+        """
+        self.exposure = nn.Parameter(torch.zeros(2, device="cuda"))
+
+    def apply_exposure(self, image):
+        """Photometric use only -- the geometry losses must see the raw render."""
+        if self.exposure is None:
+            return image
+        return image * torch.exp(self.exposure[0]) + self.exposure[1]
 
     def enable_pose_refinement(self):
         """Attach a zero-initialised learnable SE(3) delta (see utils/pose_refine.py)."""

@@ -18,6 +18,7 @@
 #include <tuple>
 #include <stdio.h>
 #include <hip/hip_runtime_api.h>
+#include <hip/hip_runtime.h>
 #include <memory>
 #include "hip_rasterizer/config.h"
 #include "hip_rasterizer/rasterizer.h"
@@ -84,7 +85,7 @@ RasterizeGaussiansCUDA(
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_others = torch::full({3+3+1, H, W}, 0.0, float_opts);
+  torch::Tensor out_others = torch::full({3+3+2, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
   torch::Device device(torch::kCUDA);
@@ -252,4 +253,57 @@ torch::Tensor markVisible(
   }
   
   return present;
+}
+
+
+// Sparse Adam (Taming 3DGS): a splat invisible in this view has a zero gradient, so its
+// only dense-Adam update is momentum decay. Skipping it turns the optimiser step from a
+// pass over every splat into a pass over the visible ones. Bias correction is folded into
+// lr/eps by the caller, so a fully visible step matches torch.optim.Adam exactly.
+__global__ void adamUpdateCUDA(
+	float* __restrict__ param,
+	const float* __restrict__ param_grad,
+	float* __restrict__ exp_avg,
+	float* __restrict__ exp_avg_sq,
+	const bool* __restrict__ visible,
+	const float lr, const float b1, const float b2, const float eps,
+	const uint32_t N, const uint32_t M)
+{
+	const uint32_t p_idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (p_idx >= N * M)
+		return;
+	if (!visible[p_idx / M])
+		return;
+
+	const float g = param_grad[p_idx];
+	const float avg = b1 * exp_avg[p_idx] + (1.0f - b1) * g;
+	const float avg_sq = b2 * exp_avg_sq[p_idx] + (1.0f - b2) * g * g;
+	exp_avg[p_idx] = avg;
+	exp_avg_sq[p_idx] = avg_sq;
+	param[p_idx] -= lr * avg / (sqrt(avg_sq) + eps);
+}
+
+void adamUpdate(
+	torch::Tensor& param,
+	const torch::Tensor& param_grad,
+	torch::Tensor& exp_avg,
+	torch::Tensor& exp_avg_sq,
+	const torch::Tensor& visible,
+	const float lr, const float b1, const float b2, const float eps,
+	const int N, const int M)
+{
+	TORCH_CHECK(param.is_contiguous() && param_grad.is_contiguous(), "adamUpdate needs contiguous tensors");
+	TORCH_CHECK(visible.scalar_type() == torch::kBool, "visible must be a bool tensor");
+	TORCH_CHECK(visible.numel() == N, "visible must have one entry per splat");
+	TORCH_CHECK(param.numel() == (int64_t)N * M, "param size does not match N*M");
+	const uint32_t total = (uint32_t)N * (uint32_t)M;
+	if (total == 0)
+		return;
+	adamUpdateCUDA<<<(total + 255) / 256, 256>>>(
+		param.data_ptr<float>(),
+		param_grad.data_ptr<float>(),
+		exp_avg.data_ptr<float>(),
+		exp_avg_sq.data_ptr<float>(),
+		visible.data_ptr<bool>(),
+		lr, b1, b2, eps, (uint32_t)N, (uint32_t)M);
 }

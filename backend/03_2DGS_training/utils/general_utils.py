@@ -170,7 +170,9 @@ def colormap(img, cmap='jet'):
     fig.colorbar(im, ax=ax)
     fig.tight_layout()
     fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    # matplotlib 3.9 removed Canvas.tostring_rgb(); buffer_rgba() is the
+    # replacement and exists well before it, so this needs no version check.
+    data = np.asarray(fig.canvas.buffer_rgba(), dtype=np.uint8)[..., :3]
     data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     img = torch.from_numpy(data / 255.).float().permute(2,0,1)
     plt.close()

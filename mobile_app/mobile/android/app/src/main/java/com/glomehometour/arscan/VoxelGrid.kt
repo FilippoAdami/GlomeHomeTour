@@ -122,9 +122,9 @@ class VoxelGrid(
                 val cos = (bearings[slot * 3] * bx + bearings[slot * 3 + 1] * by + bearings[slot * 3 + 2] * bz)
                     .coerceIn(-1f, 1f)
                 if (cos < widestCos[slot]) {
-                    val wasVerified = widestCos[slot] <= PARALLAX_COS
+                    val wasVerified = widestCos[slot] <= Tunables.parallaxCos
                     widestCos[slot] = cos
-                    if (!wasVerified && cos <= PARALLAX_COS) verifiedCount++
+                    if (!wasVerified && cos <= Tunables.parallaxCos) verifiedCount++
                 }
             }
             else -> {
@@ -588,7 +588,8 @@ class VoxelGrid(
         const val OCCUPIED: Byte = 2
         const val OCCLUDED: Byte = 3
 
-        /** SPEC §2.3: two views at least this far apart make a surface adequately captured. */
+        /** SPEC §2.3: two views at least this far apart make a surface adequately captured.
+         * Default only -- the live value is Tunables.parallaxMinDeg (SettingsActivity). */
         const val PARALLAX_MIN_DEG = 25f
         val PARALLAX_COS = kotlin.math.cos(Math.toRadians(PARALLAX_MIN_DEG.toDouble())).toFloat()
 

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Solid white so MainActivity's backgroundTintList is the only thing deciding the colour. -->
+<!-- Solid white so CaptureActivity's backgroundTintList is the only thing deciding the colour. -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
     <corners android:radius="100dp" />
     <solid android:color="@android:color/white" />

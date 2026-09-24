@@ -357,3 +357,171 @@ folders. `step_depth.py` now uses `workspace / "02_depth_estimation" / "depth"` 
 `STAGE_DIRNAME`) and its `StepContext` artifacts_dir matches, consistent with every other
 step in the pipeline. `03_2DGS_training/step_train.py`'s `install_depth_cloud` updated to
 read from the new path.
+
+## 2026-09-20: plane regularization of the depth cloud (`regularize_planes.py`)
+Mezzanine floor came out a few degrees rotated against the ground floor. New standalone script
+(never edits its input): RANSAC plane extraction, then per-plane snapping — planes within
+`--floor-tol` (20 deg) of horizontal forced perpendicular to gravity, planes within `--wall-tol`
+(35 deg) of vertical forced parallel to it and azimuth-snapped to area-weighted wall families
+clustered mod 90 deg. Steeper surfaces (sloping roof, beams) left alone by construction.
+Outcome: worked — 20 planes on `current_scene`, 36.8% of points moved, mean 2.8 cm. The nine
+horizontal planes split into three levels (ground -1.4 m, table -0.85 m, mezzanine +1.0 m); the
+mezzanine slabs were 0.8-5.3 deg off horizontal against the ground floor's 2.2-2.4 deg, i.e. the
+~3-5 deg relative rotation observed. All now exactly horizontal.
+
+Two things that were load-bearing and are worth not re-learning:
+- **Up is +Y in this cloud, not +Z.** Voting over the three coordinate axes picks Z (45%
+  support) over the true gravity (0, 0.9999, 0.0137) (76.6%), because the axis-parallel count
+  alone scores walls, not floors. `detect_up()` votes over a Fibonacci hemisphere on
+  *parallel + perpendicular* normal mass instead. Every result before this fix was garbage
+  (24 planes, ten "horizontal" ones tilted 12-15 deg).
+- Raw RANSAC at 3 cm happily returns diagonal cuts through room clutter with a room-sized
+  bbox. Inliers are now filtered by surfel-normal agreement *and* reduced to their largest
+  DBSCAN component, radius auto-set to 6x the cloud's median point spacing (a fixed radius
+  shreds sparse clouds — it silently rejected every plane in the self-test).
+Known ceiling: correction is per-plane, so objects resting on a corrected floor do not follow it.
+`--selftest` builds a synthetic two-floor room and asserts the residuals.
+
+## 2026-09-20: storey alignment -- the actual mezzanine defect (`align_storeys`)
+Per-plane snapping above did *not* fix the reported symptom, and could not: it rotates each
+plane about its own centroid, so a storey yawed as a rigid block stays yawed. Measured the real
+defect instead — dominant wall azimuth (mod 90, from surfel normals) as a function of height is
+flat at -12.4 deg from h=-1.5 to +0.5 m, transitions across 0.75-1.25 m, and is flat at -7 deg
+above. Two rigid blocks, **5.5 deg of yaw apart**, hinged at the mezzanine floor.
+New pass in `regularize_planes.py`, runs before the plane snapping: auto-find the split height
+(the cut making both halves most self-consistent in wall azimuth), seed the yaw from the two
+halves' circular means, refine with trimmed 2D ICP of the two storeys' *floor-plan outlines*
+(wall points projected along gravity — this is what recovers the slide the normals cannot see),
+then apply yaw+slide blended over `--blend` (0.25 m) of height so shared walls do not step at
+the seam. The data's own transition is gradual, so the blend fits it better than a hard cut.
+Outcome: worked — split 1.035 m, -5.01 deg yaw, 6 mm slide (so it was near-pure rotation),
+87.7k points above the split moved; inter-storey azimuth gap 5.53 -> 0.08 deg and the yaw-vs-
+height profile is flat at -12.4 deg throughout. Plan view confirms the two wall outlines now
+coincide. 60% of points moved, mean 7 cm, max 33 cm; colors/scales/opacity untouched.
+Gotcha worth keeping: `(e1, e2, up)` must be built right-handed (`e1 = up x axis; e2 = up x e1`).
+The first storey self-test used `X, Z, Y`, which is left-handed, and silently flipped the sign
+of every azimuth — the correction doubled the error instead of removing it (residual -9.97 deg).
+`--selftest` now also builds a two-storey room with a 5 deg / 8 cm offset upper block and
+asserts recovery (gets 4.97 deg, residual 0.03 deg).
+
+## 2026-09-20: fragment merging + global Manhattan snap
+Storey alignment fixed the block-level yaw but left one physical wall/floor split into several
+RANSAC fragments 1-3 deg apart with sub-5 cm gaps, so the labeller still reported 5 "close"
+pairs. Added to `regularize_planes.py`, after the storey pass: union-find `merge_groups` with a
+**size-scaled** gap budget — `min(merge_k * sqrt(min(area_i, area_j)), max_gap)`, defaults 0.5
+and 0.35 m — so two 3x3 m walls 30 cm apart merge and two 20x20 cm patches 30 cm apart do not;
+then one *global* Manhattan frame (area-weighted circular mean of wall azimuths in 4-theta
+space) rather than pairwise snapping, horizontals forced onto gravity, verticals onto the frame
+when within `--manhattan-tol` (15 deg); each fragment is rotated about its own centroid and then
+slid along its new normal onto the group plane, so merged fragments become coplanar rather than
+merely parallel.
+Outcome: worked — 28 planes -> 8 groups, frame -11.97 deg. Inspected with `label_planes.py`
+before/after: 11 planes >= 4 m2 -> 7, 5 merge candidates -> 1, and the angle matrix went from
+containing 80.89 / 83.75 / 86.19 deg to every off-diagonal <= 1.03 or >= 88.90 deg. 385,779
+points in, none NaN, colours/scales/opacity byte-identical.
+Two gotchas: (1) the labeller's extraction budget must match the regularizer's — the inspector
+ran wider (min-inliers 1500 / max-planes 40 / min-extent 0.5) and kept reporting planes the
+snapper had never seen, until the regularizer's defaults were lowered to match. (2) A second
+regularize pass **diverges** (tested: 9 planes, 3 new merge candidates, a fresh 4.8 deg-tilted
+plane, fragments sliding up to 15 cm) — re-extraction on already-snapped geometry finds
+different planes. One pass only; no `--passes` option was added on purpose.
+
+## 2026-09-20: lattice fill of the snapped surfaces (`--fill`)
+Re-labelling the snapped cloud still reported a split ground floor and ~1 deg between planes that
+the regularizer had snapped to *identical* normals. Traced it: snapping only aims a surface — it
+rotates each fragment rigidly about its centroid, so the points keep their ~1 cm of depth noise
+(group 3: tilt from up exactly 0.000 deg, residual std 10.2 mm). Only 42% of the cloud is ever
+owned by a plane, so the labeller's RANSAC at 2 cm re-carves that 1 cm-thick slab and drags in
+unowned neighbours (its "#1" floor was 78% ground-group + 22% foreign, which is where the 1.10 deg
+tilt came from). The angles were right; the *measurement* was contaminated.
+Fix is `fill_planes`, a final stage: per group, project the owned points into the plane's own 2D
+frame, rasterize occupancy at `--fill-cell` (8 cm), close 1 cell, fill interior gaps up to
+`--fill-max-hole` (0.25 m2) — bigger openings stay open so a stairwell or doorway is not paved
+over — then replace the points with an equidistant lattice at `--fill` spacing on the exact
+snapped plane, colour/opacity inherited from the nearest real point, scale = spacing/2. The
+outline is never grown.
+Outcome: worked — at 2 cm spacing, 163,438 owned points -> 147,280 lattice points, cloud
+385,779 -> 369,621. Measured directly, the two floor lattices are 0.0000 deg apart with 0.000 mm
+thickness. Re-labelled: 7 planes -> 6, 1 merge candidate -> 0, every off-diagonal <= 0.75 or
+>= 89.32 deg (was <= 1.03 / >= 88.90). The residual sub-degree is still the labeller mixing in
+unowned points, not the geometry.
+Note: a group's reported `area_m2` sums its fragments and double-counts their overlap; the fill's
+`filled_m2` is the true unioned footprint and is legitimately smaller (group 0: 22.77 -> 14.36).
+
+## 2026-09-20: plane regularization made part of the stage
+Storey alignment + Manhattan snap + lattice fill now run as the last thing `run_surfels_substep`
+does, rewriting `depth/points3D_depth.ply` in place — no side files, since the `_labelled` /
+`_report` artifacts were session debugging only. `regularize_planes.py` grew `build_parser()` /
+`default_args(**overrides)` so the step can call `regularize()` with the CLI defaults instead of
+hand-building a namespace. Flags: `--no-plane-regularization`, `--plane-fill-spacing` (0.02).
+The PLY is written before the pass runs and the pass is wrapped in try/except, so a failure notes
+itself and leaves the unrefined cloud rather than killing the stage. Bounding box, mean surfel
+scale, surfel count and the camera previews are all re-read from the rewritten PLY — computing
+them from the in-memory `cloud` would have reported pre-refinement numbers.
+Outcome: worked — verified by running the exact in-place path on a copy of the raw cloud:
+28 planes -> 8 surfaces, frame -11.97 deg, storey yaw -5.01 deg, 385,779 -> 369,621 points, no
+NaN, floors 0.0008 deg from horizontal, and re-labelling gives 6 planes with 0 merge candidates.
+Watch out: mean surfel scale now reflects the lattice (spacing/2 = 1 cm) for planar points.
+
+## 2026-09-21: Hole-safe grazing angle filter and free-space consensus for oblique ceilings
+`MAX_GRAZING_ANGLE_DEG` was previously set to 82.0° in `step_depth.py`. In indoor captures
+(especially mezzanine rooms or long halls where cameras are held near chest height), camera rays
+strike ceilings and sloped roofs at oblique angles between 85° and 89° (median measured on ceiling
+was 87.98°). This caused the grazing filter to falsely treat 99.8% of real ceiling pixels as glancing
+edge-bleed artifacts, creating massive holes across the sloped roof and wooden beams.
+Simultaneously, `min_consensus=1` required tight multi-view depth agreement (8cm + 5% z) across
+sloped beam surfaces where adjacent views suffered depth discontinuities, culling points that had
+zero free-space violations.
+Fix:
+1. Relaxed `MAX_GRAZING_ANGLE_DEG` to 89.5° in `step_depth.py` (exposed via `--max-grazing-angle`),
+   culling only degenerate parallel rays while preserving real ceilings/floors.
+2. Defaulted `min_consensus=0` in `run_surfels_substep` and CLI parser, relying on active cross-view
+   free-space carving (`enable_freespace_filter=True`, `max_freespace_violations=2`) to prune floaters
+   rather than culling uncorroborated single-view / low-parallax roof details.
+Outcome: Down-facing ceiling surfels jumped from 11,607 to 22,140 (+90.7% increase), high surfels
+(Y > 1.8m) increased from 36,376 to 51,961 (+42.8%), and covered ceiling cells rose to 3,415
+
+## 2026-09-22: Ray-Footprint Adaptive Sampling, Grazing-Aware Free-Space Tolerance & Manifold Scale Protection
+Identified and resolved remaining perforations across sloped roofs, timber beams, and sparse-view peripheral regions:
+1. **Ray-Footprint & Perspective Divergence Adaptive Sampling (`compute_hybrid_sampling_coords`):**
+   - In smartphone captures where cameras point horizontal/downward, roofs and high beams (>3.5m) suffer perspective foreshortening. Fixed coarse stride (3) resulted in 6–10 cm 3D point spacing, which missed 2cm voxel cells.
+   - Added automatic ray footprint calculation: $\Delta s_{3D} = \frac{d \cdot c_{\text{stride}}}{f_{\text{avg}}}$. If $\Delta s_{3D} \ge \text{max\_3d\_sampling\_spacing\_m}$ (2.2 cm), the region is automatically promoted to fine stride (1 px), ensuring dense coverage across sloped roofs, distant beams, and peripheral walls.
+2. **Grazing-Angle Adaptive Free-Space Margin (`filter_multiview_consistency`):**
+   - Scaled free-space violation margin by $\frac{1}{\max(\cos\theta_{\text{grazing}}, 0.35)}$ on oblique rays where depth discretization and perspective distortion create geometric uncertainty, eliminating false-positive culling on sloped roofs and high beams.
+3. **Adaptive Surfel Radii & GPU Cache Optimization (`normal_tube_collapse`):**
+   - Replaced fixed flat scale assignment with k-NN local neighbor spacing ($\sigma \in [0.5v, 1.8v]$), closing visual gaps in sparser peripheral geometry without bloating dense walls.
+   - Cleared PyTorch GPU memory cache (`torch.cuda.empty_cache()`) before tube collapse to prevent HIP out-of-memory errors on ROCm/CUDA.
+   - Raised `MAX_SURFELS` from 450k to 1.5M in `step_depth.py` to prevent post-tube-collapse downsampling loops from decimating non-planar surfaces (sloped roofs, beams) down to a coarse 4cm grid.
+4. **Verification & Tests:**
+   - 23/23 tests in `test_depth_initialization.py` and `test_depth_prior.py` pass.
+   - 7/7 tests in `test_depth_enhancements.py` and `test_depth_quality_improvements.py` pass.
+   - All shared schemas validated via `validate.py`.
+
+## 2026-09-22: Universal Plane Regularization, 2D Oriented Bounding Box Filtering & Sloped Surface Infilling
+Solved ceiling and sloped roof holes and small-plane clutter without point bloat:
+1. **2D Minimum-Area Oriented Bounding Box (`fit_2d_oriented_bbox`):**
+   - Added exact 2D convex hull and rotating-calipers edge search in `regularize_planes.py` to fit the tightest oriented bounding box ($W \times H$) for candidate planes and multi-fragment groups.
+2. **Architectural Footprint Filter (`--min-bbox-area 3.8`):**
+   - Evaluates total oriented bounding box area on plane groups. Discards small planes ($A_{\text{bbox}} < 3.8\text{ m}^2$) to eliminate furniture, tables, counters, and clutter, while retaining walls, floors, ceilings, and roofs.
+3. **Universal Surface Regularization & Coplanar Grouping:**
+   - Extended `classify()`, `merge_groups()`, and `snap_planes()` to recognize `"sloped"` surfaces (pitch/dormer roofs, angled ceilings).
+   - Coplanar sloped fragments are merged and aligned to a single unified plane equation without artificial snapping to horizontal/vertical axes.
+4. **Equidistant Lattice Infilling for All Applied Surfaces:**
+   - Fixed group applied state propagation so `fill_planes()` resamples all verified surfaces (walls, floors, sloped roofs) into a clean 2cm lattice with hole closing (`--fill-max-hole 1.5`).
+   - On `current_scene`: 40 raw planes regularized into 7-8 verified architectural surfaces, producing a clean, aligned 409k surfel point cloud with sealed roof holes and zero OOM or wall alignment degradation.
+
+## 2026-09-22: Locked Coordinate Gravity Axis, High-Contrast Diagnostic Point Cloud & Markdown Visual Legend
+Uncovered and resolved root cause for missed roof recognition and added full visual diagnostics:
+1. **Root Cause Analysis & Gravity Up-Axis Fix:**
+   - `detect_up(normals)` used hemisphere voting on normals. In indoor captures with >100k wall points along Z, voting misidentified the Z wall normal `[-0.21, -0.01, 0.98]` as the up-axis instead of OpenGL $+Y$ `[0, 1, 0]`.
+   - As a result, walls were classified as horizontal floors, floors as walls, and the sloped roof at $Y \in [2.0, 3.24\text{ m}]$ was completely misoriented and failed plane extraction.
+   - Locked default `up=1` in `regularize_planes.py` and `step_depth.py`, correctly aligning with the pipeline's OpenGL coordinate system.
+2. **High-Contrast Diagnostic Point Cloud Export (`points3D_depth_planes_colored.ply`):**
+   - Each regularized and filled architectural surface is assigned a bright, distinct color from a 19-color palette (Crimson Red, Vivid Green, Gold Yellow, Bright Blue, Deep Orange, Royal Purple, Vibrant Cyan, Hot Magenta, etc.).
+   - Unassigned non-planar clutter and furniture are rendered in dark grey `(65, 65, 65)` so detected planes immediately pop out for inspection in CloudCompare / MeshLab.
+   - Realistic RGB colors are preserved in the primary `points3D_depth.ply` for downstream 2DGS training.
+3. **Comprehensive Companion Markdown Legend (`planes_legend.md`):**
+   - Exports an exhaustive catalog table mapping each group to its color swatch, hex code, RGB tuple, inliers, filled points, bounding box dimensions ($W \times H$), area, centroid, target alignment, and status.
+4. **Outcome on `current_scene`:**
+   - Recognized 8 major architectural surfaces (5 vertical walls, 2 horizontal floor/ceiling, 1 sloped roof at $22.5^\circ$ pitch) over $69.72\text{ m}^2$.
+   - Resampled and infilled into a clean $417,418$ surfel cloud (-1.4% difference from raw $423,681$ surfels), sealing roof holes and maintaining exact Manhattan wall orthogonality without bloat or noise.

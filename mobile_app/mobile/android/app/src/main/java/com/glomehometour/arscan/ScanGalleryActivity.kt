@@ -6,11 +6,13 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.Gravity
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Locale
 
@@ -46,6 +48,8 @@ class ScanGalleryActivity : AppCompatActivity() {
     private lateinit var listContainer: LinearLayout
     private lateinit var emptyText: TextView
 
+    private val store by lazy { PropertyStore(this) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_scan_gallery)
@@ -59,11 +63,91 @@ class ScanGalleryActivity : AppCompatActivity() {
         reload()
     }
 
+    /**
+     * Files first, property index second: the zips on disk are the source of truth, and a scan is
+     * never hidden because the index disagrees with them. Zips with no index row (captured before
+     * properties existed, or unlinked since) land under "Unassigned"; index rows whose zip is gone
+     * (deleted by a file manager) show as missing rather than vanishing silently.
+     */
     private fun reload() {
         val entries = loadScans().sortedByDescending { it.lastModifiedMs }
+        val roomsBySession = store.roomsBySession()
         listContainer.removeAllViews()
-        emptyText.setVisible(entries.isEmpty())
-        for (entry in entries) listContainer.addView(buildRow(entry))
+        emptyText.setVisible(entries.isEmpty() && roomsBySession.isEmpty())
+
+        val byProperty = entries.groupBy { roomsBySession[it.sessionName]?.propertyId }
+        for (property in store.properties()) {
+            val owned = byProperty[property.id].orEmpty()
+            val missing = store.rooms(property.id).filter { room ->
+                entries.none { it.sessionName == room.sessionName }
+            }
+            if (owned.isEmpty() && missing.isEmpty()) continue
+            listContainer.addView(buildHeader(property.address, owned.size + missing.size))
+            for (entry in owned) listContainer.addView(buildRow(entry, roomsBySession[entry.sessionName]))
+            for (room in missing) listContainer.addView(buildMissingRow(room))
+        }
+
+        val unassigned = byProperty[null].orEmpty()
+        if (unassigned.isNotEmpty()) {
+            listContainer.addView(buildHeader("Unassigned", unassigned.size))
+            for (entry in unassigned) listContainer.addView(buildRow(entry, null))
+        }
+    }
+
+    private fun buildHeader(title: String, count: Int): TextView = TextView(this).apply {
+        text = "$title · $count"
+        setTextColor(color(R.color.text_secondary))
+        textSize = 13f
+        setPadding(dp(4), dp(12), dp(4), dp(6))
+    }
+
+    /** An index row whose zip is no longer on disk. Offers the one useful action: forget it. */
+    private fun buildMissingRow(room: PropertyStore.RoomScan): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = getDrawable(R.drawable.card)
+            alpha = 0.6f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(8) }
+        }
+        row.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            addView(TextView(this@ScanGalleryActivity).apply {
+                text = room.label
+                setTextColor(color(R.color.text_primary))
+                textSize = 14f
+            })
+            addView(TextView(this@ScanGalleryActivity).apply {
+                text = "File missing (${room.sessionName})"
+                setTextColor(color(R.color.danger))
+                textSize = 12f
+            })
+        })
+        row.addView(TextView(this).apply {
+            text = "Forget"
+            setTextColor(color(R.color.danger))
+            textSize = 13f
+            setOnClickListener {
+                store.deleteRoomScan(room.sessionName)
+                reload()
+            }
+        })
+        return row
+    }
+
+    /** Opens the entry's zip for reading, wherever it lives. Null for legacy loose sessions. */
+    private fun openZip(entry: ScanEntry): InputStream? {
+        entry.mediaZipId?.let { id ->
+            val uri = ContentUris.withAppendedId(
+                MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), id,
+            )
+            return contentResolver.openInputStream(uri)
+        }
+        return entry.fallbackZipFile?.inputStream()
     }
 
     private fun loadScans(): List<ScanEntry> {
@@ -152,7 +236,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         }
     }
 
-    private fun buildRow(entry: ScanEntry): LinearLayout {
+    private fun buildRow(entry: ScanEntry, room: PropertyStore.RoomScan?): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -163,17 +247,31 @@ class ScanGalleryActivity : AppCompatActivity() {
             ).apply { bottomMargin = dp(8) }
         }
 
+        // Legacy loose-file sessions (captured before finish() zipped, or crashed mid-capture)
+        // have no zip to read a frame out of; show no thumbnail rather than an empty grey box
+        // that reads as a failed load.
+        if (entry.mediaZipId != null || entry.fallbackZipFile != null) {
+            val thumbnail = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setBackgroundColor(color(R.color.action_disabled))
+                layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
+            }
+            row.addView(thumbnail)
+            ThumbnailFetcher.load(entry.sessionName, thumbnail) { openZip(entry) }
+        }
+
         val info = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         info.addView(TextView(this).apply {
-            text = formatDate(entry.lastModifiedMs)
+            text = room?.label ?: entry.sessionName
             setTextColor(color(R.color.text_primary))
             textSize = 14f
         })
         info.addView(TextView(this).apply {
-            text = formatSize(entry.sizeBytes)
+            val coverage = room?.coveragePercent?.let { "${it.toInt()}% · " } ?: ""
+            text = "$coverage${formatDate(entry.lastModifiedMs)} · ${formatSize(entry.sizeBytes)}"
             setTextColor(color(R.color.text_faint))
             textSize = 12f
         })
@@ -184,7 +282,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         val actionArea = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(dp(120), LinearLayout.LayoutParams.WRAP_CONTENT)
+            layoutParams = LinearLayout.LayoutParams(dp(100), LinearLayout.LayoutParams.WRAP_CONTENT)
         }
         val deleteLabel = TextView(this).apply {
             text = "Delete"
@@ -310,6 +408,9 @@ class ScanGalleryActivity : AppCompatActivity() {
                 }
             }
             entry.legacyFallbackDir?.deleteRecursively()
+
+            // The zip was the real data; its index row is meaningless without it.
+            store.deleteRoomScan(entry.sessionName)
             runOnUiThread { reload() }
         }.start()
     }
@@ -328,6 +429,6 @@ class ScanGalleryActivity : AppCompatActivity() {
     }
 }
 
-private fun android.view.View.setVisible(visible: Boolean) {
+internal fun android.view.View.setVisible(visible: Boolean) {
     visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
 }

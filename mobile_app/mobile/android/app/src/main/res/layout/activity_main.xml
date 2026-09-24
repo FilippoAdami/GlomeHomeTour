@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The GLSurfaceView is added programmatically at index 0 (MainActivity.startTracking), so ARCore
+<!-- The GLSurfaceView is added programmatically at index 0 (CaptureActivity.startTracking), so ARCore
      session creation can't race the camera-permission dialog, same reason as the sibling apps.
 
      Everything else here is a HUD over that camera feed, laid out as two insets-aware columns
@@ -348,7 +348,7 @@
         </LinearLayout>
 
         <!-- README section 6 step 2's white-balance trim. The auto grey-world proposal
-             (MainActivity.whiteBalanceGains) is the starting point; these only nudge it, and each
+             (CaptureActivity.whiteBalanceGains) is the starting point; these only nudge it, and each
              track is drawn as its own axis gradient so the control explains itself. Centre =
              "trust the auto proposal as-is". Two axes, same as a camera app's Temp/Tint: a
              red/blue-only slider can never reach a green- or magenta-lit room. -->

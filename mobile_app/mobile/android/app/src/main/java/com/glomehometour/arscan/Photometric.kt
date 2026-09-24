@@ -105,8 +105,8 @@ class PhotometricGate {
         if (inTransition && filled == WINDOW && variance < VARIANCE_MAX) inTransition = false
 
         return when {
-            meanLuma < MEAN_MIN -> Verdict.DARK
-            meanLuma > MEAN_MAX -> Verdict.BLOWN
+            meanLuma < Tunables.photometricMeanMin -> Verdict.DARK
+            meanLuma > Tunables.photometricMeanMax -> Verdict.BLOWN
             inTransition -> Verdict.TRANSITION
             else -> Verdict.OK
         }
@@ -132,7 +132,8 @@ class PhotometricGate {
     }
 
     companion object {
-        /** Thresholds tuned for top-15% lightest pixel luminance gating. */
+        /** Thresholds tuned for top-15% lightest pixel luminance gating. MEAN_MIN/MEAN_MAX are
+         * defaults only -- the live values are Tunables.photometricMeanMin/Max. */
         const val MEAN_MIN = 14f
         const val MEAN_MAX = 250f
         const val DELTA_MAX = 35f

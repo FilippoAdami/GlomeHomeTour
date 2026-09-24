@@ -129,11 +129,15 @@ class QualityGate:
         max_saturated_fraction: float = 0.30,       # clipped-white pixels
         max_black_fraction: float = 0.50,           # crushed-black pixels
         min_texture: float = 60.0,                  # featureless-frame floor
+        min_relative_sharpness_floor: float = 0.28, # relative sharpness floor on absolute detail
+        max_consecutive_discard: int = 4,           # maximum consecutive dropped frames
         work_resolution: int = 960,                 # long edge used for scoring
     ):
         self.blur_threshold = blur_threshold
         self.relative_blur_threshold = relative_blur_threshold
+        self.min_relative_sharpness_floor = min_relative_sharpness_floor
         self.max_reject_fraction = max_reject_fraction
+        self.max_consecutive_discard = max_consecutive_discard
         self.dark_threshold = dark_threshold
         self.blown_threshold = blown_threshold
         self.max_saturated_fraction = max_saturated_fraction
@@ -244,8 +248,11 @@ class QualityGate:
         relative = np.maximum(absolute / abs_ref, normalized / norm_ref)
 
         blur_flags = [
-            bool(relative[i] < self.relative_blur_threshold
-                 or (self.blur_threshold is not None and absolute[i] < self.blur_threshold))
+            bool(
+                relative[i] < self.relative_blur_threshold
+                or (self.min_relative_sharpness_floor is not None and (absolute[i] / abs_ref) < self.min_relative_sharpness_floor)
+                or (self.blur_threshold is not None and absolute[i] < self.blur_threshold)
+            )
             for i in range(len(stats))
         ]
         self._apply_reject_cap(blur_flags, relative)
@@ -302,6 +309,34 @@ class QualityGate:
             ))
 
             (accepted_indices if accepted else discarded_indices).append(idx)
+
+        # Cap consecutive discarded frames to prevent tracking loss and coverage blackouts
+        if self.max_consecutive_discard is not None and self.max_consecutive_discard > 0 and len(keyframes) > 0:
+            run: list[int] = []
+            for idx in range(len(keyframes)):
+                if not metrics[idx].accepted:
+                    run.append(idx)
+                    if len(run) > self.max_consecutive_discard:
+                        # Re-accept the best quality frame in the run to anchor the trajectory
+                        best_i = max(
+                            run,
+                            key=lambda i: relative[i] * max(1.0, stats[i].texture),
+                        )
+                        old_reason = metrics[best_i].rejection_reason
+                        metrics[best_i].accepted = True
+                        metrics[best_i].rejection_reason = None
+                        if old_reason == "blur":
+                            count_blur -= 1
+                        elif old_reason == "texture":
+                            count_texture -= 1
+                        elif old_reason == "exposure":
+                            count_exposure -= 1
+                        run = [i for i in run if i > best_i]
+                else:
+                    run.clear()
+
+            accepted_indices = [i for i, m in enumerate(metrics) if m.accepted]
+            discarded_indices = [i for i, m in enumerate(metrics) if not m.accepted]
 
         accepted_kfs = [keyframes[i] for i in accepted_indices]
         discarded_kfs = [keyframes[i] for i in discarded_indices]

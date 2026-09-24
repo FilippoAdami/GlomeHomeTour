@@ -29,6 +29,7 @@
           "fl_y": { "type": "number" },
           "cx": { "type": "number" },
           "cy": { "type": "number" },
+          "compass_heading_deg": { "type": ["number", "null"] },
           "transform_matrix": {
             "type": "array",
             "minItems": 4,

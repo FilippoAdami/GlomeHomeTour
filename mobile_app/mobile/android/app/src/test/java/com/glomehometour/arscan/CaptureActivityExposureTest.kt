@@ -4,7 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-class MainActivityExposureTest {
+class CaptureActivityExposureTest {
 
     @Test
     fun `dark indoor scene increases exposure without exceeding limits`() {
@@ -12,7 +12,7 @@ class MainActivityExposureTest {
         val initialShutter = CameraPipeline.FASTEST_SHUTTER_NS
         val darkLuma = 20.0f
 
-        val exposure = MainActivity.meteredExposure(darkLuma, initialIso, initialShutter)
+        val exposure = CaptureActivity.meteredExposure(darkLuma, initialIso, initialShutter)
 
         assertTrue(exposure.shutterNs > initialShutter)
         assertTrue(exposure.shutterNs <= CameraPipeline.SLOWEST_SHUTTER_NS)
@@ -24,7 +24,7 @@ class MainActivityExposureTest {
         val initialShutter = CameraPipeline.FASTEST_SHUTTER_NS
         val brightLuma = 220.0f
 
-        val exposure = MainActivity.meteredExposure(brightLuma, initialIso, initialShutter)
+        val exposure = CaptureActivity.meteredExposure(brightLuma, initialIso, initialShutter)
 
         assertTrue(exposure.iso < initialIso)
         assertEquals(CameraPipeline.FASTEST_SHUTTER_NS, exposure.shutterNs)
@@ -33,7 +33,7 @@ class MainActivityExposureTest {
     @Test
     fun `white balance gains normalize color casts`() {
         // Warm yellowish room: Y=128, U=110 (low blue, cb=-18), V=145 (high red, cr=+17)
-        val gains = MainActivity.whiteBalanceGains(meanY = 128f, meanU = 110f, meanV = 145f)
+        val gains = CaptureActivity.whiteBalanceGains(meanY = 128f, meanU = 110f, meanV = 145f)
         // Red gain should be < 1.0 (to attenuate red), Blue gain should be > 1.0 (to boost blue)
         assertTrue(gains[0] < gains[3])
     }

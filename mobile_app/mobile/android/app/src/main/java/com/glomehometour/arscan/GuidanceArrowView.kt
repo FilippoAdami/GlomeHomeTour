@@ -10,14 +10,14 @@ import android.view.View
 
 /**
  * The 2D half of the guidance cue (SPEC section 2.4): an arrow pointing at the guidance target,
- * rotated by MainActivity via the standard View.rotation property -- so this class only ever has to
+ * rotated by CaptureActivity via the standard View.rotation property -- so this class only ever has to
  * draw an arrow pointing up, and the bearing math stays in the renderer that already has the MVP.
  *
  * The 3D marker alone isn't enough: the thing the operator most needs to be told about is a
  * region that is, by definition, not currently on screen.
  *
  * One view class, two colours: reused for both the frontier arrow (amber, default) and the
- * occlusion arrow (set via [fillColor] in code -- see MainActivity) so the two guidance mechanics
+ * occlusion arrow (set via [fillColor] in code -- see CaptureActivity) so the two guidance mechanics
  * README/Phase_1.md section 6 requires stay visually distinct without a second copy of this class.
  */
 class GuidanceArrowView @JvmOverloads constructor(

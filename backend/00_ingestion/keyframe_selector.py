@@ -148,6 +148,7 @@ class DynamicKeyframeSelector:
         max_covisibility: float = 0.78,       # If overlap with the last keyframe > 78%, discard as redundant
         reference_depth_m: float = 2.0,       # Reference plane depth for frustum projection (meters)
         sample_grid_size: int = 10,           # N x N sample rays for fast frustum intersection
+        aggressiveness: Optional[float] = None, # Selection aggressiveness in [0.0, 1.0]
     ):
         self.min_translation_m = min_translation_m
         self.min_rotation_deg = min_rotation_deg
@@ -155,6 +156,7 @@ class DynamicKeyframeSelector:
         self.max_covisibility = max_covisibility
         self.reference_depth_m = reference_depth_m
         self.sample_grid_size = sample_grid_size
+        self.aggressiveness = aggressiveness
 
     @classmethod
     def for_2dgs_training(
@@ -165,21 +167,9 @@ class DynamicKeyframeSelector:
         max_covisibility: float = 0.80,
         reference_depth_m: float = 2.0,
         sample_grid_size: int = 10,
+        aggressiveness: Optional[float] = None,
     ) -> "DynamicKeyframeSelector":
-        """Factory configured specifically for dense 2DGS training keyframe selection.
-
-        ``max_covisibility`` is the only parameter that materially moves the
-        selected count (sweeping translation/rotation over 2-3x changed it by
-        <1%). ``min_covisibility`` is the one that matters for correctness: it
-        is a floor on the overlap between *consecutive* selected keyframes, so
-        erring high costs frames but never coverage.
-
-        These numbers only mean anything when ``scene_depths`` is supplied. They
-        are calibrated against measured depth, where overlap decays much faster
-        than the old fixed-2 m assumption implied, so they read lower than the
-        thresholds they replace while being strictly stricter in practice. On
-        Bedroom2 this pair keeps ~48% of stage 2 (median depth 0.8 m).
-        """
+        """Factory configured specifically for dense 2DGS training keyframe selection."""
         return cls(
             min_translation_m=min_translation_m,
             min_rotation_deg=min_rotation_deg,
@@ -187,7 +177,30 @@ class DynamicKeyframeSelector:
             max_covisibility=max_covisibility,
             reference_depth_m=reference_depth_m,
             sample_grid_size=sample_grid_size,
+            aggressiveness=aggressiveness,
         )
+
+    def compute_aggressiveness_params(self, aggressiveness: float, n_total: int) -> tuple[float, float, float, int, int]:
+        """Compute parameter scaling based on aggressiveness in [0.0, 1.0]."""
+        a = float(np.clip(aggressiveness, 0.0, 1.0))
+        if a <= 0.5:
+            t = a / 0.5
+            max_covis = 1.0 - t * (1.0 - 0.80)
+            min_trans = t * 0.08
+            min_rot = t * 4.0
+            max_pct = 1.0 - t * (1.0 - 0.50)
+            min_pct = 1.0 - t * (1.0 - 0.15)
+        else:
+            t = (a - 0.5) / 0.5
+            max_covis = 0.80 - t * (0.80 - 0.35)
+            min_trans = 0.08 + t * (0.35 - 0.08)
+            min_rot = 4.0 + t * (18.0 - 4.0)
+            max_pct = 0.50 - t * (0.50 - 0.05)
+            min_pct = 0.15 - t * (0.15 - 0.02)
+
+        min_kf = max(2, int(round(min_pct * n_total)))
+        max_kf = max(min_kf, int(round(max_pct * n_total)))
+        return max_covis, min_trans, min_rot, min_kf, max_kf
 
     def select_keyframes(
         self,
@@ -196,24 +209,23 @@ class DynamicKeyframeSelector:
         min_keyframes: Optional[int] = None,
         max_keyframes: Optional[int] = None,
         scene_depths: Optional[np.ndarray] = None,
+        aggressiveness: Optional[float] = None,
     ) -> KeyframeSelectionResult:
-        """Dynamically filter keyframes to an optimal anchor subset.
-
-        ``scene_depths`` (one measured depth per keyframe, from
-        :func:`estimate_scene_depths`) is what makes the overlap numbers mean
-        anything. Without it every frame is assumed to be looking at something
-        ``reference_depth_m`` away, which silently rates disjoint views as
-        heavily overlapping wherever the real scene is nearer than that.
-
-        ``min_keyframes``/``max_keyframes`` are best-effort targets, not hard
-        limits: they are met by re-walking the trajectory at a looser/tighter
-        overlap threshold, and the walk will not go below ``min_covisibility``
-        between neighbours to satisfy a budget. A fast pan has a minimum number
-        of frames that keeps it connected, and coverage outranks compactness.
-        """
+        """Dynamically filter keyframes to an optimal anchor subset."""
         n_total = len(keyframes)
         if n_total == 0:
             return KeyframeSelectionResult([], [], [], 0, 0.0, {})
+
+        eff_aggr = self.aggressiveness if aggressiveness is None else aggressiveness
+        if eff_aggr is not None and eff_aggr <= 0.0:
+            return KeyframeSelectionResult(
+                selected_indices=list(range(n_total)),
+                selected_keyframes=list(keyframes),
+                discarded_indices=[],
+                total_evaluated=n_total,
+                selection_ratio=1.0,
+                reasons={"skipped_aggressiveness_zero": n_total},
+            )
 
         if n_total <= 2:
             return KeyframeSelectionResult(
@@ -224,6 +236,18 @@ class DynamicKeyframeSelector:
                 selection_ratio=1.0,
                 reasons={"initial": n_total},
             )
+
+        if eff_aggr is not None:
+            eff_max_covis, eff_min_trans, eff_min_rot, calc_min_kf, calc_max_kf = \
+                self.compute_aggressiveness_params(eff_aggr, n_total)
+            if eff_aggr != 0.5:
+                self.max_covisibility = eff_max_covis
+                self.min_translation_m = eff_min_trans
+                self.min_rotation_deg = eff_min_rot
+            if min_keyframes is None:
+                min_keyframes = calc_min_kf
+            if max_keyframes is None:
+                max_keyframes = calc_max_kf
 
         self._ray_cache = {}
 

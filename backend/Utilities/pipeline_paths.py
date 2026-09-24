@@ -29,7 +29,7 @@ def stage_paths() -> list[str]:
     must pass these through ``PYTHONPATH``: a fresh interpreter inherits none of
     the parent's ``sys.path``, and those scripts import bare stage module names.
     """
-    return [str(_BACKEND_DIR / stage) for stage in _STAGE_DIRS]
+    return [str(_BACKEND_DIR)] + [str(_BACKEND_DIR / stage) for stage in _STAGE_DIRS]
 
 
 def subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:

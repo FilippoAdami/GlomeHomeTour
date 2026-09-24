@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- One palette for the whole HUD, read from both the layout and MainActivity so the 2D overlay,
+<!-- One palette for the whole HUD, read from both the layout and CaptureActivity so the 2D overlay,
      the button states and ArScanRenderer's 3D markers can't drift apart. Amber and cyan match
      ArScanRenderer's MARKER_RGBA/OCCLUSION_MARKER_RGBA exactly: the arrow the operator follows and
      the diamond it points at have to be the same colour or the cue reads as two separate things. -->

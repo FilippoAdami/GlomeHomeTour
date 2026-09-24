@@ -957,3 +957,47 @@ cooldown before re-triggering AF; and replacing the single-value warning `when` 
 dedupes same-kind while showing or queued, and pops the next distinct kind after.
 Outcome: worked — `compileDebugKotlin` clean; not yet re-verified against a real over-focusing
 scan on rosemary (originating bug report was from memory of the incident, not a live repro).
+
+## 2026-09-20: Implementation plan phases 0-3 (home, properties, gallery, settings)
+Built `implementation_plan.md`'s Phases 0-3. Phase 0: `MainActivity` -> `CaptureActivity`
+(mechanical rename, tests renamed with it), new `HomeActivity` takes the LAUNCHER intent-filter,
+capture/gallery/detail/settings all exported=false. Phase 1: `PropertyStore` (properties + room
+scans), `PropertyDetailActivity` launches `CaptureActivity` with property id + room label extras;
+the finish callback indexes the finished session *inside* the existing `finishedPath` completion
+gate, so the 2026-09-18 save-completion race isn't reintroduced and a row can't point at a zip
+that was never written. Coverage % is taken from the in-memory `CoverageWorker` stats rather than
+re-reading `coverage_summary.json` back out of the zip. Phase 2: `ScanGalleryActivity` groups by
+property with zip thumbnails (`ThumbnailFetcher`, streams the first `images/*.jpg` out of the zip
+via a content URI, in-memory LRU); MediaStore/legacy-fallback listing and the delete-with-progress
+path are untouched, grouping is derived on top. Listing stays file-first: zips with no index row
+show under "Unassigned", index rows with no zip show as "File missing" with a Forget action.
+Phase 3: `SettingsActivity` + `Tunables` expose parallax angle, coverage-complete threshold,
+photometric luma bounds and decimation stride; defaults are the existing constants, so untouched
+installs and all unit tests behave exactly as before.
+Deviations from the plan, both deliberate: persistence is a JSON file, not Room (the access
+pattern is "load all, show all" over tens of rows -- Room would have meant adding KSP to a build
+that has no annotation processing); settings are hand-built views, not `PreferenceFragmentCompat`
+(five clamped numbers don't earn the androidx.preference dependency). The plan's constant values
+were also stale: the parallax angle is `VoxelGrid.PARALLAX_MIN_DEG` = 25 (not
+`FeatureParallaxTracker`'s separate 12), the luma floor is 14 (not 40), and there is no
+"8cm / 6 deg" keyframe spacing -- decimation is per-frame-count (`DECIMATION_STRIDE`), which is
+what got exposed.
+Phase 4 (auth + upload) not started: `backend/api/` does not exist, so there is no contract to
+build against. Left unbuilt rather than guessed, per the plan's own §6.1.
+Verified on `rosemary` over adb: home screen, property creation (row lands in
+`files/properties.json`), property detail, add-room dialog, `CaptureActivity` launching from it
+with camera live and ARCore `READY`, settings render with the right defaults, Save persisting to
+`shared_prefs/capture_tunables.xml`, gallery grouping ("Unassigned · N"), zip thumbnail decode and
+delete-with-confirm removing the file. One fix came out of that pass: the device's only existing
+scan is a legacy loose-file session with no zip, so its thumbnail slot rendered as an empty grey
+box that read as a failed load -- the `ImageView` is now only added when there is actually a zip
+to decode from.
+Also learned: a zip pushed into `Documents/GlomeHomeTour/` over adb is invisible to the app.
+API 30 scoped storage only shows an app the MediaStore rows it owns, so a synthetic zip can't be
+planted there to test with; pushing it to `Android/data/<pkg>/files/` (the `File`-based fallback
+path `collectFromFallbackDir` walks) does work and is how the thumbnail path got exercised.
+Outcome: worked — `assembleDebug` clean, 89 unit tests pass (5 new in `TunablesTest`, covering the
+defaults-match-constants invariant and the settings clamp), installed and driven on `rosemary`.
+Still unverified: the SCANNING and DONE screens, i.e. whether a finished capture actually writes
+its `RoomScan` row back to the property -- that needs a person walking a lit room, per
+[[arcore-pointcloud-not-a-tracking-gate]].

@@ -65,6 +65,7 @@ class Keyframe:
     cy: float = 0.0
     transform_matrix: np.ndarray = field(default_factory=lambda: np.eye(4, dtype=np.float64))  # (4, 4) float64
     image_loader: Callable[[], Image.Image] = field(default_factory=lambda: (lambda: Image.new("RGB", (1, 1))))
+    compass_heading_deg: Optional[float] = None
 
     def load_image(self) -> Image.Image:
         """Load and return PIL Image for this keyframe."""
@@ -345,6 +346,7 @@ class PackageLoader:
                 fl_y=float(frame_dict["fl_y"]),
                 cx=float(frame_dict["cx"]),
                 cy=float(frame_dict["cy"]),
+                compass_heading_deg=(float(frame_dict["compass_heading_deg"]) if frame_dict.get("compass_heading_deg") is not None else None),
                 transform_matrix=mat_4x4,
                 image_loader=make_loader(rel_path),
             )

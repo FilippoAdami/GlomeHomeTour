@@ -1,15 +1,11 @@
-"""Shared contract for pipeline steps: logging, metrics, state, resume.
+"""Shared contract for pipeline steps: logging, metrics, stats, resume.
 
-Every step wraps its work in a :class:`StepContext`, which owns three files in
+Every step wraps its work in a :class:`StepContext`, which owns files in
 the workspace:
 
 * ``<name>_log.txt``   -- human-readable, everything the step printed
 * ``<name>_stats.json`` -- machine-readable metrics, keyed however the step likes
-* ``pipeline_state.json`` -- ``step -> {status, started, finished, ...}``
-
-On failure the state entry is written as ``failed`` with the traceback in the
-log and the workspace is left untouched, so the failing step can be re-run in
-isolation against exactly the inputs that broke it.
+* ``pipeline_stats.json`` -- high-level aggregated metrics across pipeline steps
 """
 
 from __future__ import annotations
@@ -22,15 +18,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-STATE_FILE = "pipeline_state.json"
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def read_state(workspace: Path | str) -> dict[str, Any]:
-    path = Path(workspace) / STATE_FILE
+def read_pipeline_stats(workspace: Path | str) -> dict[str, Any]:
+    path = Path(workspace) / "pipeline_stats.json"
     if not path.exists():
         return {}
     try:
@@ -39,31 +33,54 @@ def read_state(workspace: Path | str) -> dict[str, Any]:
         return {}
 
 
-def write_state(workspace: Path | str, name: str, entry: dict[str, Any]) -> None:
-    workspace = Path(workspace)
-    workspace.mkdir(parents=True, exist_ok=True)
-    state = read_state(workspace)
-    state[name] = entry
-    (workspace / STATE_FILE).write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
 def is_done(workspace: Path | str, name: str, outputs: Iterable[Path | str] = ()) -> bool:
-    """True if the step recorded ``ok`` *and* its declared outputs still exist.
-
-    Both halves matter: state alone goes stale the moment someone deletes a
-    folder by hand, and outputs alone can't tell a finished step from one that
-    crashed after writing its first file.
-    """
-    entry = read_state(workspace).get(name)
-    if not entry or entry.get("status") != "ok":
+    """True if the step recorded metrics in pipeline_stats.json *and* its declared outputs still exist."""
+    stats = read_pipeline_stats(workspace)
+    if name not in stats:
         return False
     return all(Path(p).exists() for p in outputs)
 
 
-class StepContext:
-    """Context manager owning one step's log, stats and state entry.
+def update_pipeline_stats(
+    workspace: Path | str,
+    step_name: str,
+    total_time: float,
+    frames_processed: int,
+    time_per_frame: Optional[float] = None,
+    extra_metrics: Optional[dict[str, Any]] = None,
+) -> Path:
+    """Save or update substep metrics into <workspace>/pipeline_stats.json."""
+    workspace = Path(workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
+    stats_file = workspace / "pipeline_stats.json"
 
-    ``workspace`` is where the shared ``pipeline_state.json`` lives (always the
+    if time_per_frame is None:
+        time_per_frame = round(total_time / max(1, frames_processed), 6) if frames_processed > 0 else 0.0
+
+    data = {}
+    if stats_file.exists():
+        try:
+            data = json.loads(stats_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+
+    step_data = {
+        "total_time": round(float(total_time), 4),
+        "frames_processed": int(frames_processed),
+        "time_per_frame": round(float(time_per_frame), 6),
+    }
+    if extra_metrics:
+        step_data.update(extra_metrics)
+
+    data[step_name] = step_data
+    stats_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return stats_file
+
+
+class StepContext:
+    """Context manager owning one step's log and metrics.
+
+    ``workspace`` is where the shared ``pipeline_stats.json`` lives (always the
     scene root). ``artifacts_dir`` is where this step's own ``<name>_log.txt``
     and ``<name>_stats.json`` are written -- its per-stage subfolder, if it has
     one, else the same as ``workspace``.
@@ -110,35 +127,47 @@ class StepContext:
         self.note("=" * 70)
         self.note(f"  STEP: {self.name}   started {_now()}")
         self.note("=" * 70)
-        write_state(self.workspace, self.name,
-                    {"status": "running", "started": _now(), "finished": None})
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        elapsed = round(time.time() - self._started, 2)
+        elapsed = round(time.time() - self._started, 4)
         self.metrics["elapsed_s"] = elapsed
         if self.timings:
             self.metrics["timings_s"] = self.timings
+
+        frames = self.metrics.get("frames_processed")
+        if frames is None:
+            for alt_key in ("total_in", "frames", "total_evaluated"):
+                if alt_key in self.metrics and isinstance(self.metrics[alt_key], (int, float)):
+                    frames = int(self.metrics[alt_key])
+                    break
+        frames_processed = int(frames) if frames is not None else 0
+        t_per_frame = round(elapsed / max(1, frames_processed), 6) if frames_processed > 0 else 0.0
+        self.metrics["total_time"] = elapsed
+        self.metrics["frames_processed"] = frames_processed
+        self.metrics["time_per_frame"] = t_per_frame
 
         if exc_type is not None:
             self.note("")
             self.note(f"FAILED after {elapsed:.1f}s: {exc_type.__name__}: {exc}")
             self.note("".join(traceback.format_exception(exc_type, exc, tb)))
-            status = "failed"
+            # Clear step from pipeline_stats.json on failure
+            stats_file = self.workspace / "pipeline_stats.json"
+            if stats_file.exists():
+                try:
+                    data = json.loads(stats_file.read_text(encoding="utf-8"))
+                    if self.name in data:
+                        del data[self.name]
+                        stats_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except json.JSONDecodeError:
+                    pass
         else:
             self.note("")
             self.note(f"OK in {elapsed:.1f}s")
-            status = "ok"
+            update_pipeline_stats(self.workspace, self.name, elapsed, frames_processed, t_per_frame)
 
         (self.artifacts_dir / f"{self.name}_stats.json").write_text(
             json.dumps(self.metrics, indent=2, default=str), encoding="utf-8")
-        write_state(self.workspace, self.name, {
-            "status": status,
-            "started": _now() if not self._started else
-                       datetime.fromtimestamp(self._started, timezone.utc).isoformat(timespec="seconds"),
-            "finished": _now(),
-            "elapsed_s": elapsed,
-        })
         if self._log is not None:
             self._log.close()
             self._log = None

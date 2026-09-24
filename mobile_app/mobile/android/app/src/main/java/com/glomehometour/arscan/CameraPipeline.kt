@@ -32,7 +32,7 @@ import com.google.ar.core.Session
  * there's one physical sensor readout rate (`CONTROL_AE_TARGET_FPS_RANGE`, targeted at 60), and
  * ARCore's pose tracker consumes frames from it at whatever rate it can keep up with -- it was
  * never on a separate clock, it just doesn't have to process every one. Recording decimation
- * (MainActivity.isKeyframe, §10 item 2) is the thing that turns "60fps sensor" into "6-10
+ * (CaptureActivity.isKeyframe, §10 item 2) is the thing that turns "60fps sensor" into "6-10
  * keyframes/sec export" without asking the sensor to run at a different rate than ARCore reads.
  *
  * Not unit-tested: this is Camera2/ARCore session plumbing with no pure-Kotlin surface, same
@@ -92,7 +92,7 @@ class CameraPipeline(
 
     /** Manual ISO, metered from ambient light during pre-flight (README §4/§6) and then left
      * alone once scanning starts. Jointly tuned with `shutterNanos` against a shared tradeoff
-     * curve (grain vs. motion blur) -- see `MainActivity.meteredExposure()`. */
+     * curve (grain vs. motion blur) -- see `CaptureActivity.meteredExposure()`. */
     @Volatile var isoSensitivity: Int = DEFAULT_ISO
         set(value) {
             field = value
@@ -294,7 +294,7 @@ class CameraPipeline(
         // Shutter 1/500s-1/50s and ISO 50-ceiling, jointly metered (README §4), manual exposure
         // (AE off). A slow shutter beyond one frame duration necessarily drops the achievable
         // frame rate below the 60fps target above -- that's a real hardware tradeoff, not a bug;
-        // MainActivity.meteredExposure() prefers ISO's cheaper-on-framerate cost once shutter
+        // CaptureActivity.meteredExposure() prefers ISO's cheaper-on-framerate cost once shutter
         // alone would start cutting into readout rate (see its own comment).
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         val exposureRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)

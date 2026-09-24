@@ -53,6 +53,7 @@ def filter_quality(workspace: Path, stage_dir: Path, ctx: StepContext,
 
     pct = 100.0 * kept / max(1, total)
     ctx.metric("total_in", total)
+    ctx.metric("frames_processed", total)
     ctx.metric("kept", kept)
     ctx.metric("discarded", rejected)
     ctx.metric("kept_pct", round(pct, 1))
@@ -97,6 +98,11 @@ def filter_quality(workspace: Path, stage_dir: Path, ctx: StepContext,
         margins[m.rejection_reason].append(float(value - threshold))
 
     ctx.metric("discarded_frames", per_frame)
+    # Save per-frame blur scores for downstream sharpness-aware keyframe selection
+    ctx.metric("per_frame_sharpness", {
+        Path(m.file_path).name: round(float(m.blur_score), 2)
+        for m in result.metrics
+    })
     for reason, values in margins.items():
         if values:
             ctx.metric(f"margin_{reason}", {

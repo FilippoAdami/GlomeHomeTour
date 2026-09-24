@@ -91,3 +91,36 @@ def test_edge_cases():
     sel_few, meta_few = select_keyframes_arcore(f_few)
     assert len(sel_few) == 15
     assert meta_few["pruned"] is False
+
+
+def test_sharpness_aware_swapping():
+    # Sequence of 100 frames where frame 10 is very blurry and frame 11 is crisp and close
+    frames = [_make_dummy_frame(i, i * 0.05, 1.4, 0.0) for i in range(100)]
+    sharpness = np.ones(100) * 50.0
+    sharpness[10] = 5.0   # very blurry
+    sharpness[11] = 95.0  # very sharp
+
+    # Target count that includes ~50 frames
+    sel, meta = select_keyframes_arcore(frames, target_count=50, sharpness_scores=sharpness)
+    sel_paths = [f["file_path"] for f in sel]
+    # Blurry frame 10 is rejected
+    assert "images/000010.jpg" not in sel_paths
+    # Crisp frame 11 is chosen
+    assert "images/000011.jpg" in sel_paths
+
+
+def test_max_rotation_preserved_during_pruning():
+    # Sequence with a sharp 30-degree turn in the middle:
+    # Even if target_count requests very few frames, consecutive frames must never exceed 16 deg jump
+    frames = []
+    for i in range(30):
+        # 1 deg per frame
+        frames.append(_make_dummy_frame(i, i * 0.05, 1.4, 0.0, yaw_deg=i * 1.5))
+    sel, meta = select_keyframes_arcore(frames, target_count=5)
+    # Check max consecutive rotation between selected frames
+    rots = [np.array(f["transform_matrix"])[:3, :3] for f in sel]
+    from select_keyframes_arcore import rotation_angle_deg
+    for k in range(len(rots) - 1):
+        ang = rotation_angle_deg(rots[k], rots[k + 1])
+        assert ang <= 16.5, f"Rotation jump {ang:.1f} deg between {sel[k]['file_path']} and {sel[k+1]['file_path']} exceeds 16 deg limit"
+
