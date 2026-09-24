@@ -82,34 +82,7 @@ def build_da3_poses(
                 "sparse/0/ and images/ must match exactly -- run step 2/3's prune first.")
         cand_names = list(names)
 
-    # Filter by drift against ARCore if transforms are supplied
-    kept_names = []
-    dropped_drift = []
-    for name in cand_names:
-        if arcore_transforms is not None and name in arcore_transforms:
-            img = by_name[name]
-            w2c_cand = np.eye(4, dtype=np.float64)
-            w2c_cand[:3, :3] = qvec2rotmat(img.qvec)
-            w2c_cand[:3, 3] = img.tvec
-            c2w_colmap = np.linalg.inv(w2c_cand) @ _FLIP_YZ
-            c2w_arcore = np.asarray(arcore_transforms[name], dtype=np.float64)
-
-            R_diff = c2w_colmap[:3, :3].T @ c2w_arcore[:3, :3]
-            trace_val = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
-            angle_deg = float(np.degrees(np.arccos(trace_val)))
-            trans_m = float(np.linalg.norm(c2w_colmap[:3, 3] - c2w_arcore[:3, 3]))
-
-            if angle_deg > max_rot_deg or trans_m > max_trans_m:
-                dropped_drift.append((name, angle_deg, trans_m))
-                continue
-        kept_names.append(name)
-
-    if dropped_drift:
-        print(f"[build_da3_poses] Pruned {len(dropped_drift)} corrupted keyframe(s) exceeding drift tolerance "
-              f"(>{max_rot_deg}° or >{max_trans_m * 100:.0f}cm):")
-        for n, a, t in dropped_drift[:10]:
-            print(f"    {n}: rot={a:.1f}°, trans={t * 100:.1f}cm")
-
+    kept_names = cand_names
     w2c = np.zeros((len(kept_names), 4, 4), dtype=np.float32)
     k_mats = np.zeros((len(kept_names), 3, 3), dtype=np.float32)
     for i, name in enumerate(kept_names):

@@ -699,6 +699,7 @@ def filter_multiview_consistency(
     depth_maps: Sequence[np.ndarray],
     intrinsics: CameraIntrinsics,
     normals_world: Optional[np.ndarray] = None,
+    normal_maps: Optional[Sequence[Optional[np.ndarray]]] = None,
     max_neighbors: int = 6,
     min_consensus: int = 1,
     enable_freespace_filter: bool = True,
@@ -706,6 +707,7 @@ def filter_multiview_consistency(
     freespace_margin_m: float = 0.08,
     min_neighbor_baseline_m: float = 0.08,
     min_neighbor_parallax_deg: float = 3.0,
+    max_depth_ceiling: Optional[float] = None,
 ) -> np.ndarray:
     """Return boolean mask of points corroborated by neighboring camera views.
 
@@ -782,19 +784,37 @@ def filter_multiview_consistency(
 
         # Stay slightly away from extreme image boundary to avoid edge sampling distortion
         valid_uv = in_front & (u >= 2) & (u < dw - 2) & (v >= 2) & (v < dh - 2)
-        views_in_frustum += valid_uv.astype(np.int32)
 
         obs_depth = np.zeros(n_pts, dtype=np.float32)
         obs_depth[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
 
         valid_obs = valid_uv & np.isfinite(obs_depth) & (obs_depth > 0.2)
+        if max_depth_ceiling is not None:
+            valid_obs = valid_obs & (obs_depth <= max_depth_ceiling)
+
+        # Discard invalid normal regions (failed plane fit / shadow holes) from carving free space
+        valid_carving_obs = valid_obs
+        if normal_maps is not None and j < len(normal_maps) and normal_maps[j] is not None:
+            n_map_j = normal_maps[j]
+            norm_lengths = np.zeros(n_pts, dtype=np.float32)
+            norm_lengths[valid_uv] = np.linalg.norm(n_map_j[v[valid_uv], u[valid_uv]], axis=-1)
+            valid_carving_obs = valid_obs & (norm_lengths > 0.5)
 
         # 1. Surface agreement / consensus check
         tol = 0.08 + 0.05 * proj_z
         match = valid_obs & (np.abs(obs_depth - proj_z) <= tol)
         consensus_count += match.astype(np.int32)
 
-        # 2. Cross-view free-space check (detecting empty space between camera and observed surface)
+        # 2. Occlusion-aware frustum observation:
+        # If the other camera sees an obstacle in front (obs_depth < proj_z - tol),
+        # this 3D point is occluded (e.g. by a mezzanine floor, wall, or beam) from camera j.
+        # An occluded camera cannot see the point, so it must NOT penalize the point as an
+        # uncorroborated frustum view! Only unoccluded views expect surface agreement.
+        occluded = valid_obs & (obs_depth < (proj_z - tol))
+        unoccluded_in_frustum = valid_uv & (~occluded)
+        views_in_frustum += unoccluded_in_frustum.astype(np.int32)
+
+        # 3. Cross-view free-space check (detecting empty space between camera and observed surface)
         if enable_freespace_filter:
             baseline = float(np.linalg.norm(t_cw - cur_t))
             vec_cur = pts_world - cur_t
@@ -814,7 +834,7 @@ def filter_multiview_consistency(
                 tol_scale = 1.0
 
             tol_free = (freespace_margin_m + 0.05 * proj_z) * tol_scale
-            empty_space = valid_obs & has_parallax & (proj_z < (obs_depth - tol_free))
+            empty_space = valid_carving_obs & has_parallax & (proj_z < (obs_depth - tol_free))
             freespace_violations += empty_space.astype(np.int32)
 
     # 1. Regional coherence check: reject isolated atomic outliers.
@@ -830,10 +850,10 @@ def filter_multiview_consistency(
     # 2. Three-way Multi-View Logic:
     # - Confirmed: Another picture looks at this area and confirms a surface exists (consensus_count >= min_consensus). -> KEEP
     # - Contradicted: Another picture looks through this area to a surface behind it (freespace_violations > max_violations). -> CARVE / REJECT
-    # - Neutral: No other picture looks at this area (views_in_frustum == 0) or no other picture confirms nor contradicts.
+    # - Neutral: No other unoccluded picture looks at this area (views_in_frustum == 0) or views are obstructed.
     #   -> Trust the single-view prediction, provided it belongs to a coherent regional patch.
     if min_consensus > 0:
-        # Confirmed by other view(s) OR uncontradicted single-view regional surface
+        # Confirmed by other view(s) OR uncontradicted, unoccluded single-view regional surface
         valid_mask = (consensus_count >= min_consensus) | ((views_in_frustum == 0) & coherent_region_mask)
     else:
         valid_mask = coherent_region_mask
@@ -892,28 +912,28 @@ def global_cross_view_freespace_carving(
         proj_z = -pts_cam[:, 2]
         in_front = proj_z > 0.2
 
-        u = (fx * (pts_cam[:, 0] / np.maximum(proj_z, 1e-4)) + cx).astype(np.int32)
-        v = (-fy * (pts_cam[:, 1] / np.maximum(proj_z, 1e-4)) + cy).astype(np.int32)
-
         valid_uv = in_front & (u >= 4) & (u < dw - 4) & (v >= 4) & (v < dh - 4)
         if not np.any(valid_uv):
             continue
-
-        views_seen += valid_uv.astype(np.int32)
 
         obs_d = np.zeros(n_pts, dtype=np.float32)
         obs_d[valid_uv] = d_map[v[valid_uv], u[valid_uv]]
         valid_obs = valid_uv & np.isfinite(obs_d) & (obs_d > 0.2)
 
-        # Free space violation check
-        tol_free = margin_m + 0.01 * proj_z
-        empty_space = valid_obs & (proj_z < (obs_d - tol_free))
-        violations += empty_space.astype(np.int32)
-
         # Corroborating match check
         tol_match = match_tol_base + match_tol_slope * proj_z
         match = valid_obs & (np.abs(proj_z - obs_d) <= tol_match)
         matches += match.astype(np.int32)
+
+        # Occlusion check: if camera sees an obstacle in front (obs_d < proj_z - tol_match),
+        # this point is occluded from this viewpoint and must not count as an uncorroborated visible view.
+        occluded = valid_obs & (obs_d < (proj_z - tol_match))
+        views_seen += (valid_uv & (~occluded)).astype(np.int32)
+
+        # Free space violation check
+        tol_free = margin_m + 0.01 * proj_z
+        empty_space = valid_obs & (proj_z < (obs_d - tol_free))
+        violations += empty_space.astype(np.int32)
 
     # Filter rule: Discard points that violate free space in > max_violations views,
     # and require at least 1 match if observed by 3+ cameras.
@@ -1067,7 +1087,7 @@ class SurfelCloudInitializer:
         max_depth_m: Optional[float] = None, # If None, dynamically estimated from confident depths
         min_consensus: int = 0,              # Disabled by default (prevents cutting real points with slight depth disagreement)
         max_depth_gradient: float = 0.0,     # Disabled by default (prevents puncturing slanted floors/beds)
-        max_grazing_angle_deg: float = 0.0,  # Disabled by default (prevents cutting grazing floors)
+        max_grazing_angle_deg: float = 85.0,  # Hole-safe grazing angle threshold (85 deg)
         enable_sor: bool = False,            # Disabled by default (prevents punching holes in sparse peripheral regions)
         sor_k: int = 20,
         sor_std_mul: float = 1.5,
@@ -1146,9 +1166,10 @@ class SurfelCloudInitializer:
         intrinsics: CameraIntrinsics,
         sparse_points_3d: Optional[np.ndarray] = None,
         conf_maps: Optional[Sequence[Optional[np.ndarray]]] = None,
+        normal_maps: Optional[Sequence[Optional[np.ndarray]]] = None,
         min_conf: float = 0.5,
     ) -> SurfelCloud:
-        """Unproject keyframes with dense aligned depth maps into an initial SurfelCloud."""
+        """Unproject keyframes with dense aligned depth maps and precomputed normal maps into an initial SurfelCloud."""
         num_frames = len(keyframes)
         if num_frames == 0 or len(depth_maps) != num_frames:
             raise ValueError(f"Mismatched keyframes ({num_frames}) and depth maps ({len(depth_maps)})")
@@ -1178,14 +1199,10 @@ class SurfelCloudInitializer:
         cx, cy = intrinsics.cx, intrinsics.cy
         cos_min = math.cos(math.radians(self.max_grazing_angle_deg)) if self.max_grazing_angle_deg > 0 else 0.0
 
-        normals_cam_cache: dict[int, np.ndarray] = {}
-
         def get_normals_cam(k_idx: int) -> np.ndarray:
-            if k_idx not in normals_cam_cache:
-                if len(normals_cam_cache) >= 16:
-                    normals_cam_cache.pop(next(iter(normals_cam_cache)))
-                normals_cam_cache[k_idx] = compute_surface_normals(depth_maps[k_idx], intrinsics)
-            return normals_cam_cache[k_idx]
+            if normal_maps is not None and k_idx < len(normal_maps) and normal_maps[k_idx] is not None:
+                return normal_maps[k_idx]
+            return compute_surface_normals(depth_maps[k_idx], intrinsics)
 
         for idx, (kf, depth) in enumerate(zip(keyframes, depth_maps)):
             h, w = depth.shape[:2]
@@ -1291,12 +1308,15 @@ class SurfelCloudInitializer:
                     depth_maps,
                     intrinsics,
                     normals_world=n_world,
+                    normal_maps=normal_maps,
+                    max_neighbors=self.max_neighbors if hasattr(self, "max_neighbors") else 6,
                     min_consensus=self.min_consensus,
                     enable_freespace_filter=self.enable_freespace_filter,
                     max_freespace_violations=self.max_freespace_violations,
                     freespace_margin_m=self.freespace_margin_m,
                     min_neighbor_baseline_m=self.min_neighbor_baseline_m,
                     min_neighbor_parallax_deg=self.min_neighbor_parallax_deg,
+                    max_depth_ceiling=depth_ceiling,
                 )
                 if np.sum(mv_mask) < 5:
                     continue

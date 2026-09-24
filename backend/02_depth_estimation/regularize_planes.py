@@ -746,12 +746,14 @@ def is_point_inside_quad(pts: np.ndarray, quad: np.ndarray) -> np.ndarray:
     return is_point_inside_polygon(pts, quad)
 
 
-def fill_planes(vert, xyz, members, spacing, cell, close, max_hole):
+def fill_planes(vert, xyz, members, spacing, cell, close, max_hole, min_infill_distance: float = 0.03):
     """Infill empty areas within each plane's bounding polygon with an equidistant grid.
 
     Preserves ALL original points with their original photogrammetric colors, while generating
-    new grid points (at `spacing`, e.g. 1cm) on the fitted plane strictly within the enclosing
+    new grid points (at `spacing`, e.g. 3cm) on the fitted plane strictly within the enclosing
     bounding polygon where no original points currently exist (empty areas / holes).
+    Guarantees no points are added within `min_infill_distance` (default 3cm radius) of any
+    existing inlier point.
     The newly added infill points are assigned the plane's exact uniform average color.
     """
     fresh, stats = [], []
@@ -782,10 +784,11 @@ def fill_planes(vert, xyz, members, spacing, cell, close, max_hole):
             continue
 
         # 3. Find empty areas: query nearest distance to existing inlier points in local 2D space
-        # A candidate grid location is considered empty if it is farther than 0.85 * spacing from any existing inlier point
+        # A candidate grid location is considered empty only if it is farther than max(0.85 * spacing, min_infill_distance)
+        # from any existing inlier point (default 3cm radius) to avoid point clustering near original photogrammetric points.
         tree = cKDTree(local)
         dists, nn_idx = tree.query(L, k=1)
-        empty_mask = dists >= (0.85 * spacing)
+        empty_mask = dists >= max(0.85 * spacing, min_infill_distance)
         L_empty = L[empty_mask]
         if len(L_empty) == 0:
             continue
@@ -976,8 +979,10 @@ def regularize(src: Path, dst: Path, args) -> dict:
     for k, col in zip(("nx", "ny", "nz"), normals.T):
         vert[k] = col.astype(vert[k].dtype)
     if getattr(args, "fill", None):
+        min_infill_dist = getattr(args, "fill_min_dist", 0.03)
         vert, report["fill"] = fill_planes(vert, xyz, members, args.fill, args.fill_cell,
-                                           args.fill_close, args.fill_max_hole)
+                                           args.fill_close, args.fill_max_hole,
+                                           min_infill_distance=min_infill_dist)
         report["points_out"] = int(len(vert))
 
         # Build diagnostic colored cloud from regularized and filled vertices
@@ -1222,7 +1227,7 @@ def selftest_fill():
     xyz = np.stack([p[:, 0], rng.normal(0, 0.005, len(p)), p[:, 1]], axis=1)  # 5 mm of noise
     vert = np.zeros(len(p), dtype=[(k, "<f4") for k in ("x", "y", "z", "nx", "ny", "nz")]
                     + [(k, "u1") for k in ("red", "green", "blue")])
-    out, stats = fill_planes(vert, xyz, [np.arange(len(p))], 0.02, 0.08, 1, 0.25)
+    out, stats = fill_planes(vert, xyz, [np.arange(len(p))], 0.05, 0.08, 1, 0.25)
 
     q = np.stack([out["x"], out["z"]], axis=1)
     assert len(stats) == 1 and stats[0]["removed"] == len(p)
@@ -1325,6 +1330,8 @@ def build_parser():
     ap.add_argument("--blend", type=float, default=0.25, help="half-width of the transition band, m")
     ap.add_argument("--icp-trim", type=float, default=0.7, help="correspondence keep fraction")
     ap.add_argument("--fill", type=float, help="re-sample snapped surfaces at this spacing, m")
+    ap.add_argument("--fill-min-dist", type=float, default=0.03,
+                    help="minimum distance from existing inlier points to allow infill, m (default: 0.03 = 3cm)")
     ap.add_argument("--fill-cell", type=float, default=0.08, help="footprint cell size, m")
     ap.add_argument("--fill-close", type=int, default=1, help="footprint closing radius, cells")
     ap.add_argument("--fill-max-hole", type=float, default=1.5,

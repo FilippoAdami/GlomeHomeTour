@@ -1370,6 +1370,49 @@ def compute_surface_normals(
     return normal.cpu().numpy().astype(np.float32)
 
 
+def extract_and_polish_normals(
+    depth_metric: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    rgb_guide: Optional[np.ndarray] = None,
+    smooth_radius: int = 0,
+) -> np.ndarray:
+    """Extract and polish dense surface normals from metric depth.
+
+    Computes local plane-fit normals directly on GPU using fit_plane_normals, which
+    already enforces robust 3D plane fitting and distance tolerance.
+    """
+    raw_normals = compute_surface_normals(depth_metric, intrinsics)
+
+    # Polish normals with guided / bilateral edge-preserving smoothing if RGB guide is available
+    if rgb_guide is not None and smooth_radius > 0:
+        h, w = depth_metric.shape[:2]
+        if rgb_guide.shape[:2] != (h, w):
+            rgb_guide = cv2.resize(rgb_guide, (w, h), interpolation=cv2.INTER_LINEAR)
+        guide_gray = cv2.cvtColor(rgb_guide, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+        polished = np.zeros_like(raw_normals)
+        for c in range(3):
+            polished[:, :, c] = cv2.ximgproc.guidedFilter(
+                guide=guide_gray,
+                src=raw_normals[:, :, c].astype(np.float32),
+                radius=smooth_radius,
+                eps=1e-3,
+            ) if hasattr(cv2, "ximgproc") else cv2.bilateralFilter(raw_normals[:, :, c].astype(np.float32), d=5, sigmaColor=0.1, sigmaSpace=3.0)
+        norm = np.maximum(np.linalg.norm(polished, axis=-1, keepdims=True), 1e-8)
+        return (polished / norm).astype(np.float32)
+
+    return raw_normals
+
+
+def colorize_normals(normals: np.ndarray, valid_mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Convert (H, W, 3) unit normal vectors in [-1, 1] to an RGB uint8 image for visualization."""
+    norm_u8 = np.clip((normals + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+    if valid_mask is not None:
+        norm_u8[~valid_mask] = 0
+    return norm_u8
+
+
+
 class GlobalDepthGraphOptimizer:
     """Performs joint scale-shift optimization of monocular depth maps across keyframes.
 

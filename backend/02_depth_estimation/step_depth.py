@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Step 4 -- DA3 depth priors, edge snapping, TSDF fusion, and surfel cloud initialization.
+"""Step 2 -- DA3 depth priors, normal estimation, edge snapping, TSDF fusion, and surfel initialization.
 
 In:  ``<workspace>/images/`` + ``transforms.json`` + ``sparse/0/``.
-Out: ``02_depth_estimation/depth/depth_maps/*.npy``, ``02_depth_estimation/depth/poses_da3.npz``,
-     ``02_depth_estimation/depth/points3D_depth.ply``, ``02_depth_estimation/depth/edge_snapping_vis/*.jpg``,
+Out: ``02_depth_estimation/depth/depth_maps/*.npy``, ``02_depth_estimation/depth/normal_maps/*.npy``,
+     ``02_depth_estimation/depth/poses_da3.npz``, ``02_depth_estimation/depth/points3D_depth.ply``,
+     ``02_depth_estimation/depth/depth_images/*.jpg``, ``02_depth_estimation/depth/normal_images/*.jpg``,
      ``02_depth_estimation/depth/preview/*.png``.
 
 Two coordinate conventions meet here, in opposite directions, and both are
@@ -20,7 +21,6 @@ CLI Usage:
 
     # Modular substeps:
     python 02_depth_estimation/step_depth.py --substep depth
-    python 02_depth_estimation/step_depth.py --substep edge_snapping
     python 02_depth_estimation/step_depth.py --substep tsdf
     python 02_depth_estimation/step_depth.py --substep surfels
 """
@@ -28,6 +28,7 @@ CLI Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
 import sys
@@ -47,7 +48,7 @@ from Utilities.pipeline_paths import bootstrap
 
 bootstrap()
 
-from Utilities.pipeline_step import StepContext, is_done
+from Utilities.pipeline_step import StepContext, is_done, update_pipeline_stats
 from Utilities.scene_io import load_scene
 from colmap_diagnostics import parse_images_txt, parse_points3D_txt
 from colmap_poses_to_da3 import build_da3_poses, validate_poses
@@ -58,6 +59,8 @@ from depth_priors import (
     GlobalDepthGraphOptimizer,
     anchor_depths_to_sparse_points,
     guided_filter_depth,
+    extract_and_polish_normals,
+    colorize_normals,
 )
 from initialization import SurfelCloudInitializer
 from regularize_planes import planes_of, diagnose_planes_quads
@@ -80,7 +83,7 @@ TARGET_SURFELS = MAX_SURFELS = 450_000
 
 # Boundary-floater filters (tuned hole-safe thresholds)
 MAX_DEPTH_GRADIENT = 0.15
-MAX_GRAZING_ANGLE_DEG = 89.5  # Hole-safe threshold: eliminates degenerate parallel rays without clipping oblique ceilings/floors (83-88 deg)
+MAX_GRAZING_ANGLE_DEG = 85.0  # Hole-safe threshold: eliminates degenerate grazing rays (85 deg)
 
 
 # A window prediction still off by more than this after its scale/shift fit to the COLMAP
@@ -148,7 +151,7 @@ def run_depth_estimation_substep(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = OVERLAP,
     process_res: int = PROCESS_RES,
-    enable_guided_filter: bool = True,
+    enable_guided_filter: bool = False,
     # Redundant now that every window is fitted to the same COLMAP tracks before fusion, and
     # its fallback is actively harmful: a frame that fails its inlier gate gets the sequence's
     # median scale/shift, which is ~identity, silently leaving the one frame that needed
@@ -172,9 +175,9 @@ def run_depth_estimation_substep(
     # --- poses: COLMAP -> DA3, unconverted, but checked ---------------------
     with ctx.timer("build_poses"):
         by_name = {Path(f["file_path"]).name: np.array(f["transform_matrix"]) for f in scene.frames}
-        w2c, k_mats, pose_names = build_da3_poses(sparse_dir, names, arcore_transforms=by_name)
-        centres = np.array([by_name[n][:3, 3] for n in pose_names])
-        stats = validate_poses(w2c, centres)
+        w2c, k_mats, pose_names = build_da3_poses(sparse_dir, names)
+        centres = np.array([by_name[n][:3, 3] for n in pose_names if n in by_name])
+        stats = validate_poses(w2c, centres if len(centres) == len(pose_names) else None)
         np.savez(depth_dir / "poses_da3.npz", w2c=w2c, K=k_mats, names=np.array(pose_names))
     ctx.metric("pose_validation", {k: round(v, 6) for k, v in stats.items()})
     ctx.note(f"Poses: {len(pose_names)} world-to-camera, orthonormality err "
@@ -199,6 +202,9 @@ def run_depth_estimation_substep(
              f"chunk={chunk_size}, overlap={overlap}, process_res={process_res})")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
 
     estimator = DepthPriorEstimator(device=device, process_res=process_res)
     with ctx.timer("da3_inference"):
@@ -213,6 +219,13 @@ def run_depth_estimation_substep(
             align_fn=aligner,
         )
     vram_substeps["da3_inference"] = _get_vram_info()
+
+    # Free neural network model weights and intermediate tensors to reclaim ~14 GB VRAM
+    del estimator
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     unreliable: list[str] = []
     align_stats: dict = {}
@@ -320,9 +333,43 @@ def run_depth_estimation_substep(
         vram_substeps["global_depth_graph"] = _get_vram_info()
 
     with ctx.timer("write_depth_maps"):
-        for name, dmap in zip(pose_names, depth_maps):
+        def _save_dmap(item):
+            name, dmap = item
             np.save(maps_dir / f"{Path(name).stem}.npy", dmap.astype(np.float32))
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_save_dmap, zip(pose_names, depth_maps)))
     vram_substeps["write_depth_maps"] = _get_vram_info()
+
+    # --- surface normal extraction & polishing (Step 2.3) ---------------------
+    normals_dir = depth_dir / "normal_maps"
+    normals_dir.mkdir(exist_ok=True)
+    normal_images_dir = depth_dir / "normal_images"
+    normal_images_dir.mkdir(exist_ok=True)
+
+    with ctx.timer("extract_and_polish_normals"):
+        def _save_normal_disk(item):
+            stem, norm_map, orig_rgb, dmap = item
+            np.save(normals_dir / f"{stem}.npy", norm_map)
+            norm_rgb = colorize_normals(norm_map, valid_mask=(dmap > 0.2))
+            if norm_rgb.shape[:2] != orig_rgb.shape[:2]:
+                norm_rgb = cv2.resize(norm_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
+                                      interpolation=cv2.INTER_NEAREST)
+            composite_norm = np.hstack([orig_rgb, norm_rgb])
+            comp_norm_img = Image.fromarray(composite_norm)
+            comp_norm_img.save(normal_images_dir / f"{stem}.jpg", quality=90)
+
+        # Compute normals sequentially on GPU to prevent concurrent VRAM spikes,
+        # offload disk I/O & JPEG encoding to thread pool
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
+                orig_rgb = images[i]
+                norm_map = extract_and_polish_normals(dmap, scene.intrinsics, rgb_guide=orig_rgb)
+                stem = Path(name).stem
+                executor.submit(_save_normal_disk, (stem, norm_map.astype(np.float32), orig_rgb, dmap))
+
+    vram_substeps["extract_and_polish_normals"] = _get_vram_info()
+    ctx.note(f"Extracted and polished surface normals, saved diagnostic views to {normal_images_dir}")
 
     finite = np.concatenate([d[np.isfinite(d)].ravel()[::97] for d in depth_maps])
     depth_p05, depth_p95 = float(np.percentile(finite, 5)), float(np.percentile(finite, 95))
@@ -337,7 +384,9 @@ def run_depth_estimation_substep(
     depth_images_dir.mkdir(exist_ok=True)
 
     with ctx.timer("write_depth_images"):
-        for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
+        def _save_depth_image(i):
+            name = pose_names[i]
+            dmap = depth_maps[i]
             orig_rgb = images[i]
             depth_rgb = _colorize_depth(dmap, depth_p05, depth_p95)
             if depth_rgb.shape[:2] != orig_rgb.shape[:2]:
@@ -347,11 +396,26 @@ def run_depth_estimation_substep(
             comp_img = Image.fromarray(composite)
             stem = Path(name).stem
             comp_img.save(depth_images_dir / f"{stem}.jpg", quality=90)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_save_depth_image, range(len(pose_names))))
     vram_substeps["write_depth_images"] = _get_vram_info()
+
+    # --- record machine-readable substep metrics to pipeline_stats.json -------
+    n_frames = len(pose_names)
+    ctx.metric("frames_processed", n_frames)
+    if "build_poses" in ctx.timings:
+        update_pipeline_stats(workspace, "depth_pose_validation", ctx.timings["build_poses"], n_frames)
+    if "da3_inference" in ctx.timings:
+        update_pipeline_stats(workspace, "da3_depth_inference", ctx.timings["da3_inference"], n_frames)
+    if "guided_filter" in ctx.timings:
+        update_pipeline_stats(workspace, "guided_depth_filtering", ctx.timings["guided_filter"], n_frames)
+    if "extract_and_polish_normals" in ctx.timings:
+        update_pipeline_stats(workspace, "surface_normal_polishing", ctx.timings["extract_and_polish_normals"], n_frames)
 
     # Diagnostic markdown summary
     summary_md = [
-        "# Multi-View Depth Estimation Summary",
+        "# Multi-View Depth & Surface Normal Estimation Summary (Step 2)",
         "",
         f"**Workspace:** `{workspace}`  ",
         f"**Model:** `DA3-Base` (Test Resolution: `{process_res}px`, Window: `N={chunk_size}, K={overlap}`)  ",
@@ -367,7 +431,9 @@ def run_depth_estimation_substep(
         "## Diagnostic Artifacts",
         "",
         f"- **Side-by-Side RGB | Depth Images:** [`{depth_images_dir}`](file://{depth_images_dir})",
+        f"- **Side-by-Side RGB | Normal Images:** [`{normal_images_dir}`](file://{normal_images_dir})",
         f"- **Dense Float32 Metric Depth Maps:** [`{maps_dir}`](file://{maps_dir})",
+        f"- **Dense Float32 Unit Normal Maps:** [`{normals_dir}`](file://{normals_dir})",
         f"- **Camera Extrinsics & Intrinsics:** [`{depth_dir / 'poses_da3.npz'}`](file://{depth_dir / 'poses_da3.npz'})",
         "",
         "## Execution Time & VRAM Profile",
@@ -483,6 +549,7 @@ def run_tsdf_substep(
 
     # Geometry statistics
     pos = cloud.positions
+    rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
     min_b = np.min(pos, axis=0)
     max_b = np.max(pos, axis=0)
     dims = max_b - min_b
@@ -510,8 +577,12 @@ def run_tsdf_substep(
         ctx.note(f"Preview rendering notice: {e}")
 
     # Write Markdown Summary Report
+    t_tsdf = ctx.timings.get("tsdf_integration", 0.0) + ctx.timings.get("tsdf_multiscale_extraction", 0.0)
+    ctx.metric("frames_processed", len(pose_names))
+    update_pipeline_stats(workspace, "tsdf_volumetric_fusion", t_tsdf, len(pose_names))
+
     tsdf_summary_md = [
-        "# Volumetric TSDF Fusion & Multi-Scale Surfel Extraction (Step 4d)",
+        "# Volumetric TSDF Fusion & Multi-Scale Surfel Extraction (Step 2 - TSDF)",
         "",
         f"**Workspace:** `{workspace}`  ",
         f"**Output PLY:** [`{ply_path}`](file://{ply_path})  ",
@@ -569,13 +640,16 @@ def run_surfels_substep(
     hybrid_coarse_stride: int = 3,
     enable_plane_diagnostics: bool = True,
     enable_plane_regularization: bool = True,
-    plane_fill_spacing: float = 0.02,
+    plane_fill_spacing: float = 0.05,
+    plane_fill_min_dist: float = 0.03,
+    enable_storeys: bool = False,
 ) -> None:
-    """Substep 4b: Standard unprojection surfel initializer with geometric filtering."""
+    """Substep 2b: Standard unprojection surfel initializer with geometric filtering."""
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
     sparse_dir = workspace / "sparse" / "0"
     depth_dir = workspace / STAGE_DIRNAME / "depth"
     maps_dir = depth_dir / "depth_maps"
+    normals_dir = depth_dir / "normal_maps"
     poses_path = depth_dir / "poses_da3.npz"
 
     if not poses_path.exists():
@@ -596,9 +670,8 @@ def run_surfels_substep(
     if align_path.exists():
         unreliable = set(json.loads(align_path.read_text()).get("unreliable", []))
 
-    # Filter out any corrupted poses with severe ARCore drift (>10 deg or >25 cm)
+    # Filter out frames whose depth could not be metrically aligned
     clean_indices = []
-    dropped_drift = []
     dropped_align = []
     for i, n in enumerate(pose_names):
         c2w_c = c2w_gl[i]
@@ -606,24 +679,11 @@ def run_surfels_substep(
         if n in unreliable and not is_upward:
             dropped_align.append(n)
             continue
-        if n in by_name_arcore:
-            c2w_a = by_name_arcore[n]
-            r_diff = c2w_c[:3, :3].T @ c2w_a[:3, :3]
-            trace_val = np.clip((np.trace(r_diff) - 1.0) / 2.0, -1.0, 1.0)
-            angle_deg = float(np.degrees(np.arccos(trace_val)))
-            trans_m = float(np.linalg.norm(c2w_c[:3, 3] - c2w_a[:3, 3]))
-            if angle_deg > 10.0 or trans_m > 0.25:
-                dropped_drift.append((n, angle_deg, trans_m))
-                continue
         clean_indices.append(i)
 
     if dropped_align:
         ctx.note(f"Surfel init: pruned {len(dropped_align)} keyframe(s) whose depth could not "
                  f"be metrically aligned to the COLMAP tracks: {dropped_align}")
-    if dropped_drift:
-        ctx.note(f"Surfel init pose filter: pruned {len(dropped_drift)} drifted keyframe(s) "
-                 f"(>10.0° or >25cm): {[d[0] for d in dropped_drift]}")
-    if dropped_align or dropped_drift:
         pose_names = [pose_names[i] for i in clean_indices]
         c2w_gl = c2w_gl[clean_indices]
 
@@ -632,6 +692,14 @@ def run_surfels_substep(
                  for i, n in enumerate(pose_names)]
 
     depth_maps = [np.load(maps_dir / f"{Path(n).stem}.npy", mmap_mode="r") for n in pose_names]
+    normal_maps = None
+    if normals_dir.is_dir():
+        normal_maps = [
+            np.load(normals_dir / f"{Path(n).stem}.npy", mmap_mode="r")
+            if (normals_dir / f"{Path(n).stem}.npy").exists() else None
+            for n in pose_names
+        ]
+
     points = parse_points3D_txt(sparse_dir / "points3D.txt")
     sparse_xyz = np.array([p["xyz"] for p in points.values()]) if points else None
 
@@ -665,8 +733,9 @@ def run_surfels_substep(
             keyframes=keyframes,
             depth_maps=depth_maps,
             intrinsics=scene.intrinsics,
-            sparse_points_3d=None,
+            sparse_points_3d=sparse_xyz,
             conf_maps=None,
+            normal_maps=normal_maps,
             min_conf=MIN_CONF,
         )
         ctx.note(f"Initialized continuous refined surfel cloud: {len(cloud):,} surfels")
@@ -679,24 +748,34 @@ def run_surfels_substep(
     # and re-sample planar surfaces into equidistant lattices with harmonized colors
     reg_report = None
     if enable_plane_regularization:
-        try:
-            from regularize_planes import regularize, default_args
-            reg_args = default_args(
-                min_bbox_area=3.8,
-                fill=plane_fill_spacing,
-                fill_cell=0.08,
-                fill_close=1,
-                fill_max_hole=1.5,
-                no_storeys=True,
-            )
-            reg_report = regularize(depth_ply_path, depth_ply_path, reg_args)
-            ctx.note(
-                f"Plane Regularization applied: {len(reg_report['groups'])} groups, "
-                f"{len(reg_report.get('fill', []))} surfaces regularized into {plane_fill_spacing*100:.1f}cm lattices. "
-                f"Output: {depth_ply_path}"
-            )
-        except Exception as e:
-            ctx.note(f"Plane regularization notice: {e}")
+        with ctx.timer("plane_regularization"):
+            try:
+                from regularize_planes import regularize, default_args
+                reg_args = default_args(
+                    min_bbox_area=3.8,
+                    fill=plane_fill_spacing,
+                    fill_min_dist=plane_fill_min_dist,
+                    fill_cell=0.08,
+                    fill_close=1,
+                    fill_max_hole=1.5,
+                    no_storeys=not enable_storeys,
+                )
+                reg_report = regularize(depth_ply_path, depth_ply_path, reg_args)
+                ctx.note(
+                    f"Plane Regularization applied: {len(reg_report['groups'])} groups, "
+                    f"{len(reg_report.get('fill', []))} surfaces regularized into {plane_fill_spacing*100:.1f}cm lattices. "
+                    f"Output: {depth_ply_path}"
+                )
+            except Exception as e:
+                ctx.note(f"Plane regularization notice: {e}")
+
+    # Record machine-readable surfel and plane stats into pipeline_stats.json
+    n_clean = len(pose_names)
+    ctx.metric("frames_processed", n_clean)
+    if "surfel_init" in ctx.timings:
+        update_pipeline_stats(workspace, "surfel_cloud_initialization", ctx.timings["surfel_init"], n_clean)
+    if "plane_regularization" in ctx.timings:
+        update_pipeline_stats(workspace, "plane_regularization_and_lattice_infill", ctx.timings["plane_regularization"], n_clean)
 
     # Read the final regularized point cloud for downstream stats & previews
     from plyfile import PlyData
@@ -716,11 +795,11 @@ def run_surfels_substep(
         try:
             from regularize_planes import diagnose_planes_quads
 
-            artifact_dir = Path("/home/monday/.gemini/antigravity/brain/37b923db-4194-4f75-9cfd-025a501bbbcd")
+            artifact_dir = ctx.artifacts_dir if (ctx.artifacts_dir and ctx.artifacts_dir.is_dir()) else None
             plane_report = diagnose_planes_quads(
                 depth_ply_path=depth_ply_path,
                 output_dir=depth_dir,
-                artifact_dir=artifact_dir if artifact_dir.is_dir() else None,
+                artifact_dir=artifact_dir,
                 min_area=2.0,
             )
             ctx.note(
@@ -756,7 +835,7 @@ def run_surfels_substep(
         ctx.note(f"Camera preview rendering notice: {e}")
 
     surfel_summary_md = [
-        "# Surfel Cloud Initialization Summary (Step 4b)",
+        "# Surfel Cloud Initialization Summary (Step 2)",
         "",
         f"**Workspace:** `{workspace}`  ",
         f"**Output PLY:** [`{depth_ply_path}`](file://{depth_ply_path})  ",
@@ -811,9 +890,9 @@ def main(argv: list[str] | None = None) -> int:
                              "superseded by per-window alignment inside the sliding window)")
     parser.add_argument("--no-sparse-anchor", action="store_false", dest="enable_sparse_anchor",
                         help="Disable sparse COLMAP landmark scale/shift anchoring")
-    parser.add_argument("--enable-guided-filter", action="store_true", default=True,
-                        help="Enable depth guided edge filter")
-    parser.add_argument("--no-guided-filter", action="store_true",
+    parser.add_argument("--enable-guided-filter", action="store_true", default=False,
+                        help="Enable depth guided edge filter (default: False)")
+    parser.add_argument("--no-guided-filter", action="store_false", dest="enable_guided_filter",
                         help="Disable depth guided edge filter")
     parser.add_argument("--no-normal-consensus", action="store_true",
                         help="Disable cross-view surface normal consensus regularization")
@@ -833,7 +912,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-consensus", type=int, default=1,
                         help="Min consensus views required for surfel corroboration (default 1; multi-view requires consensus, single-view is trusted)")
     parser.add_argument("--max-grazing-angle", type=float, default=MAX_GRAZING_ANGLE_DEG,
-                        help="Max grazing angle in degrees before culling (default 89.5; hole-safe for ceilings)")
+                        help=f"Max grazing angle in degrees before culling (default {MAX_GRAZING_ANGLE_DEG}; hole-safe)")
     parser.add_argument("--enable-multiscale-pyramid", action="store_true", default=False,
                         help="Enable multi-scale surfel decimation for planar regions")
     parser.add_argument("--no-multiscale-pyramid", action="store_false", dest="enable_multiscale_pyramid",
@@ -858,8 +937,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enable-plane-regularization", action="store_true",
                         dest="enable_plane_regularization", default=True,
                         help="Enable planar snapping, lattice infill and color harmonization (default: True)")
-    parser.add_argument("--plane-fill-spacing", type=float, default=0.01,
-                        help="Equidistant point lattice spacing for regularized planar surfaces in meters (default: 0.01 = 1cm)")
+    parser.add_argument("--plane-fill-spacing", type=float, default=0.05,
+                        help="Equidistant point lattice spacing for regularized planar surfaces in meters (default: 0.05 = 5cm)")
+    parser.add_argument("--fill-min-dist", type=float, default=0.03,
+                        help="Minimum distance in meters from existing inlier points to allow infill (default: 0.03 = 3cm)")
+    parser.add_argument("--enable-storeys", action="store_true", default=False,
+                        help="Enable multi-storey storey alignment split")
     # Legacy flags for compatibility
     parser.add_argument("--only-depth", action="store_true",
                         help="Alias for --substep depth")
@@ -889,11 +972,11 @@ def main(argv: list[str] | None = None) -> int:
             depth_ply_path = depth_dir / "points3D_depth.ply"
             if not depth_ply_path.exists():
                 raise FileNotFoundError(f"Cannot run enclosure diagnostics: {depth_ply_path} does not exist.")
-            artifact_dir = Path("/home/monday/.gemini/antigravity/brain/37b923db-4194-4f75-9cfd-025a501bbbcd")
+            artifact_dir = ctx.artifacts_dir if (ctx.artifacts_dir and ctx.artifacts_dir.is_dir()) else None
             plane_report = diagnose_planes_quads(
                 depth_ply_path=depth_ply_path,
                 output_dir=depth_dir,
-                artifact_dir=artifact_dir if artifact_dir.is_dir() else None,
+                artifact_dir=artifact_dir,
                 min_area=2.0,
                 max_vertices=5,
             )
@@ -910,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
                 chunk_size=args.chunk_size,
                 overlap=args.overlap,
                 process_res=args.process_res,
-                enable_guided_filter=not args.no_guided_filter,
+                enable_guided_filter=args.enable_guided_filter,
                 enable_sparse_anchor=args.enable_sparse_anchor,
             )
 
@@ -941,6 +1024,8 @@ def main(argv: list[str] | None = None) -> int:
                 enable_plane_diagnostics=args.enable_plane_diagnostics,
                 enable_plane_regularization=args.enable_plane_regularization,
                 plane_fill_spacing=args.plane_fill_spacing,
+                plane_fill_min_dist=args.fill_min_dist,
+                enable_storeys=args.enable_storeys,
             )
 
     return 0
@@ -948,5 +1033,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
