@@ -316,8 +316,8 @@ def main():
                 safe_id = kf.file_path.replace("/", "_").replace(".", "_")
                 d_file = cache_dir / f"depth_{safe_id}.npy"
                 c_file = cache_dir / f"conf_{safe_id}.npy"
-                raw_depth_maps.append(np.load(d_file))
-                conf_maps.append(np.load(c_file) if c_file.exists() else None)
+                raw_depth_maps.append(np.load(d_file).astype(np.float32))
+                conf_maps.append(np.load(c_file).astype(np.float32) if c_file.exists() else None)
         else:
             estimator = DepthPriorEstimator(model_name=args.model_name)
             print(f"    - Running multi-view streaming inference (chunk_size={args.chunk_size}, overlap={args.overlap})...")
@@ -351,9 +351,9 @@ def main():
             print(f"    - Saving results to cache: {cache_dir.resolve()}")
             for idx, kf in enumerate(eval_depth_kfs):
                 safe_id = kf.file_path.replace("/", "_").replace(".", "_")
-                np.save(cache_dir / f"depth_{safe_id}.npy", raw_depth_maps[idx].astype(np.float32))
+                np.save(cache_dir / f"depth_{safe_id}.npy", raw_depth_maps[idx].astype(np.float16))
                 if conf_maps is not None and idx < len(conf_maps) and conf_maps[idx] is not None:
-                    np.save(cache_dir / f"conf_{safe_id}.npy", conf_maps[idx].astype(np.float32))
+                    np.save(cache_dir / f"conf_{safe_id}.npy", conf_maps[idx].astype(np.float16))
 
         # Optional Global Depth Graph Optimizer
         aligned_depth_maps = raw_depth_maps

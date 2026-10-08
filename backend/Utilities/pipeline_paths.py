@@ -17,8 +17,10 @@ _STAGE_DIRS = (
     "00_ingestion",
     "01_poses_refinment",
     "02_depth_estimation",
-    "03_2DGS_training",
-    "05_2DGS_to_mesh",
+    "03_FastGS_DNSplatter",
+    "04_3DGS_to_mesh",
+    "05_floor_plan",
+    "06_semantic_segmentation",
 )
 
 

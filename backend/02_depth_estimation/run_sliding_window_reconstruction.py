@@ -269,15 +269,19 @@ def main():
         help="Skip depth estimation pass and load existing depth maps from output-dir",
     )
     parser.add_argument(
+        "--train-gs",
         "--train-2dgs",
+        dest="train_gs",
         action="store_true",
-        help="Automatically launch Phase 5 2DGS training upon staging GS_input",
+        help="Automatically launch Gaussian Splatting training upon staging GS_input",
     )
     parser.add_argument(
+        "--iterations-gs",
         "--iterations-2dgs",
+        dest="iterations_gs",
         type=int,
         default=3000,
-        help="Number of 2DGS training iterations if --train-2dgs is enabled",
+        help="Number of Gaussian Splatting training iterations if --train-gs is enabled",
     )
 
     args = parser.parse_args()
@@ -425,7 +429,7 @@ def main():
         # Save depth maps & visualizations in output root
         print("Saving depth maps and diagnostic heatmaps...")
         for i, d in enumerate(depth_maps):
-            np.save(depth_dir / f"depth_{i:04d}.npy", d)
+            np.save(depth_dir / f"depth_{i:04d}.npy", d.astype(np.float16))
             # Normalize for visualization
             d_min, d_max = np.percentile(d, 2), np.percentile(d, 98)
             d_norm = np.clip((d - d_min) / max(d_max - d_min, 1e-4), 0.0, 1.0)
@@ -433,7 +437,7 @@ def main():
             cv2.imwrite(str(depth_dir / f"vis_{i:04d}.png"), vis)
 
             if uncertainties and uncertainties[i] is not None:
-                np.save(depth_dir / f"unc_{i:04d}.npy", uncertainties[i])
+                np.save(depth_dir / f"unc_{i:04d}.npy", uncertainties[i].astype(np.float16))
 
     # 3. 3D Surfel Cloud Initialization & Unprojection
     print("\n[Phase 3] Unprojecting multi-view depth maps into 3D Surfel Cloud...")
@@ -583,20 +587,16 @@ GS_input/
     print(f"Surfel Cloud PLY:      {ply_path}")
     print("=" * 70)
 
-    # 7. Optional Automatic Phase 5 2DGS Optimization
-    if args.train_2dgs:
+    # 7. Optional Automatic Gaussian Splatting Optimization
+    if args.train_gs:
         print("\n" + "=" * 70)
-        print("  LAUNCHING 2DGS RADIANCE FIELD TRAINING")
+        print("  LAUNCHING FASTGS RADIANCE FIELD TRAINING")
         print("=" * 70)
-        from run_scene_training import train_scene_from_ply_and_frames
-        train_scene_from_ply_and_frames(
-            scene_dir=gs_input_dir,
-            output_dir=out_dir / "2dgs_output",
-            iterations=args.iterations_2dgs,
-            voxel_size_m=0.035,
-            max_surfels=400_000,
-            multi_scale=True,
-        )
+        from step_train import main as step_train_main
+        step_train_main([
+            "--workspace", str(out_dir),
+            "--iterations", str(args.iterations_gs),
+        ])
 
 
 if __name__ == "__main__":

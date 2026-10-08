@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
 import sys
+import threading
 import time
 from collections.abc import Sequence as SequenceABC
 from pathlib import Path
@@ -62,7 +63,8 @@ from depth_priors import (
     extract_and_polish_normals,
     colorize_normals,
 )
-from initialization import SurfelCloudInitializer
+from initialization import SurfelCloudInitializer, filter_multiview_consistency
+from clean_depth_maps import clean_all_depth_maps
 from regularize_planes import planes_of, diagnose_planes_quads
 from tsdf_fusion import TSDFVolume
 
@@ -70,7 +72,6 @@ DEFAULT_WORKSPACE = _backend_dir / "current_scene"
 STAGE_DIRNAME = "02_depth_estimation"
 MANIFEST_DIRNAME = "00_ingestion"
 
-# DA3 confidence is not a probability -- it is a relative score, and on textureless
 # interior walls the whole frame sits low. 0.5 throws away most of a bedroom;
 # 0.01 keeps everything but unwritten pixels and lets downstream filters do the real culling.
 MIN_CONF = 0.01
@@ -106,28 +107,52 @@ def _colorize_depth(dmap: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     return cv2.cvtColor(colored_bgr, cv2.COLOR_BGR2RGB)
 
 
-class _LazyImages(SequenceABC):
-    """Images decoded on access with a small LRU cache for sliding window chunk reuse."""
+def _read_image_rgb(p: Path) -> np.ndarray:
+    bgr = cv2.imread(str(p))
+    if bgr is not None:
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    with Image.open(p) as im:
+        return np.asarray(im.convert("RGB"))
 
-    def __init__(self, paths: list[Path], cache_size: int = 32):
+
+class _LazyImages(SequenceABC):
+    """Images decoded on access with an LRU cache and background prefetching for GPU pipelines."""
+
+    def __init__(self, paths: list[Path], cache_size: int = 64):
         self._paths = paths
         self._cache_size = cache_size
         self._cache: dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._paths)
 
+    def prefetch(self, indices: SequenceABC[int]) -> None:
+        """Preload and decode a list of image indices in background threads."""
+        with self._lock:
+            missing = [i for i in indices if 0 <= i < len(self._paths) and i not in self._cache]
+        if not missing:
+            return
+        for i in missing:
+            arr = _read_image_rgb(self._paths[i])
+            with self._lock:
+                if len(self._cache) >= self._cache_size:
+                    oldest = next(iter(self._cache))
+                    del self._cache[oldest]
+                self._cache[i] = arr
+
     def __getitem__(self, idx):
         if isinstance(idx, slice):
             return [self[i] for i in range(*idx.indices(len(self)))]
-        if idx in self._cache:
-            return self._cache[idx]
-        with Image.open(self._paths[idx]) as im:
-            arr = np.asarray(im.convert("RGB"))
-        if len(self._cache) >= self._cache_size:
-            oldest = next(iter(self._cache))
-            del self._cache[oldest]
-        self._cache[idx] = arr
+        with self._lock:
+            if idx in self._cache:
+                return self._cache[idx]
+        arr = _read_image_rgb(self._paths[idx])
+        with self._lock:
+            if len(self._cache) >= self._cache_size:
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+            self._cache[idx] = arr
         return arr
 
 
@@ -158,6 +183,8 @@ def run_depth_estimation_substep(
     # correcting uncorrected. That fallback is what planted the ghost surfaces.
     enable_sparse_anchor: bool = False,
     enable_global_depth_graph: bool = False,
+    normal_model: str = "stablenormal",
+    normal_res: int = 768,
 ) -> tuple[list[np.ndarray], list[str], np.ndarray, np.ndarray]:
     """Substep 1/2: Multi-View DA3 sliding window depth estimation & guided filtering."""
     scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
@@ -332,44 +359,93 @@ def run_depth_estimation_substep(
                      f"RMSE {graph_res.rmse_before_m*100:.1f}cm -> {graph_res.rmse_after_m*100:.1f}cm")
         vram_substeps["global_depth_graph"] = _get_vram_info()
 
-    with ctx.timer("write_depth_maps"):
-        def _save_dmap(item):
-            name, dmap = item
-            np.save(maps_dir / f"{Path(name).stem}.npy", dmap.astype(np.float32))
-
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            list(executor.map(_save_dmap, zip(pose_names, depth_maps)))
-    vram_substeps["write_depth_maps"] = _get_vram_info()
-
     # --- surface normal extraction & polishing (Step 2.3) ---------------------
     normals_dir = depth_dir / "normal_maps"
     normals_dir.mkdir(exist_ok=True)
     normal_images_dir = depth_dir / "normal_images"
     normal_images_dir.mkdir(exist_ok=True)
+    normal_maps: list[np.ndarray] = [None] * len(pose_names)
 
     with ctx.timer("extract_and_polish_normals"):
-        def _save_normal_disk(item):
-            stem, norm_map, orig_rgb, dmap = item
-            np.save(normals_dir / f"{stem}.npy", norm_map)
+        def _save_normal_disk(idx: int, stem: str, norm_map: np.ndarray, orig_rgb: np.ndarray, dmap: np.ndarray):
+            normal_maps[idx] = norm_map
+            np.save(normals_dir / f"{stem}.npy", norm_map.astype(np.float16))
+            # Fast OpenCV colorization and side-by-side diagnostic JPEG write (releases GIL)
             norm_rgb = colorize_normals(norm_map, valid_mask=(dmap > 0.2))
             if norm_rgb.shape[:2] != orig_rgb.shape[:2]:
                 norm_rgb = cv2.resize(norm_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
                                       interpolation=cv2.INTER_NEAREST)
             composite_norm = np.hstack([orig_rgb, norm_rgb])
-            comp_norm_img = Image.fromarray(composite_norm)
-            comp_norm_img.save(normal_images_dir / f"{stem}.jpg", quality=90)
+            comp_bgr = cv2.cvtColor(composite_norm, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(normal_images_dir / f"{stem}.jpg"), comp_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-        # Compute normals sequentially on GPU to prevent concurrent VRAM spikes,
-        # offload disk I/O & JPEG encoding to thread pool
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
-                orig_rgb = images[i]
-                norm_map = extract_and_polish_normals(dmap, scene.intrinsics, rgb_guide=orig_rgb)
-                stem = Path(name).stem
-                executor.submit(_save_normal_disk, (stem, norm_map.astype(np.float32), orig_rgb, dmap))
+        if normal_model == "stablenormal":
+            from stable_normal import StableNormalEstimator
+            ctx.note(f"Running StableNormal Turbo model inference for surface normals (res={normal_res})")
+            with StableNormalEstimator(device=device, resolution=normal_res) as normal_estimator:
+                with ThreadPoolExecutor(max_workers=4) as save_pool:
+                    next_rgb = images[0] if len(pose_names) > 0 else None
+                    for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
+                        cur_rgb = next_rgb
+                        if i + 1 < len(pose_names):
+                            future_next = save_pool.submit(lambda idx: images[idx], i + 1)
+
+                        norm_map = normal_estimator.estimate_normal(cur_rgb)
+                        stem = Path(name).stem
+                        save_pool.submit(_save_normal_disk, i, stem, norm_map, cur_rgb, dmap)
+
+                        if i + 1 < len(pose_names):
+                            next_rgb = future_next.result()
+            # Full GPU memory release is guaranteed by StableNormalEstimator.__exit__
+        else:
+            with ThreadPoolExecutor(max_workers=4) as save_pool:
+                for i, (name, dmap) in enumerate(zip(pose_names, depth_maps)):
+                    orig_rgb = images[i]
+                    norm_map = extract_and_polish_normals(dmap, scene.intrinsics, rgb_guide=orig_rgb)
+                    stem = Path(name).stem
+                    save_pool.submit(_save_normal_disk, i, stem, norm_map, orig_rgb, dmap)
 
     vram_substeps["extract_and_polish_normals"] = _get_vram_info()
-    ctx.note(f"Extracted and polished surface normals, saved diagnostic views to {normal_images_dir}")
+    ctx.note(f"Estimated surface normals using {normal_model}, saved diagnostic views to {normal_images_dir}")
+
+    # --- depth post-processing: clean flying edges, saturation bloom, grazing angles & free-space phantoms ------
+    with ctx.timer("clean_depth_maps"):
+        cleaned_maps, clean_stats = clean_all_depth_maps(
+            depth_maps=depth_maps,
+            images=images,
+            c2w_mats=c2w_gl,
+            intrinsics=scene.intrinsics,
+            normal_maps=normal_maps,
+            max_depth_gradient=MAX_DEPTH_GRADIENT,
+            enable_saturation_mask=True,
+            enable_depth_ceiling=True,
+            max_grazing_angle_deg=MAX_GRAZING_ANGLE_DEG,
+            enable_freespace_filter=True,
+            freespace_margin_m=0.08,
+            max_freespace_violations=0,
+            enable_depth_alignment=True,
+            alignment_margin_m=0.08,
+            min_consensus_views=0,
+            device=device,
+        )
+        depth_maps = cleaned_maps
+        ctx.note(
+            f"Cleaned & aligned depth maps on GPU: cleared {int(clean_stats['saturation']):,} bloom, "
+            f"{int(clean_stats['ceiling']):,} ceiling, {int(clean_stats['gradient']):,} edge-gradient, "
+            f"{int(clean_stats['grazing']):,} grazing, {int(clean_stats['freespace']):,} free-space phantoms, "
+            f"{int(clean_stats['uncorroborated']):,} uncorroborated floaters, and aligned {int(clean_stats['aligned_pixels']):,} "
+            f"multi-view pixels (mean adj: {clean_stats['mean_adjustment_m']*100:.2f} cm)"
+        )
+    vram_substeps["clean_depth_maps"] = _get_vram_info()
+
+    with ctx.timer("write_depth_maps"):
+        def _save_dmap(item):
+            name, dmap = item
+            np.save(maps_dir / f"{Path(name).stem}.npy", dmap.astype(np.float16))
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(_save_dmap, zip(pose_names, depth_maps)))
+    vram_substeps["write_depth_maps"] = _get_vram_info()
 
     finite = np.concatenate([d[np.isfinite(d)].ravel()[::97] for d in depth_maps])
     depth_p05, depth_p95 = float(np.percentile(finite, 5)), float(np.percentile(finite, 95))
@@ -482,7 +558,7 @@ def run_tsdf_substep(
                  for i, n in enumerate(pose_names)]
 
     images = _LazyImages([workspace / "images" / n for n in pose_names])
-    depth_maps = [np.load(maps_dir / f"{Path(n).stem}.npy") for n in pose_names]
+    depth_maps = [np.load(maps_dir / f"{Path(n).stem}.npy").astype(np.float32) for n in pose_names]
 
     points = parse_points3D_txt(sparse_dir / "points3D.txt")
     sparse_xyz = np.array([p["xyz"] for p in points.values()]) if points else None
@@ -544,8 +620,10 @@ def run_tsdf_substep(
     # Save output surfels
     ply_path = depth_dir / "points3D_depth.ply"
     cloud.to_ply(ply_path)
+
     # Also save a dedicated TSDF copy
     cloud.to_ply(depth_dir / "points3D_tsdf.ply")
+
 
     # Geometry statistics
     pos = cloud.positions
@@ -627,7 +705,7 @@ def run_surfels_substep(
     sor_std_mul: float = 2.8,
     enable_normal_consensus: bool = True,
     enable_saturation_mask: bool = True,
-    enable_freespace_filter: bool = True,
+    enable_freespace_filter: bool = False,
     max_freespace_violations: int = 2,
     freespace_margin_m: float = 0.08,
     enable_tube_collapse: bool = False,
@@ -691,11 +769,11 @@ def run_surfels_substep(
     keyframes = [dataclasses.replace(kf_by_name[n], transform_matrix=c2w_gl[i])
                  for i, n in enumerate(pose_names)]
 
-    depth_maps = [np.load(maps_dir / f"{Path(n).stem}.npy", mmap_mode="r") for n in pose_names]
+    depth_maps = [np.load(maps_dir / f"{Path(n).stem}.npy").astype(np.float32) for n in pose_names]
     normal_maps = None
     if normals_dir.is_dir():
         normal_maps = [
-            np.load(normals_dir / f"{Path(n).stem}.npy", mmap_mode="r")
+            np.load(normals_dir / f"{Path(n).stem}.npy").astype(np.float32)
             if (normals_dir / f"{Path(n).stem}.npy").exists() else None
             for n in pose_names
         ]
@@ -752,7 +830,15 @@ def run_surfels_substep(
             try:
                 from regularize_planes import regularize, default_args
                 reg_args = default_args(
-                    min_bbox_area=3.8,
+                    dist_thr=0.05,
+                    wall_tol=10.0,
+                    floor_tol=8.0,
+                    min_bbox_area=5.0,
+                    normal_tol=28.0,
+                    min_inliers=500,
+                    merge_angle=15.0,
+                    max_gap=0.25,
+                    max_furniture_gap=0.70,
                     fill=plane_fill_spacing,
                     fill_min_dist=plane_fill_min_dist,
                     fill_cell=0.08,
@@ -766,6 +852,9 @@ def run_surfels_substep(
                     f"{len(reg_report.get('fill', []))} surfaces regularized into {plane_fill_spacing*100:.1f}cm lattices. "
                     f"Output: {depth_ply_path}"
                 )
+                if "roof_data" in reg_report:
+                    rd = reg_report["roof_data"]
+                    ctx.note(f"Roof data saved to {reg_report.get('roof_data_file')}: type={rd.get('roof_type')}, formula: {rd.get('equation') or rd.get('height')}")
             except Exception as e:
                 ctx.note(f"Plane regularization notice: {e}")
 
@@ -796,11 +885,13 @@ def run_surfels_substep(
             from regularize_planes import diagnose_planes_quads
 
             artifact_dir = ctx.artifacts_dir if (ctx.artifacts_dir and ctx.artifacts_dir.is_dir()) else None
+            pre_planes = reg_report.get("planes") if (reg_report and "planes" in reg_report) else None
             plane_report = diagnose_planes_quads(
                 depth_ply_path=depth_ply_path,
                 output_dir=depth_dir,
                 artifact_dir=artifact_dir,
                 min_area=2.0,
+                pre_extracted_planes=pre_planes,
             )
             ctx.note(
                 f"Plane MEQ diagnostic: extracted {len(plane_report['planes'])} planes with 4-vertex enclosures. "
@@ -885,6 +976,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Use experimental Volumetric TSDF Fusion instead of SurfelCloudInitializer")
     parser.add_argument("--no-tsdf", action="store_false", dest="enable_tsdf",
                         help="Use classic backprojection unprojection instead of TSDF")
+    parser.add_argument("--normal-model", choices=["stablenormal", "depth_gradient"], default="stablenormal",
+                        help="Surface normal estimation backend (default: stablenormal)")
+    parser.add_argument("--normal-res", type=int, default=768,
+                        help="StableNormal processing resolution (default: 768, upscaled to full resolution)")
     parser.add_argument("--enable-sparse-anchor", action="store_true", dest="enable_sparse_anchor", default=False,
                         help="Re-enable the post-hoc per-frame COLMAP anchoring (default: False -- "
                              "superseded by per-window alignment inside the sliding window)")
@@ -995,6 +1090,8 @@ def main(argv: list[str] | None = None) -> int:
                 process_res=args.process_res,
                 enable_guided_filter=args.enable_guided_filter,
                 enable_sparse_anchor=args.enable_sparse_anchor,
+                normal_model=args.normal_model,
+                normal_res=args.normal_res,
             )
 
         if substep == "tsdf" or (substep == "all" and args.enable_tsdf):

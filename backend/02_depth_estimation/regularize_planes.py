@@ -493,12 +493,25 @@ def extract_planes(xyz, normals, dist_thr, min_inliers, min_extent, normal_tol_d
         if len(idx) < min_inliers:
             continue
 
-        # keep the largest connected component -- a diagonal RANSAC cut through room clutter
-        # spans a big bbox but shatters into crumbs, a real wall stays one blob
+        # Filter out small noise crumbs (< 50 points), and reject far-away disconnected clusters (> 0.40m)
         comp = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz[idx]))
         lab = np.asarray(comp.cluster_dbscan(eps=cluster_eps, min_points=10))
         if (lab >= 0).any():
-            idx = idx[lab == np.argmax(np.bincount(lab[lab >= 0]))]
+            counts = np.bincount(lab[lab >= 0])
+            main_c = np.argmax(counts)
+            pts_main = xyz[idx[lab == main_c]]
+            tree_main = cKDTree(pts_main)
+
+            valid_labels = [main_c]
+            for l in range(len(counts)):
+                if l == main_c or counts[l] < 50:
+                    continue
+                pts_sub = xyz[idx[lab == l]]
+                d_sub, _ = tree_main.query(pts_sub, k=1)
+                if d_sub.min() <= 0.40:
+                    valid_labels.append(l)
+
+            idx = idx[np.isin(lab, valid_labels)]
         if len(idx) < min_inliers:
             continue
 
@@ -510,8 +523,15 @@ def extract_planes(xyz, normals, dist_thr, min_inliers, min_extent, normal_tol_d
         if extent.min() < min_extent:
             continue
         w_obb, h_obb, area_obb, center_obb, uv_obb = fit_2d_oriented_bbox(local)
+        occ_area = occupied_area(local)
+
+        # Solidity / density check: reject planes where occupied area is less than 25% of OBB area
+        # (e.g. tiny fragments bridging across huge empty room space)
+        if occ_area / max(area_obb, 1e-6) < 0.25 and area_obb > 3.0:
+            continue
+
         planes.append(dict(idx=idx, centroid=centroid, normal=n, extent=extent,
-                           area=occupied_area(local), bbox_dims=(w_obb, h_obb),
+                           area=occ_area, bbox_dims=(w_obb, h_obb),
                            bbox_area=area_obb))
     return planes
 
@@ -619,6 +639,14 @@ def filter_furniture_planes(fitted: list[dict], xyz: np.ndarray, max_furniture_g
     perimeter wall is tagged as furniture. Real corridors and alcoves (gap > 0.70m) remain walls.
     """
     c_room = xyz.mean(axis=0)
+
+    # Reject sloped planes sitting in the lower half of the room (e.g. bed blankets, pillows, chair backs)
+    for g in fitted:
+        if g["kind"] == "sloped" and g["centroid"][1] < 0.5:
+            g["kind"] = "furniture"
+            g["keep"] = False
+            g["reason"] = f"furniture/bed: sloped plane at Y={g['centroid'][1]:.2f}m < 0.5m"
+
     verticals = [g for g in fitted if g["kind"] == "vertical" and g.get("keep", True)]
     for i in range(len(verticals)):
         for j in range(len(verticals)):
@@ -629,8 +657,10 @@ def filter_furniture_planes(fitted: list[dict], xyz: np.ndarray, max_furniture_g
             dot = float(np.dot(n_in, n_out))
             if abs(dot) < 0.92:
                 continue
-            n_ref = n_out if dot > 0 else -n_out
             c_in, c_out = g_inner["centroid"], g_outer["centroid"]
+            n_ref = n_out if dot > 0 else -n_out
+            if np.dot(c_out - c_room, n_ref) < 0:
+                n_ref = -n_ref
             d_in = float(np.dot(c_in - c_room, n_ref))
             d_out = float(np.dot(c_out - c_room, n_ref))
             if d_out > d_in:
@@ -691,7 +721,11 @@ def snap_planes(xyz, normals, planes, up, e1, e2, args):
                          azimuth_deg=round(az, 2), azimuth_target_deg=round(az_t, 2),
                          off_frame_deg=round(off, 2))
         else:
-            n_t = n
+            all_pts = xyz[np.concatenate([planes[m]["idx"] for m in g["members"]])]
+            _, n_ls = plane_from_points(all_pts)
+            if np.dot(n_ls, n) < 0:
+                n_ls = -n_ls
+            n_t = n_ls
             entry["target"] = "sloped"
 
         entry["rotation_deg"] = round(float(np.degrees(
@@ -718,10 +752,61 @@ def snap_planes(xyz, normals, planes, up, e1, e2, args):
                      normal=[round(float(v), 4) for v in n_t])
         report.append(entry)
 
-    members = [np.concatenate([planes[m]["idx"] for m in g["members"]]) if g.get("applied")
-               else np.empty(0, np.int64) for g in fitted]
+    # Inlier expansion pass: absorb close coplanar unassigned points into the snapped planes
+    all_assigned = set()
+    for g in fitted:
+        if g.get("applied"):
+            for m in g["members"]:
+                all_assigned.update(planes[m]["idx"])
+
+    unassigned_mask = np.ones(len(xyz), dtype=bool)
+    if all_assigned:
+        unassigned_mask[list(all_assigned)] = False
+    unassigned_indices = np.where(unassigned_mask)[0]
+
+    expanded_members = []
+    for gid, g in enumerate(fitted):
+        if not g.get("applied"):
+            expanded_members.append(np.empty(0, np.int64))
+            continue
+        base_idx = np.concatenate([planes[m]["idx"] for m in g["members"]])
+        n_t = np.array(report[gid]["normal"])
+        d_target = float((xyz[base_idx] @ n_t).mean())
+
+        if len(unassigned_indices) > 0 and len(base_idx) > 0:
+            pts_un = xyz[unassigned_indices]
+            norm_un = normals[unassigned_indices]
+            d_plane = np.abs((pts_un @ n_t) - d_target)
+            a_norm = np.degrees(np.arccos(np.clip(np.abs((norm_un * n_t).sum(axis=1)), 0, 1)))
+
+            d_cand_max = 0.08 if g["kind"] == "sloped" else 0.05
+            a_norm_max = 35.0 if g["kind"] == "sloped" else 32.0
+            sp_dist_max = 0.25 if g["kind"] == "sloped" else 0.15
+
+            cand_mask = (d_plane <= d_cand_max) & (a_norm <= a_norm_max)
+            if cand_mask.any():
+                cand_indices = unassigned_indices[cand_mask]
+                pts_cand = xyz[cand_indices]
+
+                tree_base = cKDTree(xyz[base_idx])
+                spatial_dist, _ = tree_base.query(pts_cand, k=1)
+                absorb_submask = spatial_dist <= sp_dist_max
+
+                if absorb_submask.any():
+                    absorbed = cand_indices[absorb_submask]
+                    shift = d_target - (xyz[absorbed] @ n_t)
+                    xyz[absorbed] += shift[:, None] * n_t
+                    normals[absorbed] = n_t
+                    base_idx = np.concatenate([base_idx, absorbed])
+
+                    absorbed_set = set(absorbed)
+                    unassigned_indices = np.array([idx for idx in unassigned_indices if idx not in absorbed_set], dtype=np.int64)
+
+        expanded_members.append(base_idx)
+        report[gid]["inliers"] = len(base_idx)
+
     return dict(manhattan_frame_deg=None if phi is None else round(phi, 3),
-                merged_pairs=pairs, groups=report), members
+                merged_pairs=pairs, groups=report), expanded_members
 
 
 def is_point_inside_polygon(pts: np.ndarray, poly: np.ndarray) -> np.ndarray:
@@ -941,6 +1026,77 @@ def align_storeys(xyz, normals, up, e1, e2, args):
                 blend_m=b, points_above=int((h >= cut).sum()), applied=True)
 
 
+def extract_and_save_roof_data(report: dict, out_dir: Path) -> dict:
+    """Extract roof data (tilted roof plane or highest horizontal ceiling) and save to roof_data.json."""
+    groups = report.get("groups", [])
+    applied_groups = [g for g in groups if g.get("applied", False)]
+
+    # Check for tilted big planes (kind == 'sloped' or non-vertical/non-horizontal with area >= 4.0m2)
+    tilted_planes = []
+    for g in applied_groups:
+        if g.get("kind") == "sloped" or (g.get("target") == "sloped"):
+            tilted_planes.append(g)
+        elif g.get("kind") not in ("horizontal", "vertical", "furniture") and g.get("area_m2", 0) >= 4.0:
+            tilted_planes.append(g)
+
+    # Check for horizontal planes
+    horizontal_planes = [g for g in applied_groups if g.get("kind") == "horizontal"]
+    highest_horiz = None
+    if horizontal_planes:
+        highest_horiz = max(horizontal_planes, key=lambda g: g["centroid"][1])
+
+    if tilted_planes:
+        primary_tilted = max(tilted_planes, key=lambda g: g.get("area_m2", 0.0))
+        n_raw = np.array(primary_tilted.get("normal", [0.0, 1.0, 0.0]), dtype=np.float64)
+        c = np.array(primary_tilted["centroid"], dtype=np.float64)
+        if n_raw[1] < 0:
+            n_raw = -n_raw
+        norm = np.linalg.norm(n_raw)
+        if norm > 1e-6:
+            n_raw /= norm
+        d = float(np.dot(n_raw, c))
+
+        roof_data = {
+            "remove_margin_m": 0.30,
+            "roof_type": "tilted",
+            "group_id": primary_tilted.get("group"),
+            "normal": [round(float(v), 6) for v in n_raw],
+            "offset_d": round(d, 6),
+            "centroid": [round(float(v), 4) for v in c],
+            "area_m2": primary_tilted.get("area_m2"),
+            "bbox_area_m2": primary_tilted.get("bbox_area_m2"),
+            "equation": f"{n_raw[0]:.4f}*x + {n_raw[1]:.4f}*y + {n_raw[2]:.4f}*z = {d:.4f}",
+            "height_formula": f"y = ({d:.4f} - ({n_raw[0]:.4f})*x - ({n_raw[2]:.4f})*z) / {n_raw[1]:.4f}",
+        }
+    elif highest_horiz is not None:
+        y_ceil = float(highest_horiz["centroid"][1])
+        roof_data = {
+            "remove_margin_m": 0.30,
+            "roof_type": "horizontal",
+            "group_id": highest_horiz.get("group"),
+            "height": round(y_ceil, 4),
+            "normal": [0.0, 1.0, 0.0],
+            "offset_d": round(y_ceil, 4),
+            "centroid": [round(float(v), 4) for v in highest_horiz["centroid"]],
+            "area_m2": highest_horiz.get("area_m2"),
+            "bbox_area_m2": highest_horiz.get("bbox_area_m2"),
+            "equation": f"y = {y_ceil:.4f}",
+            "height_formula": f"y = {y_ceil:.4f}",
+        }
+    else:
+        roof_data = {
+            "remove_margin_m": 0.30,
+            "roof_type": "none",
+            "height": None,
+        }
+
+    roof_json_path = out_dir / "roof_data.json"
+    roof_json_path.write_text(json.dumps(roof_data, indent=2) + "\n", encoding="utf-8")
+    report["roof_data"] = roof_data
+    report["roof_data_file"] = str(roof_json_path)
+    return roof_data
+
+
 def regularize(src: Path, dst: Path, args) -> dict:
     ply = PlyData.read(str(src))
     vert = ply["vertex"].data.copy()
@@ -972,7 +1128,7 @@ def regularize(src: Path, dst: Path, args) -> dict:
     report = dict(
         source=str(src), output=str(dst), points=int(len(xyz)),
         up_axis=[round(float(v), 5) for v in up], cluster_eps_m=round(eps, 4),
-        storeys=storeys, **snapped,
+        storeys=storeys, planes=planes, **snapped,
     )
     for k, col in zip("xyz", xyz.T):
         vert[k] = col.astype(vert[k].dtype)
@@ -1040,6 +1196,10 @@ def regularize(src: Path, dst: Path, args) -> dict:
         dst.with_name(dst.stem + "_legend.md").write_text(legend_md)
     report["legend_file"] = str(legend_path)
     report["legend_md"] = legend_md
+
+    # Extract and save roof data (ceiling height and/or tilted roof plane)
+    extract_and_save_roof_data(report, dst.parent)
+
     return report
 
 
@@ -1305,22 +1465,22 @@ def build_parser():
     ap.add_argument("-o", "--output", type=Path)
     ap.add_argument("--up", type=int, choices=[0, 1, 2], default=1,
                     help="up axis index (default: 1, +Y axis)")
-    ap.add_argument("--dist-thr", type=float, default=0.02, help="RANSAC inlier distance, m")
+    ap.add_argument("--dist-thr", type=float, default=0.05, help="RANSAC inlier distance, m (default: 0.05 = 5cm)")
     ap.add_argument("--cluster-eps", type=float, help="connectivity radius, m (default: auto)")
-    ap.add_argument("--min-inliers", type=int, default=800)
+    ap.add_argument("--min-inliers", type=int, default=500)
     ap.add_argument("--min-inlier-frac", type=float, default=0.0)
     ap.add_argument("--min-extent", type=float, default=0.5, help="smallest in-plane side, m")
-    ap.add_argument("--min-bbox-area", type=float, default=3.8,
-                    help="discard candidate planes with 2D OBB area below this, m2")
+    ap.add_argument("--min-bbox-area", type=float, default=5.0,
+                    help="discard candidate planes with 2D OBB area below this, m2 (default: 5.0 m2)")
     ap.add_argument("--max-furniture-gap", type=float, default=0.70,
                     help="parallel vertical planes within this offset from a perimeter wall are furniture, m")
-    ap.add_argument("--normal-tol", type=float, default=20.0, help="surfel-normal agreement, deg")
+    ap.add_argument("--normal-tol", type=float, default=28.0, help="surfel-normal agreement, deg (default: 28.0 deg)")
     ap.add_argument("--max-planes", type=int, default=40)
-    ap.add_argument("--wall-tol", type=float, default=35.0, help="snap to vertical below this tilt")
-    ap.add_argument("--floor-tol", type=float, default=20.0, help="snap to horizontal below this")
-    ap.add_argument("--merge-angle", type=float, default=10.0, help="fragments parallel within, deg")
+    ap.add_argument("--wall-tol", type=float, default=10.0, help="snap to vertical below this tilt, deg (default: 10.0 deg)")
+    ap.add_argument("--floor-tol", type=float, default=8.0, help="snap to horizontal below this tilt, deg (default: 8.0 deg)")
+    ap.add_argument("--merge-angle", type=float, default=15.0, help="fragments parallel within, deg (default: 15.0 deg)")
     ap.add_argument("--merge-k", type=float, default=0.5, help="gap budget per sqrt(area), m")
-    ap.add_argument("--max-gap", type=float, default=0.35, help="absolute cap on the merge gap, m")
+    ap.add_argument("--max-gap", type=float, default=0.25, help="absolute cap on the merge gap, m (default: 0.25 m)")
     ap.add_argument("--manhattan-tol", type=float, default=15.0,
                     help="snap a wall to the 90 deg frame when it is within this, deg")
     ap.add_argument("--no-storeys", action="store_true", help="skip the storey alignment pass")
@@ -1354,6 +1514,7 @@ def diagnose_planes_quads(
     artifact_dir: Path | None = None,
     min_area: float = 2.0,
     max_vertices: int = 5,
+    pre_extracted_planes: list[dict] | None = None,
 ) -> dict:
     """Diagnostic up-to-5-vertex non-orthogonal minimum enclosing polygon plane analysis.
 
@@ -1363,9 +1524,11 @@ def diagnose_planes_quads(
     """
     import os
     import shutil
+    from concurrent.futures import ThreadPoolExecutor
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
 
     ply = PlyData.read(str(depth_ply_path))
     vert = ply["vertex"].data.copy()
@@ -1374,17 +1537,20 @@ def diagnose_planes_quads(
     n_len = np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
     normals /= n_len
 
-    up = detect_up(normals)
-    eps = None
-    try:
-        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz[:: max(1, len(xyz) // 40000)]))
-        eps = 6.0 * float(np.median(np.asarray(pcd.compute_nearest_neighbor_distance())))
-    except Exception:
-        eps = 0.08
+    if pre_extracted_planes is not None and len(pre_extracted_planes) > 0:
+        planes = pre_extracted_planes
+    else:
+        up = detect_up(normals)
+        eps = None
+        try:
+            pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz[:: max(1, len(xyz) // 40000)]))
+            eps = 6.0 * float(np.median(np.asarray(pcd.compute_nearest_neighbor_distance())))
+        except Exception:
+            eps = 0.08
 
-    planes = extract_planes(xyz, normals, dist_thr=0.025, min_inliers=1000, min_extent=0.35,
-                            normal_tol_deg=22.0, max_planes=30, cluster_eps=eps)
-    classify(planes, up, wall_tol_deg=35.0, floor_tol_deg=20.0)
+        planes = extract_planes(xyz, normals, dist_thr=0.025, min_inliers=1000, min_extent=0.35,
+                                normal_tol_deg=22.0, max_planes=30, cluster_eps=eps)
+        classify(planes, up, wall_tol_deg=35.0, floor_tol_deg=20.0)
 
     kept = [p for p in planes if p["area"] >= min_area]
     kept.sort(key=lambda p: -p["area"])
@@ -1419,15 +1585,12 @@ def diagnose_planes_quads(
         "| :---: | :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |",
     ]
 
-    for i, p in enumerate(kept):
+    def _process_plane(i_p):
+        i, p = i_p
         palette_entry = PALETTE[i % len(PALETTE)]
         color_rgb = palette_entry["rgb"]
         color_name = palette_entry["name"]
         swatch = palette_entry["emoji"]
-
-        # Color inliers in colored_vert
-        for c, val in zip(("red", "green", "blue"), color_rgb):
-            colored_vert[c][p["idx"]] = val
 
         centroid = p["centroid"]
         basis = plane_basis(xyz[p["idx"]], centroid)  # (2, 3)
@@ -1439,17 +1602,20 @@ def diagnose_planes_quads(
 
         # Generate 3D wireframe boundary points along edges
         n_interp = 80
+        wf_pts = []
+        wf_cols = []
         for edge_idx in range(k_verts):
             p_start = poly_3d[edge_idx]
             p_end = poly_3d[(edge_idx + 1) % k_verts]
             t_vals = np.linspace(0, 1, n_interp, endpoint=False)[:, None]
             pts_edge = p_start[None, :] * (1.0 - t_vals) + p_end[None, :] * t_vals
-            wireframe_pts.append(pts_edge)
-            # Bright white wireframe
-            wireframe_colors.append(np.full((n_interp, 3), 255, dtype=np.uint8))
+            wf_pts.append(pts_edge)
+            wf_cols.append(np.full((n_interp, 3), 255, dtype=np.uint8))
 
-        # Render 2D Matplotlib diagnostic plot
-        fig, ax = plt.subplots(figsize=(7, 6), dpi=130)
+        # Render 2D Matplotlib diagnostic plot using thread-safe Figure
+        fig = Figure(figsize=(7, 6), dpi=130)
+        canvas = FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111)
         ax.set_facecolor("#1A1A1A")
         fig.patch.set_facecolor("#121212")
 
@@ -1505,9 +1671,8 @@ def diagnose_planes_quads(
 
         fig_filename = f"plane_{i}_quad.png"
         fig_path = preview_dir / fig_filename
-        plt.tight_layout()
-        plt.savefig(fig_path, facecolor=fig.get_facecolor(), edgecolor="none")
-        plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(fig_path, facecolor=fig.get_facecolor(), edgecolor="none")
 
         if artifact_dir:
             shutil.copy2(fig_path, artifact_dir / fig_filename)
@@ -1516,13 +1681,13 @@ def diagnose_planes_quads(
         angles_str = ", ".join(f"{a:.1f}°" for a in metrics["internal_angles_deg"])
         n_vec = [round(float(v), 3) for v in p["normal"]]
 
-        md_lines.append(
+        md_row = (
             f"| **#{i}** | {swatch} | **{p['kind'].capitalize()}** | {color_name} | {len(p['idx']):,} | "
             f"`{metrics['occupied_area_m2']:.2f} m²` | `{metrics['poly_area_m2']:.2f} m²` | `{k_verts}` | "
             f"**`{metrics['occupied_ratio']*100:.1f}%`** | `{side_lens_str}` | `{angles_str}` | `{n_vec}` |"
         )
 
-        catalog.append({
+        catalog_entry = {
             "plane_id": i,
             "kind": p["kind"],
             "color": color_name,
@@ -1533,7 +1698,21 @@ def diagnose_planes_quads(
             "vertices_2d": [[round(float(coord), 4) for coord in v2] for v2 in poly_2d],
             "metrics": metrics,
             "plot_image": fig_filename,
-        })
+        }
+
+        return p["idx"], color_rgb, wf_pts, wf_cols, md_row, catalog_entry
+
+    max_workers = min(8, max(1, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = list(executor.map(_process_plane, enumerate(kept)))
+
+    for inlier_indices, color_rgb, wf_pts, wf_cols, md_row, catalog_entry in results:
+        for c, val in zip(("red", "green", "blue"), color_rgb):
+            colored_vert[c][inlier_indices] = val
+        wireframe_pts.extend(wf_pts)
+        wireframe_colors.extend(wf_cols)
+        md_lines.append(md_row)
+        catalog.append(catalog_entry)
 
     # Add per-plane visual sections to markdown report
     md_lines += [

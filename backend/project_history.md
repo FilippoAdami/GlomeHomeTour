@@ -376,3 +376,13 @@ yet run on real data**. Tests cover the structural guarantees
 (`test_colmap_poses_to_da3.py`) and step 3's new track covisibility
 (`test_step_filter_depth.py`) — 12 assertions-based tests, all passing.
 
+## 2026-09-28: FastGS + DN-Splatter Integration & Step 00 Detachment
+- Switched stage 03 to `03_FastGS_DNSplatter`, integrating FastGS fast 3DGS training with DN-Splatter depth and normal supervision (`--depth_supervision`, `--normal_supervision`, `--depth_loss pearson`).
+- Detached `00_ingestion` (`step_filter_quality.py`, `step_rotate_upright.py`) from `run_pipeline.py` orchestration following on-device migration of capture quality filtering into the mobile app. Step 0 files are preserved for standalone and offline tools.
+- Input/output routing integrated into the workspace:
+  - `03_FastGS_DNSplatter` resolves depth & normal maps directly from `02_depth_estimation/depth/depth_maps/` and `normal_maps/` (or root `depth_maps/` / `normal_maps/`).
+  - Initializes point cloud from DA3 dense surfels (`points3D_depth.ply` installed to `sparse/0/points3D.ply`).
+  - Outputs model and point cloud to `<workspace>/03_FastGS_DNSplatter/output/point_cloud/iteration_<N>/point_cloud.ply`.
+- Created `03_FastGS_DNSplatter/step_train.py` wrapper conforming to pipeline step contract (`StepContext`, `is_done`, `--force`, stats logging).
+- Updated `Utilities/pipeline_paths.py`, `run_pipeline.py`, cross-stage references, documentation, and verified with test suite.
+

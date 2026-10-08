@@ -82,3 +82,52 @@ class TestTSDFFusion:
         # Zero crossing positions should sit tightly around Z = -2.0 in OpenGL world
         mean_z = np.mean(cloud.positions[:, 2])
         assert abs(mean_z - (-2.0)) < 0.1
+
+    def test_float16_storage_and_fidelity(self, tmp_path, mock_intrinsics):
+        """Verify float16 storage preserves metric depth accuracy and unit normal orientation."""
+        from clean_depth_maps import clean_all_depth_maps
+
+        h, w = 120, 160
+        # Synthetic metric depth in meters
+        orig_depth = np.linspace(0.5, 8.0, h * w, dtype=np.float32).reshape((h, w))
+        # Synthetic unit surface normals in camera space
+        nx = np.sin(orig_depth) * 0.5
+        ny = np.cos(orig_depth) * 0.5
+        nz = np.sqrt(np.maximum(0.0, 1.0 - nx**2 - ny**2))
+        orig_normals = np.stack([nx, ny, nz], axis=-1).astype(np.float32)
+
+        # Save as float16
+        depth_path = tmp_path / "frame_000.npy"
+        norm_path = tmp_path / "norm_000.npy"
+        np.save(depth_path, orig_depth.astype(np.float16))
+        np.save(norm_path, orig_normals.astype(np.float16))
+
+        # Check disk size reduction (float16 = 2 bytes/element)
+        assert depth_path.stat().st_size < orig_depth.nbytes
+        assert norm_path.stat().st_size < orig_normals.nbytes
+
+        # Load and verify precision
+        loaded_depth = np.load(depth_path).astype(np.float32)
+        loaded_normals = np.load(norm_path).astype(np.float32)
+
+        # Metric depth error should be sub-millimeter to ~4mm at 8m
+        max_depth_err_mm = np.max(np.abs(loaded_depth - orig_depth)) * 1000.0
+        assert max_depth_err_mm < 5.0  # Max error < 5mm at 8 meters
+
+        # Normal vector error should have angular error < 0.05 degrees
+        dot = np.sum(loaded_normals * orig_normals, axis=-1).clip(-1.0, 1.0)
+        angular_err_deg = np.rad2deg(np.arccos(dot))
+        assert np.max(angular_err_deg) < 0.05
+
+        # Test compatibility with clean_all_depth_maps
+        c2w = np.eye(4, dtype=np.float32)
+        cleaned, stats = clean_all_depth_maps(
+            depth_maps=[loaded_depth],
+            images=[np.full((h, w, 3), 128, dtype=np.uint8)],
+            c2w_mats=c2w[None],
+            intrinsics=mock_intrinsics,
+            normal_maps=[loaded_normals],
+            device="cpu",
+        )
+        assert len(cleaned) == 1
+        assert cleaned[0].shape == (h, w)

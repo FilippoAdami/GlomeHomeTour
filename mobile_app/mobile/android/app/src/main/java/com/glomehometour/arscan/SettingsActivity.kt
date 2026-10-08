@@ -25,6 +25,10 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var lumaMinField: EditText
     private lateinit var lumaMaxField: EditText
     private lateinit var strideField: EditText
+    private lateinit var keyframeFilterCheck: android.widget.CheckBox
+    private lateinit var keyframeMinM2Field: EditText
+    private lateinit var keyframeMaxM2Field: EditText
+    private lateinit var qualityBlurField: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,6 +79,39 @@ class SettingsActivity : AppCompatActivity() {
             Tunables.decimationStride.toString(),
         )
 
+        column.addView(TextView(this).apply {
+            text = "Pre-COLMAP Processing"
+            setTextColor(color(R.color.text_secondary))
+            textSize = 16f
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        keyframeFilterCheck = android.widget.CheckBox(this).apply {
+            text = "Enable keyframe & quality filtering"
+            isChecked = Tunables.keyframeFilterEnabled
+            setTextColor(color(R.color.text_primary))
+            textSize = 14f
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(8) }
+        }
+        column.addView(keyframeFilterCheck)
+
+        keyframeMinM2Field = addField(
+            column, "Min keyframes / m² (budget lo)",
+            "Default 8.0 keyframes per m² of estimated floor area.",
+            Tunables.keyframeMinPerM2.toString(),
+        )
+        keyframeMaxM2Field = addField(
+            column, "Max keyframes / m² (budget hi)",
+            "Default 11.0 keyframes per m² of estimated floor area.",
+            Tunables.keyframeMaxPerM2.toString(),
+        )
+        qualityBlurField = addField(
+            column, "Quality gate relative blur threshold",
+            "Fraction of scene median sharpness (default 0.35). Frames below this fail blur gate.",
+            Tunables.qualityGateBlurThreshold.toString(),
+        )
+
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -117,6 +154,10 @@ class SettingsActivity : AppCompatActivity() {
             lumaMin = lumaMinField.floatOr(Tunables.photometricMeanMin),
             lumaMax = lumaMaxField.floatOr(Tunables.photometricMeanMax),
             stride = strideField.text.toString().trim().toLongOrNull() ?: Tunables.decimationStride,
+            keyframeFilterEnabled = keyframeFilterCheck.isChecked,
+            keyframeMinPerM2 = keyframeMinM2Field.floatOr(Tunables.keyframeMinPerM2),
+            keyframeMaxPerM2 = keyframeMaxM2Field.floatOr(Tunables.keyframeMaxPerM2),
+            qualityGateBlurThreshold = qualityBlurField.floatOr(Tunables.qualityGateBlurThreshold),
         )
         Tunables.save(this, values)
         Toast.makeText(this, "Saved -- applies to the next scan", Toast.LENGTH_SHORT).show()

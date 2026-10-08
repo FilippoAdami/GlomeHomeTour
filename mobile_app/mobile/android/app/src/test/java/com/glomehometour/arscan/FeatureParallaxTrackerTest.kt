@@ -128,4 +128,120 @@ class FeatureParallaxTrackerTest {
             assertTrue("$entries -> $size", size >= entries * 2 && (size and (size - 1)) == 0)
         }
     }
+
+    @Test
+    fun `wobble detection detects high jitter and unanchors tracking`() {
+        val tracker = FeatureParallaxTracker()
+        assertTrue(tracker.isTrackingAnchored)
+
+        val ids = intArrayOf(1, 2, 3, 4)
+        val initialPoints = floatArrayOf(
+            -0.5f, 0f, 2.0f, 0.9f,
+            -0.2f, 0f, 2.0f, 0.9f,
+             0.2f, 0f, 2.0f, 0.9f,
+             0.5f, 0f, 2.0f, 0.9f
+        )
+        // Frame 1
+        tracker.update(initialPoints, ids, 4, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 1_000L)
+        assertTrue(tracker.isTrackingAnchored)
+
+        // Frame 2: candidate positions violently wobble by 0.2 meters
+        val wobbledPoints = floatArrayOf(
+            -0.5f, 0f, 2.2f, 0.9f,
+            -0.2f, 0f, 1.8f, 0.9f,
+             0.2f, 0f, 2.2f, 0.9f,
+             0.5f, 0f, 1.8f, 0.9f
+        )
+        tracker.update(wobbledPoints, ids, 4, cameraX = 0.01f, cameraY = 0f, cameraZ = 0f, timestampNs = 2_000L)
+
+        // Smoothed jitter exceeds 0.035m, tracking is not anchored
+        org.junit.Assert.assertFalse(tracker.isTrackingAnchored)
+    }
+
+    @Test
+    fun `high triangulation residual rejects candidate promotion`() {
+        val tracker = FeatureParallaxTracker()
+        // Two rays that pass each other with a large miss distance (> 0.09m)
+        val triangulated = tracker.triangulateTwoRays(
+            p1x = 0f, p1y = 0f, p1z = 0f, d1x = 0f, d1y = 0f, d1z = 1f,
+            p2x = 1f, p2y = 0.3f, p2z = 0f, d2x = -0.4472f, d2y = 0f, d2z = 0.8944f
+        )
+        // Since vertical miss is 0.3m > MAX_RESIDUAL_M (0.09m), triangulation must fail
+        org.junit.Assert.assertNull(triangulated)
+    }
+
+    @Test
+    fun `distant outlier candidate is rejected from promotion`() {
+        val tracker = FeatureParallaxTracker()
+        // Populate 10 valid landmarks around (0, 0, 2)
+        val n = 10
+        val points = FloatArray(n * 4)
+        val ids = IntArray(n)
+        for (i in 0 until n) {
+            points[i * 4] = (i - 5) * 0.1f
+            points[i * 4 + 1] = 0f
+            points[i * 4 + 2] = 2.0f
+            points[i * 4 + 3] = 0.9f
+            ids[i] = i + 1
+        }
+        tracker.update(points, ids, n, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 1_000L)
+        tracker.update(points, ids, n, cameraX = 0.8f, cameraY = 0f, cameraZ = 0f, timestampNs = 2_000L)
+        assertEquals(n, tracker.verifiedLandmarkCount)
+
+        // Now introduce an outlier candidate at (20.0, 0, 20.0) -> far outside cluster and camera limit
+        val outlierPoint = floatArrayOf(20.0f, 0f, 20.0f, 0.9f)
+        val outlierId = intArrayOf(999)
+        tracker.update(outlierPoint, outlierId, 1, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 3_000L)
+        tracker.update(outlierPoint, outlierId, 1, cameraX = 0.8f, cameraY = 0f, cameraZ = 0f, timestampNs = 4_000L)
+
+        // Landmark count remains 10; outlier candidate was not promoted
+        assertEquals(10, tracker.verifiedLandmarkCount)
+    }
+
+    @Test
+    fun `normal culling culls points when camera moves to opposite side`() {
+        val tracker = FeatureParallaxTracker()
+        // Feature on North wall at (0, 0, 5) seen from camera at (0, 0, 0)
+        val initialObservation = floatArrayOf(0.0f, 0.0f, 5.0f, 0.9f)
+        val ids = intArrayOf(10)
+
+        // View 1 at (0, 0, 0)
+        tracker.update(initialObservation, ids, 1, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 1_000L)
+        // View 2 at (1.0, 0, 0) -> Triangulates and promotes with observation normal pointing south towards (0, 0, 0)
+        tracker.update(initialObservation, ids, 1, cameraX = 1.0f, cameraY = 0f, cameraZ = 0f, timestampNs = 2_000L)
+        assertEquals(1, tracker.verifiedLandmarkCount)
+
+        val exported = FloatArray(4)
+
+        // Camera on front side of wall at (0, 0, 2): Landmark must be visible!
+        val frontCount = tracker.exportPointVertices(
+            exported, nowNs = 2_000L,
+            camX = 0f, camY = 0f, camZ = 2f,
+            enableNormalCulling = true
+        )
+        assertEquals(1, frontCount)
+
+        // Camera moved to opposite side of the wall at (0, 0, 10): Landmark must be culled!
+        val backCount = tracker.exportPointVertices(
+            exported, nowNs = 2_000L,
+            camX = 0f, camY = 0f, camZ = 10f,
+            enableNormalCulling = true
+        )
+        assertEquals(0, backCount)
+    }
+
+    @Test
+    fun `outdoor distance promotion allows distant points beyond 6 meters`() {
+        val tracker = FeatureParallaxTracker()
+        // Feature on building facade at 8.0 meters away
+        val p1 = floatArrayOf(0.0f, 0.0f, 8.0f, 0.9f)
+        val ids = intArrayOf(77)
+
+        // Baseline of 1.5 meters for distant feature triangulation
+        tracker.update(p1, ids, 1, cameraX = 0f, cameraY = 0f, cameraZ = 0f, timestampNs = 1_000L)
+        tracker.update(p1, ids, 1, cameraX = 1.5f, cameraY = 0f, cameraZ = 0f, timestampNs = 2_000L)
+
+        // Must be promoted as permanent landmark despite being > 6.0m
+        assertEquals(1, tracker.verifiedLandmarkCount)
+    }
 }

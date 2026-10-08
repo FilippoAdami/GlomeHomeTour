@@ -34,6 +34,9 @@ class FeatureParallaxTracker(
     private val landmarkX = FloatArray(maxLandmarks)
     private val landmarkY = FloatArray(maxLandmarks)
     private val landmarkZ = FloatArray(maxLandmarks)
+    private val landmarkNormX = FloatArray(maxLandmarks)
+    private val landmarkNormY = FloatArray(maxLandmarks)
+    private val landmarkNormZ = FloatArray(maxLandmarks)
     private val landmarkPromoteTimeNs = LongArray(maxLandmarks)
     var verifiedLandmarkCount: Int = 0
         private set
@@ -50,7 +53,9 @@ class FeatureParallaxTracker(
     private val candCamY = FloatArray(maxCandidates)
     private val candCamZ = FloatArray(maxCandidates)
     private val candLastSeenNs = LongArray(maxCandidates)
+    private val candStableCount = IntArray(maxCandidates)
     private var candidateCount: Int = 0
+    private var smoothedJitterM: Float = 0f
 
     // Both maps below probe with `idx = (idx + 1) and mask`, which is only a valid wrap when the
     // table size is a power of two. A raw `count * 2` is not: for 20000 landmarks the mask 39999
@@ -85,6 +90,13 @@ class FeatureParallaxTracker(
         get() = verifiedLandmarkCount
 
     /**
+     * Returns true when visual feature points are solidly anchored in 3D space with low jitter.
+     * Returns false when points are wobbling (e.g. scanning a flat poster or low-parallax surface).
+     */
+    val isTrackingAnchored: Boolean
+        get() = smoothedJitterM < WOBBLE_THRESHOLD_M
+
+    /**
      * Integrates an ARCore PointCloud into the tracker.
      */
     fun update(
@@ -97,6 +109,9 @@ class FeatureParallaxTracker(
         timestampNs: Long,
     ) {
         val n = minOf(count, pointBuf.size / 4, idBuf.size)
+        var totalCandidateDisplacement = 0f
+        var trackedCandidateCount = 0
+
         for (i in 0 until n) {
             val px = pointBuf[i * 4]
             val py = pointBuf[i * 4 + 1]
@@ -112,6 +127,20 @@ class FeatureParallaxTracker(
             if (slot >= 0) {
                 // Existing candidate: update last seen
                 candLastSeenNs[slot] = timestampNs
+
+                val cdx = px - candX[slot]
+                val cdy = py - candY[slot]
+                val cdz = pz - candZ[slot]
+                val disp = sqrt(cdx * cdx + cdy * cdy + cdz * cdz)
+
+                totalCandidateDisplacement += disp
+                trackedCandidateCount++
+
+                if (disp < 0.04f) {
+                    candStableCount[slot]++
+                } else {
+                    candStableCount[slot] = 0
+                }
 
                 val dx = cameraX - px
                 val dy = cameraY - py
@@ -143,13 +172,33 @@ class FeatureParallaxTracker(
                         cameraX, cameraY, cameraZ, u2x, u2y, u2z
                     )
 
-                    val targetX = triangulated?.x ?: px
-                    val targetY = triangulated?.y ?: py
-                    val targetZ = triangulated?.z ?: pz
+                    // If ray triangulation failed (e.g. ill-conditioned rays, excessive residual):
+                    // DO NOT PROMOTE! Keep candidate and continue observing.
+                    if (triangulated == null) {
+                        candX[slot] = px
+                        candY[slot] = py
+                        candZ[slot] = pz
+                        continue
+                    }
+
+                    val targetX = triangulated.x
+                    val targetY = triangulated.y
+                    val targetZ = triangulated.z
+
+                    // Near plane safeguard (>= 0.3m); no arbitrary upper ceiling for large exterior spaces
+                    val dCamX = cameraX - targetX
+                    val dCamY = cameraY - targetY
+                    val dCamZ = cameraZ - targetZ
+                    val distFromCam = sqrt(dCamX * dCamX + dCamY * dCamY + dCamZ * dCamZ)
+                    val validDist = distFromCam >= 0.3f
+
+                    val normX = if (distFromCam > 1e-4f) dCamX / distFromCam else 0f
+                    val normY = if (distFromCam > 1e-4f) dCamY / distFromCam else 0f
+                    val normZ = if (distFromCam > 1e-4f) dCamZ / distFromCam else 1f
 
                     // Promote candidate to permanent verified landmark if space permits and spatially distinct
-                    if (canPromoteLandmark(targetX, targetY, targetZ)) {
-                        addPermanentLandmark(id, targetX, targetY, targetZ, timestampNs)
+                    if (isTrackingAnchored && validDist && canPromoteLandmark(targetX, targetY, targetZ)) {
+                        addPermanentLandmark(id, targetX, targetY, targetZ, normX, normY, normZ, timestampNs)
                     } else {
                         // Keep current estimate if close to other landmarks
                         candX[slot] = targetX
@@ -172,6 +221,7 @@ class FeatureParallaxTracker(
                 candCamX[newSlot] = cameraX
                 candCamY[newSlot] = cameraY
                 candCamZ[newSlot] = cameraZ
+                candStableCount[newSlot] = 0
 
                 val dx = cameraX - px; val dy = cameraY - py; val dz = cameraZ - pz
                 val dist = sqrt(dx * dx + dy * dy + dz * dz)
@@ -185,6 +235,11 @@ class FeatureParallaxTracker(
                 candLastSeenNs[newSlot] = timestampNs
                 candidateCount++
             }
+        }
+
+        if (trackedCandidateCount >= 4) {
+            val frameJitter = totalCandidateDisplacement / trackedCandidateCount
+            smoothedJitterM = smoothedJitterM * 0.75f + frameJitter * 0.25f
         }
 
         // Clean out unverified candidates that left the field of view
@@ -207,16 +262,50 @@ class FeatureParallaxTracker(
                 return false // Too close to an existing solid landmark
             }
         }
+
+        // Outlier prevention: reject points that lie far outside the established room cluster
+        if (verifiedLandmarkCount >= 10) {
+            var sumX = 0f; var sumZ = 0f
+            for (i in 0 until verifiedLandmarkCount) {
+                sumX += landmarkX[i]
+                sumZ += landmarkZ[i]
+            }
+            val cx = sumX / verifiedLandmarkCount
+            val cz = sumZ / verifiedLandmarkCount
+            var maxDistSq = 0f
+            for (i in 0 until verifiedLandmarkCount) {
+                val dx = landmarkX[i] - cx
+                val dz = landmarkZ[i] - cz
+                val d2 = dx * dx + dz * dz
+                if (d2 > maxDistSq) maxDistSq = d2
+            }
+            val clusterRadius = sqrt(maxDistSq)
+            val dFromCenter = sqrt((x - cx) * (x - cx) + (z - cz) * (z - cz))
+            // Dynamic adaptive cluster boundary (scales naturally with room or exterior size)
+            val maxAllowed = 2.5f * clusterRadius + 2.0f
+            if (dFromCenter > maxAllowed) {
+                return false // Outlier rejected
+            }
+        }
+
         return true
     }
 
-    private fun addPermanentLandmark(id: Int, x: Float, y: Float, z: Float, timestampNs: Long = 0L) {
+    private fun addPermanentLandmark(
+        id: Int,
+        x: Float, y: Float, z: Float,
+        normX: Float, normY: Float, normZ: Float,
+        timestampNs: Long = 0L,
+    ) {
         val slot = verifiedLandmarkCount
         if (slot >= maxLandmarks) return
         landmarkIds[slot] = id
         landmarkX[slot] = x
         landmarkY[slot] = y
         landmarkZ[slot] = z
+        landmarkNormX[slot] = normX
+        landmarkNormY[slot] = normY
+        landmarkNormZ[slot] = normZ
         landmarkPromoteTimeNs[slot] = timestampNs
         verifiedLandmarkCount++
 
@@ -295,7 +384,7 @@ class FeatureParallaxTracker(
         val t1 = (b * e - c * d) / denom
         val t2 = (a * e - b * d) / denom
 
-        if (t1 < 0.2f || t1 > 10.0f || t2 < 0.2f || t2 > 10.0f) return null
+        if (t1 < 0.2f || t1 > 35.0f || t2 < 0.2f || t2 > 35.0f) return null
 
         val pt1x = p1x + t1 * d1x; val pt1y = p1y + t1 * d1y; val pt1z = p1z + t1 * d1z
         val pt2x = p2x + t2 * d2x; val pt2y = p2y + t2 * d2y; val pt2z = p2z + t2 * d2z
@@ -355,6 +444,7 @@ class FeatureParallaxTracker(
         candCamY[to] = candCamY[from]
         candCamZ[to] = candCamZ[from]
         candLastSeenNs[to] = candLastSeenNs[from]
+        candStableCount[to] = candStableCount[from]
     }
 
     private fun rebuildCandHashMap() {
@@ -377,7 +467,14 @@ class FeatureParallaxTracker(
      * 1. First exports all permanent solid Emerald Green landmarks (permanent history).
      * 2. Then exports currently visible Amber candidate points.
      */
-    fun exportPointVertices(out: FloatArray, nowNs: Long = 0L): Int {
+    fun exportPointVertices(
+        out: FloatArray,
+        nowNs: Long = 0L,
+        camX: Float = 0f,
+        camY: Float = 0f,
+        camZ: Float = 0f,
+        enableNormalCulling: Boolean = false,
+    ): Int {
         var count = 0
         val maxVerts = out.size / 4
 
@@ -386,6 +483,17 @@ class FeatureParallaxTracker(
         val sparkleDurationNs = 1_200_000_000L
         for (i in 0 until verifiedLandmarkCount) {
             if (count >= maxVerts) break
+
+            // Observation ray / normal culling for object-centric / exterior scanning:
+            // Culls points facing away from camera (opposite wall / back of house)
+            if (enableNormalCulling) {
+                val vx = camX - landmarkX[i]
+                val vy = camY - landmarkY[i]
+                val vz = camZ - landmarkZ[i]
+                val dot = vx * landmarkNormX[i] + vy * landmarkNormY[i] + vz * landmarkNormZ[i]
+                if (dot < -0.05f) continue
+            }
+
             out[count * 4] = landmarkX[i]
             out[count * 4 + 1] = landmarkY[i]
             out[count * 4 + 2] = landmarkZ[i]
@@ -402,6 +510,8 @@ class FeatureParallaxTracker(
         // 2. Currently Visible Candidates (Amber = 0.0f)
         for (i in 0 until candidateCount) {
             if (count >= maxVerts) break
+            val id = candIds[i]
+            if (isLandmark(id)) continue
             out[count * 4] = candX[i]
             out[count * 4 + 1] = candY[i]
             out[count * 4 + 2] = candZ[i]
@@ -424,6 +534,11 @@ class FeatureParallaxTracker(
             landmarkX[i] = out[0]
             landmarkY[i] = out[1]
             landmarkZ[i] = out[2]
+
+            transform.rotateVector(landmarkNormX[i], landmarkNormY[i], landmarkNormZ[i], out)
+            landmarkNormX[i] = out[0]
+            landmarkNormY[i] = out[1]
+            landmarkNormZ[i] = out[2]
         }
     }
 
@@ -441,6 +556,8 @@ class FeatureParallaxTracker(
         candHashKeys.fill(EMPTY_KEY)
         candHashSlots.fill(-1)
         landmarkHashKeys.fill(EMPTY_KEY)
+        candStableCount.fill(0)
+        smoothedJitterM = 0f
     }
 
     private fun findCandSlot(id: Int): Int {
@@ -477,12 +594,14 @@ class FeatureParallaxTracker(
         /** Minimum spatial distance between solid permanent landmarks (0.12 m). */
         const val MIN_LANDMARK_SPACING_M = 0.06f
         /** Minimum viewing angle baseline to trigger ray triangulation (projet.md §2.3). */
-        const val MIN_PARALLAX_DEG = 12.0f
+        const val MIN_PARALLAX_DEG = 8.0f
         /** Minimum physical camera translation baseline. */
         const val MIN_TRANSLATION_M = 0.20f
-        /** Max geometric distance between two rays at closest approach. */
-        const val MAX_RESIDUAL_M = 0.25f
+        /** Max geometric distance between two rays at closest approach (tightened to 9cm). */
+        const val MAX_RESIDUAL_M = 0.09f
         /** Eviction threshold for unverified candidate points when out of frame (1.2 seconds). */
         const val CANDIDATE_STALE_TIMEOUT_NS = 1_200_000_000L
+        /** Maximum candidate frame-to-frame jitter threshold to be considered solidly anchored. */
+        const val WOBBLE_THRESHOLD_M = 0.035f
     }
 }

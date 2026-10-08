@@ -8,6 +8,7 @@ dense surface normal estimation from metric depth gradients.
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence, Union
 
@@ -453,54 +454,60 @@ class DepthPriorEstimator:
         raw_chunk_depths: list[list[np.ndarray]] = []
         raw_chunk_confs: list[list[Optional[np.ndarray]]] = []
 
-        for c_idx, (w_start, w_end) in enumerate(windows):
-            chunk_cache_file = cache_path / f"chunk_{seq_hash}_{c_idx:03d}_{w_start:04d}_{w_end:04d}.npz" if cache_path else None
-            
-            loaded = False
-            if chunk_cache_file and chunk_cache_file.is_file():
-                try:
-                    data = np.load(chunk_cache_file)
-                    d_list = [data[f"depth_{i}"] for i in range(w_end - w_start)]
-                    c_list = [data[f"conf_{i}"] if f"conf_{i}" in data else None for i in range(w_end - w_start)]
+        with ThreadPoolExecutor(max_workers=2) as io_pool:
+            for c_idx, (w_start, w_end) in enumerate(windows):
+                chunk_cache_file = cache_path / f"chunk_{seq_hash}_{c_idx:03d}_{w_start:04d}_{w_end:04d}.npz" if cache_path else None
+                
+                # Asynchronously prefetch next window's images into memory to eliminate GPU idle time
+                if c_idx + 1 < num_chunks and hasattr(images, "prefetch"):
+                    next_start, next_end = windows[c_idx + 1]
+                    io_pool.submit(images.prefetch, range(next_start, next_end))
+
+                loaded = False
+                if chunk_cache_file and chunk_cache_file.is_file():
+                    try:
+                        data = np.load(chunk_cache_file)
+                        d_list = [data[f"depth_{i}"] for i in range(w_end - w_start)]
+                        c_list = [data[f"conf_{i}"] if f"conf_{i}" in data else None for i in range(w_end - w_start)]
+                        raw_chunk_depths.append(d_list)
+                        raw_chunk_confs.append(c_list)
+                        loaded = True
+                        print(f"[SlidingWindow] Loaded chunk {c_idx + 1}/{num_chunks} [{w_start}:{w_end}] from cache.")
+                    except Exception as e:
+                        print(f"[SlidingWindow] Cache read failed for chunk {c_idx}: {e}. Recomputing.")
+                        loaded = False
+
+                if not loaded:
+                    chunk_imgs = [images[idx] for idx in range(w_start, w_end)]
+                    chunk_exts = extrinsics[w_start:w_end] if extrinsics is not None else None
+                    chunk_ixts = intrinsics[w_start:w_end] if intrinsics is not None else None
+
+                    t0 = time.time()
+                    d_list, c_list = self.estimate_depth_sequence(
+                        chunk_imgs, extrinsics=chunk_exts, intrinsics=chunk_ixts
+                    )
+                    dt = time.time() - t0
+                    print(f"[SlidingWindow] Computed chunk {c_idx + 1}/{num_chunks} [{w_start}:{w_end}] in {dt:.1f}s")
+
                     raw_chunk_depths.append(d_list)
-                    raw_chunk_confs.append(c_list)
-                    loaded = True
-                    print(f"[SlidingWindow] Loaded chunk {c_idx + 1}/{num_chunks} [{w_start}:{w_end}] from cache.")
-                except Exception as e:
-                    print(f"[SlidingWindow] Cache read failed for chunk {c_idx}: {e}. Recomputing.")
-                    loaded = False
+                    raw_chunk_confs.append(c_list if c_list else [None] * len(d_list))
 
-            if not loaded:
-                chunk_imgs = [images[idx] for idx in range(w_start, w_end)]
-                chunk_exts = extrinsics[w_start:w_end] if extrinsics is not None else None
-                chunk_ixts = intrinsics[w_start:w_end] if intrinsics is not None else None
+                    if chunk_cache_file:
+                        save_dict = {f"depth_{i}": d_list[i] for i in range(len(d_list))}
+                        if c_list:
+                            for i in range(len(c_list)):
+                                if c_list[i] is not None:
+                                    save_dict[f"conf_{i}"] = c_list[i]
+                        io_pool.submit(np.savez, chunk_cache_file, **save_dict)
 
-                t0 = time.time()
-                d_list, c_list = self.estimate_depth_sequence(
-                    chunk_imgs, extrinsics=chunk_exts, intrinsics=chunk_ixts
-                )
-                dt = time.time() - t0
-                print(f"[SlidingWindow] Computed chunk {c_idx + 1}/{num_chunks} [{w_start}:{w_end}] in {dt:.1f}s")
+                    # Periodic GPU memory cleanup
+                    if (c_idx + 1) % 25 == 0:
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
 
-                raw_chunk_depths.append(d_list)
-                raw_chunk_confs.append(c_list if c_list else [None] * len(d_list))
-
-                if chunk_cache_file:
-                    save_dict = {f"depth_{i}": d_list[i] for i in range(len(d_list))}
-                    if c_list:
-                        for i in range(len(c_list)):
-                            if c_list[i] is not None:
-                                save_dict[f"conf_{i}"] = c_list[i]
-                    np.savez(chunk_cache_file, **save_dict)
-
-                # Periodic GPU memory cleanup
-                if (c_idx + 1) % 25 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-            if progress_callback:
-                progress_callback(c_idx + 1, num_chunks)
+                if progress_callback:
+                    progress_callback(c_idx + 1, num_chunks)
 
         # 3. Bring every window onto a common metric scale before ensembling.
         # DA3's align_to_input_ext_scale is not enough on its own: windows disagree by up to
@@ -791,10 +798,10 @@ def cross_view_scale_outliers(
         pc = np.stack([(ug[ok] - cx) * z[ok] / fx, (vg[ok] - cy) * z[ok] / fy, z[ok]], -1)
         world.append(pc @ c2w[i][:3, :3].T + c2w[i][:3, 3])
 
-    ratios: dict[str, float] = {}
-    for i, pts in enumerate(world):
+    def _eval_frame(i: int) -> tuple[str, float] | None:
+        pts = world[i]
         if len(pts) < min_pixels:
-            continue
+            return None
         dist = np.linalg.norm(centres - centres[i], axis=1)
         cos_sim = optical_axes @ optical_axes[i]
         per_pair = []
@@ -834,7 +841,16 @@ def cross_view_scale_outliers(
             wt = np.array([x[1] for x in per_pair], dtype=np.float64)
             o = np.argsort(rr)
             cw = np.cumsum(wt[o])
-            ratios[str(names[i])] = float(rr[o][np.searchsorted(cw, cw[-1] / 2)])
+            return str(names[i]), float(rr[o][np.searchsorted(cw, cw[-1] / 2)])
+        return None
+
+    ratios: dict[str, float] = {}
+    max_workers = min(16, max(1, os.cpu_count() or 4))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for res in executor.map(_eval_frame, range(len(world))):
+            if res is not None:
+                name, val = res
+                ratios[name] = val
 
     outliers = [n for n, r in ratios.items() if abs(r - 1.0) > tol]
     return ratios, sorted(outliers)

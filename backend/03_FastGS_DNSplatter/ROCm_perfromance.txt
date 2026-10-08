@@ -1,0 +1,28 @@
+# Historical FastGS benchmark; train.py and its Inria-derived kernels were removed. These timings do not describe the gsplat replacement.
+
+source .venv-rocm/bin/activate
+
+python train.py \
+    -s current_scene \
+    -m output/current_scene_rocm_30k \
+    --iterations 30000 \
+    --eval \
+    --data_device cuda
+
+Scene:               current_scene
+GPU:                 RX 9060 XT / gfx1200
+Backend:             ROCm 7.1.1
+Torch:               2.9.1 ROCm
+Resolution:          1080×1920
+Images:              317
+
+Iterations:          30,000
+Training time:       ?
+Average iter/s:       ?
+Peak VRAM:            ?
+Initial Gaussians:   365,660
+Final Gaussians:      ?
+Final training loss: ?
+PSNR:                 ?
+SSIM:                 ?
+LPIPS:                ?

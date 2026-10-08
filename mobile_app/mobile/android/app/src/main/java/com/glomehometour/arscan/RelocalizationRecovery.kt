@@ -29,6 +29,12 @@ object RelocalizationRecovery {
             out[outOffset + 2] = r20 * x + r21 * y + r22 * z + tz
         }
 
+        fun rotateVector(vx: Float, vy: Float, vz: Float, out: FloatArray, outOffset: Int = 0) {
+            out[outOffset] = r00 * vx + r01 * vy + r02 * vz
+            out[outOffset + 1] = r10 * vx + r11 * vy + r12 * vz
+            out[outOffset + 2] = r20 * vx + r21 * vy + r22 * vz
+        }
+
         val isSignificant: Boolean
             get() = (tx * tx + ty * ty + tz * tz) > 0.0036f || abs(r00 - 1f) > 0.03f || abs(r22 - 1f) > 0.03f
     }

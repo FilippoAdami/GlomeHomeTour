@@ -144,15 +144,15 @@ def render_topdown(sparse_dir: Path, up_axis: int = 1, transforms_path: Path | N
     points = cloud.points[np.all((cloud.points >= lo) & (cloud.points <= hi), axis=1)]
 
     north_deg = estimate_north_heading_deg(sparse_dir, transforms_path)
+    align_deg = horizontal_align_deg(points, up_axis)
+
     if north_deg is not None:
-        align_deg = float((90.0 - north_deg) % 360.0)
         raw_title = f"raw (world X, -Z; North {north_deg:.1f}°)"
-        aligned_title = f"compass-aligned (+X=North, {align_deg:.1f}° about Y)"
+        aligned_title = f"wall-aligned ({align_deg:.1f}° about Y)"
         raw_heading = north_deg
-        aligned_heading = 90.0  # +X is 90 deg clockwise from top
+        aligned_heading = float((north_deg + align_deg) % 360.0)
         is_magnetic = True
     else:
-        align_deg = horizontal_align_deg(points, up_axis)
         raw_title = "raw (world X, -Z)"
         aligned_title = f"wall-aligned ({align_deg:.1f} deg about Y)"
         raw_heading = float((90.0 - align_deg) % 360.0)

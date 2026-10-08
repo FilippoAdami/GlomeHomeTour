@@ -8,7 +8,9 @@ frames, 2D scales, degree-0 Spherical Harmonics, and opacities.
 from __future__ import annotations
 
 import math
+import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Union
@@ -912,6 +914,9 @@ def global_cross_view_freespace_carving(
         proj_z = -pts_cam[:, 2]
         in_front = proj_z > 0.2
 
+        u = (fx * (pts_cam[:, 0] / np.maximum(proj_z, 1e-4)) + cx).astype(np.int32)
+        v = (-fy * (pts_cam[:, 1] / np.maximum(proj_z, 1e-4)) + cy).astype(np.int32)
+
         valid_uv = in_front & (u >= 4) & (u < dw - 4) & (v >= 4) & (v < dh - 4)
         if not np.any(valid_uv):
             continue
@@ -1204,7 +1209,9 @@ class SurfelCloudInitializer:
                 return normal_maps[k_idx]
             return compute_surface_normals(depth_maps[k_idx], intrinsics)
 
-        for idx, (kf, depth) in enumerate(zip(keyframes, depth_maps)):
+        def _process_frame(idx: int):
+            kf = keyframes[idx]
+            depth = depth_maps[idx]
             h, w = depth.shape[:2]
             normals_cam = get_normals_cam(idx)
 
@@ -1232,14 +1239,14 @@ class SurfelCloudInitializer:
             valid_mask = (d_sampled > 0.2) & (d_sampled <= depth_ceiling)
 
             # 1. Depth Discontinuity / Edge Gradient Filter (eliminates flying boundary pixels)
-            if self.max_depth_gradient > 0:
+            if self.max_depth_gradient > 0 and np.any(valid_mask):
                 gx = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3) / np.maximum(depth, 1e-3)
                 gy = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3) / np.maximum(depth, 1e-3)
                 grad_sampled = np.sqrt(gx**2 + gy**2)[y_flat, x_flat]
                 valid_mask = valid_mask & (grad_sampled <= self.max_depth_gradient)
 
             # 2. Saturated Pixel Masking (eliminates optical bloom / light-source artifacts)
-            if self.enable_saturation_mask:
+            if self.enable_saturation_mask and np.any(valid_mask):
                 sat_mask = compute_overexposed_mask(
                     img_rgb,
                     min_threshold=self.saturation_min_threshold,
@@ -1258,7 +1265,7 @@ class SurfelCloudInitializer:
                 valid_mask = valid_mask & (c_sampled >= min_conf)
 
             if np.sum(valid_mask) < 10:
-                continue
+                return None
 
             y_valid = y_flat[valid_mask]
             x_valid = x_flat[valid_mask]
@@ -1279,7 +1286,7 @@ class SurfelCloudInitializer:
                 cos_grazing = np.sum(-n_cam * ray_dir, axis=-1)  # n_cam points toward camera (+Z)
                 grazing_mask = cos_grazing >= cos_min
                 if np.sum(grazing_mask) < 5:
-                    continue
+                    return None
                 pts_cam = pts_cam[grazing_mask]
                 n_cam = n_cam[grazing_mask]
                 y_valid = y_valid[grazing_mask]
@@ -1319,7 +1326,7 @@ class SurfelCloudInitializer:
                     max_depth_ceiling=depth_ceiling,
                 )
                 if np.sum(mv_mask) < 5:
-                    continue
+                    return None
                 pts_world = pts_world[mv_mask]
                 n_world = n_world[mv_mask]
                 c_rgb = c_rgb[mv_mask]
@@ -1338,13 +1345,19 @@ class SurfelCloudInitializer:
                     blend_weight=self.normal_consensus_weight,
                 )
 
-            all_positions.append(pts_world)
-            all_normals.append(n_world)
-            all_colors.append(c_rgb)
-            all_rel_scales.append(scales_valid)
+            return pts_world, n_world, c_rgb, scales_valid
 
-            if (idx + 1) % 50 == 0 or (idx + 1) == len(keyframes):
-                print(f"[SurfelInit] Processed {idx + 1}/{len(keyframes)} keyframes ({sum(len(p) for p in all_positions):,} raw points)...", flush=True)
+        max_workers = min(16, max(1, os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for idx, res in enumerate(executor.map(_process_frame, range(num_frames))):
+                if res is not None:
+                    pts_w, n_w, col, sc = res
+                    all_positions.append(pts_w)
+                    all_normals.append(n_w)
+                    all_colors.append(col)
+                    all_rel_scales.append(sc)
+                if (idx + 1) % 50 == 0 or (idx + 1) == num_frames:
+                    print(f"[SurfelInit] Processed {idx + 1}/{num_frames} keyframes ({sum(len(p) for p in all_positions):,} raw points)...", flush=True)
 
         if not all_positions:
             raise RuntimeError("Failed to unproject any valid surfel points from keyframes")

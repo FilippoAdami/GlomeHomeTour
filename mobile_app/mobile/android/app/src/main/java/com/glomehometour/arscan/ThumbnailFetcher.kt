@@ -43,15 +43,27 @@ object ThumbnailFetcher {
         }
     }
 
-    private fun firstFrame(stream: InputStream): Bitmap? = ZipInputStream(stream).use { zis ->
-        var entry = zis.nextEntry
-        while (entry != null) {
-            if (!entry.isDirectory && entry.name.startsWith("images/") && entry.name.endsWith(".jpg")) {
-                val options = BitmapFactory.Options().apply { inSampleSize = 8 }
-                return@use BitmapFactory.decodeStream(zis, null, options)
+    private fun firstFrame(stream: InputStream): Bitmap? {
+        val bytes = stream.readBytes()
+        try {
+            ZipInputStream(bytes.inputStream()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory && entry.name.startsWith("images/") && entry.name.endsWith(".jpg")) {
+                        val options = BitmapFactory.Options().apply { inSampleSize = 8 }
+                        return BitmapFactory.decodeStream(zis, null, options)
+                    }
+                    entry = zis.nextEntry
+                }
             }
-            entry = zis.nextEntry
+        } catch (e: Exception) {
+            // Not a zip
         }
-        null
+        return try {
+            val options = BitmapFactory.Options().apply { inSampleSize = 8 }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+        } catch (e: Exception) {
+            null
+        }
     }
 }

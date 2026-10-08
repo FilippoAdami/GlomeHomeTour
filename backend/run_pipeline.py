@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The one entry point: a compressed capture in, a trained 2DGS scene out.
+"""The one entry point: a compressed capture in, a trained FastGS scene and mesh out.
 
-    .venv/bin/python run_pipeline.py scenes/Bedroom2.zip
+    .venv/bin/python run_pipeline.py scenes/Bedroom3.zip
 
 Every step is also a standalone script; this only sequences them and summarises.
 Steps run **in-process** (imported and called), so a failure raises here with a
@@ -41,19 +41,20 @@ bootstrap()
 from Utilities.pipeline_step import read_pipeline_stats
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
-DEFAULT_SCENE_NAME = "Beedroom3"
+DEFAULT_SCENE_NAME = "Bedroom3"
 DEFAULT_SOURCE = f"scenes/{DEFAULT_SCENE_NAME}.zip"
-if not Path(DEFAULT_SOURCE).exists() and Path("scenes/Bedroom3.zip").exists():
-    DEFAULT_SOURCE = "scenes/Bedroom3.zip"
+if not Path(DEFAULT_SOURCE).exists() and Path("scenes/Bedroom2.zip").exists():
+    DEFAULT_SOURCE = "scenes/Bedroom2.zip"
 
 # (state name, module path) in execution order.
 STEPS: tuple[tuple[str, str], ...] = (
     ("extract", "Utilities/step_extract.py"),
-    ("filter_quality", "00_ingestion/step_filter_quality.py"),
-    ("rotate_upright", "00_ingestion/step_rotate_upright.py"),
     ("colmap", "01_poses_refinment/step_colmap.py"),
     ("depth", "02_depth_estimation/step_depth.py"),
-    ("train", "03_2DGS_training/step_train.py"),
+    ("train", "03_FastGS_DNSplatter/step_train.py"),
+    ("mesh", "04_3DGS_to_mesh/step_mesh.py"),
+    ("floorplan", "05_floor_plan/step_floorplan.py"),
+    ("segmentation", "06_semantic_segmentation/step_segmentation.py"),
 )
 STEP_NAMES = [name for name, _ in STEPS]
 

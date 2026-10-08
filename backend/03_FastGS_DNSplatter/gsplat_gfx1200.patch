@@ -1,0 +1,1093 @@
+diff --git a/gsplat/cuda/_wrapper.py b/gsplat/cuda/_wrapper.py
+index 286685f..20f909a 100644
+--- a/gsplat/cuda/_wrapper.py
++++ b/gsplat/cuda/_wrapper.py
+@@ -579,7 +579,7 @@ def rasterize_to_pixels(
+         - **Rendered alphas**. [..., image_height, image_width, 1]
+     """
+ 
+-    image_dims = means2d.shape[:-2]
++    image_dims = isect_offsets.shape[:-2] if packed else means2d.shape[:-2]
+     channels = colors.shape[-1]
+     device = means2d.device
+     if packed:
+@@ -668,6 +668,7 @@ def rasterize_to_pixels(
+         isect_offsets.contiguous(),
+         flatten_ids.contiguous(),
+         absgrad,
++        torch.is_grad_enabled(),
+     )
+ 
+     if padded_channels > 0:
+@@ -1266,23 +1267,46 @@ class _RasterizeToPixels(torch.autograd.Function):
+         isect_offsets: Tensor,  # [..., tile_height, tile_width]
+         flatten_ids: Tensor,  # [n_isects]
+         absgrad: bool,
++        enable_checkpoint: bool,
+     ) -> Tuple[Tensor, Tensor]:
+-        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
+-            "rasterize_to_pixels_3dgs_fwd"
+-        )(
+-            means2d,
+-            conics,
+-            colors,
+-            opacities,
+-            backgrounds,
+-            masks,
+-            width,
+-            height,
+-            tile_size,
+-            isect_offsets,
+-            flatten_ids,
+-        )
+-
++        ctx.checkpoint_path = (enable_checkpoint and any(ctx.needs_input_grad[:5])
++            and torch.version.hip is not None and tile_size == 16 and colors.shape[-1] in (3, 4)
++            and all(t.dtype == torch.float32 for t in (means2d, conics, colors, opacities))
++            and isect_offsets.ndim == 3
++            and torch.cuda.get_device_properties(means2d.device).gcnArchName.split(":")[0] == "gfx1200")
++        ctx.checkpoint_rgb = ctx.checkpoint_path and colors.shape[-1] == 3
++        checkpoint_colors, checkpoint_backgrounds = colors, backgrounds
++        if ctx.checkpoint_rgb:
++            checkpoint_colors = torch.cat((colors, torch.zeros_like(colors[..., :1])), dim=-1)
++            if backgrounds is not None:
++                checkpoint_backgrounds = torch.cat((backgrounds, torch.zeros_like(backgrounds[..., :1])), dim=-1)
++        extra = ()
++        if ctx.checkpoint_path:
++            render_colors, render_alphas, last_ids, cp, bounds, bucket_offsets, bucket_tiles, sentinel = _make_lazy_cuda_func("rasterize_checkpoint_3dgs_fwd")(
++                means2d, conics, checkpoint_colors, opacities, checkpoint_backgrounds, masks,
++                width, height, tile_size, isect_offsets, flatten_ids)
++            ctx.checkpoint_path = cp.numel() > 0
++            if ctx.checkpoint_path:
++                extra = (render_colors, cp, bounds, bucket_offsets, bucket_tiles, sentinel)
++        else:
++            render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
++                "rasterize_to_pixels_3dgs_fwd"
++            )(
++                means2d,
++                conics,
++                colors,
++                opacities,
++                backgrounds,
++                masks,
++                width,
++                height,
++                tile_size,
++                isect_offsets,
++                flatten_ids,
++            )
++        if ctx.checkpoint_rgb:
++            colors = checkpoint_colors
++            backgrounds = checkpoint_backgrounds
+         ctx.save_for_backward(
+             means2d,
+             conics,
+@@ -1294,6 +1318,7 @@ class _RasterizeToPixels(torch.autograd.Function):
+             flatten_ids,
+             render_alphas,
+             last_ids,
++            *extra,
+         )
+         ctx.width = width
+         ctx.height = height
+@@ -1302,7 +1327,7 @@ class _RasterizeToPixels(torch.autograd.Function):
+ 
+         # double to float
+         render_alphas = render_alphas.float()
+-        return render_colors, render_alphas
++        return render_colors[..., :3] if ctx.checkpoint_rgb else render_colors, render_alphas
+ 
+     @staticmethod
+     def backward(
+@@ -1321,37 +1346,48 @@ class _RasterizeToPixels(torch.autograd.Function):
+             flatten_ids,
+             render_alphas,
+             last_ids,
+-        ) = ctx.saved_tensors
++        ) = ctx.saved_tensors[:10]
+         width = ctx.width
+         height = ctx.height
+         tile_size = ctx.tile_size
+         absgrad = ctx.absgrad
+ 
+-        (
+-            v_means2d_abs,
+-            v_means2d,
+-            v_conics,
+-            v_colors,
+-            v_opacities,
+-        ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_bwd")(
+-            means2d,
+-            conics,
+-            colors,
+-            opacities,
+-            backgrounds,
+-            masks,
+-            width,
+-            height,
+-            tile_size,
+-            isect_offsets,
+-            flatten_ids,
+-            render_alphas,
+-            last_ids,
+-            v_render_colors.contiguous(),
+-            v_render_alphas.contiguous(),
+-            absgrad,
+-        )
+-
++        if ctx.checkpoint_rgb:
++            v_render_colors = torch.cat(
++                (v_render_colors, torch.zeros_like(v_render_colors[..., :1])), dim=-1
++            )
++        if ctx.checkpoint_path:
++            rendered, cp, bounds, bucket_offsets, bucket_tiles, sentinel = ctx.saved_tensors[10:]
++            v_means2d_abs, v_means2d, v_conics, v_colors, v_opacities = _make_lazy_cuda_func("rasterize_checkpoint_3dgs_bwd")(
++                means2d, conics, colors, opacities, masks, width, height, tile_size,
++                sentinel, flatten_ids, bucket_offsets, bucket_tiles, rendered,
++                render_alphas, last_ids, cp, bounds,
++                v_render_colors.contiguous(), v_render_alphas.contiguous(), absgrad)
++        else:
++            (
++                v_means2d_abs,
++                v_means2d,
++                v_conics,
++                v_colors,
++                v_opacities,
++            ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_bwd")(
++                means2d,
++                conics,
++                colors,
++                opacities,
++                backgrounds,
++                masks,
++                width,
++                height,
++                tile_size,
++                isect_offsets,
++                flatten_ids,
++                render_alphas,
++                last_ids,
++                v_render_colors.contiguous(),
++                v_render_alphas.contiguous(),
++                absgrad,
++            )
+         if absgrad:
+             means2d.absgrad = v_means2d_abs
+ 
+@@ -1362,6 +1398,11 @@ class _RasterizeToPixels(torch.autograd.Function):
+         else:
+             v_backgrounds = None
+ 
++        if ctx.checkpoint_rgb:
++            v_colors = v_colors[..., :3]
++            if v_backgrounds is not None:
++                v_backgrounds = v_backgrounds[..., :3]
++
+         return (
+             v_means2d,
+             v_conics,
+@@ -1375,6 +1416,7 @@ class _RasterizeToPixels(torch.autograd.Function):
+             None,
+             None,
+             None,
++            None,
+         )
+ 
+ 
+diff --git a/gsplat/cuda/csrc/RasterizeCheckpointGfx1200.cu b/gsplat/cuda/csrc/RasterizeCheckpointGfx1200.cu
+new file mode 100644
+index 0000000..5940325
+--- /dev/null
++++ b/gsplat/cuda/csrc/RasterizeCheckpointGfx1200.cu
+@@ -0,0 +1,366 @@
++// Independent gfx1200 checkpoint rasterization for GlomeHomeTour.
++// SPDX-License-Identifier: Apache-2.0
++#if USE_ROCM
++#include <ATen/ATen.h>
++#include <c10/core/DeviceGuard.h>
++#include <c10/hip/HIPStream.h>
++#include <c10/hip/HIPException.h>
++#include <hip/hip_runtime.h>
++#include <tuple>
++#include <limits>
++#include "Ops.h"
++namespace gsplat {
++static_assert(sizeof(float2)==8 && sizeof(float3)==12 && sizeof(float4)==16);
++
++// Determine the furthest accepted Gaussian in each tile after a cheap prepass.
++__global__ void checkpoint_tile_bounds(const int* last,int width,int height,int tw,int th,int* bounds) {
++ int t=threadIdx.x,tile=blockIdx.x,image=tile/(tw*th),tid=tile%(tw*th);
++ int y=tid/tw*16+t/16,x=tid%tw*16+t%16;
++ int value=(y<height && x<width) ? last[image*width*height+y*width+x] : 0;
++ for(int d=16;d;d/=2) value=max(value,__shfl_xor(value,d,32));
++ __shared__ int waves[8];
++ if(t%32==0) waves[t/32]=value;
++ __syncthreads();
++ if(t==0) {value=0;for(int w=0;w<8;++w) value=max(value,waves[w]);bounds[tile]=value;}
++}
++
++template<int TILE>
++__global__ void checkpoint_forward(const float2* means,const float3* conics,const float4* colors,const float* opacity,
++ const float4* bg,const bool* mask,int width,int height,int ignored_tile,int tw,int th,int total,int nids,
++ const int* offsets,const int* ids,const int* bucket_offsets,float* checkpoints,
++ float4* output,float* alpha,int* last,int* bounds,const int* reached) {
++ int t=threadIdx.x,area=TILE*TILE,global_tile=blockIdx.x,image=global_tile/(tw*th),tid=global_tile%(tw*th);
++ int row=tid/tw*TILE+t/TILE,col=tid%tw*TILE+t%TILE;
++ bool inside=row<height && col<width,done=!inside || (mask && !mask[global_tile]);
++ int pixel=image*width*height+row*width+col;
++ int begin=offsets[global_tile],end=global_tile+1<total ? offsets[global_tile+1] : nids;
++ if(reached) end=min(end,reached[global_tile]+1);
++ __shared__ float4 positions[TILE*TILE],features[TILE*TILE];
++ __shared__ float3 shapes[TILE*TILE];
++ __shared__ int wave_bounds[32];
++ float T=1;float4 prefix=make_float4(0,0,0,0);int cur=0;
++ for(int b=begin;b<end;b+=area) {
++  if(__syncthreads_count(done)==area) break;
++  int index=b+t;
++  if(index<end) {int g=ids[index];float2 m=means[g];positions[t]=make_float4(m.x,m.y,opacity[g],0);shapes[t]=conics[g];features[t]=colors[g];}
++  __syncthreads();
++  int count=min(area,end-b);
++  for(int j=0;j<count;++j) {
++   int index=b+j;
++   if((index-begin)%32==0) {
++    int checkpoint=bucket_offsets[global_tile]+(index-begin)/32;
++    float* dst=checkpoints+(int64_t(checkpoint)*area+t)*5;
++    dst[0]=done ? 0 : T;dst[1]=prefix.x;dst[2]=prefix.y;dst[3]=prefix.z;dst[4]=prefix.w;
++   }
++   if(done) continue;
++   float4 pos=positions[j];float3 q=shapes[j];
++   float dx=pos.x-(col+.5f),dy=pos.y-(row+.5f);
++   float sigma=.5f*(q.x*dx*dx+q.z*dy*dy)+q.y*dx*dy;
++   float a=fminf(.999f,pos.z*__expf(-sigma));
++   if(sigma<0 || a<1.f/255.f) continue;
++   float next=T*(1-a);
++   if(next<=1e-4f) {done=true;continue;}
++   float weight=a*T;float4 c=features[j];
++   prefix.x+=c.x*weight;prefix.y+=c.y*weight;prefix.z+=c.z*weight;prefix.w+=c.w*weight;
++   T=next;cur=index;
++  }
++  __syncthreads();
++ }
++ if(inside) {
++  alpha[pixel]=mask && !mask[global_tile] ? 0 : 1-T;last[pixel]=cur;
++  float4 c=bg ? bg[image] : make_float4(0,0,0,0);
++  output[pixel]=make_float4(prefix.x+T*c.x,prefix.y+T*c.y,prefix.z+T*c.z,prefix.w+T*c.w);
++ }
++ int bound=inside ? cur : 0;
++ for(int delta=16;delta;delta/=2) bound=max(bound,__shfl_xor(bound,delta,32));
++ if(t%32==0) wave_bounds[t/32]=bound;
++ __syncthreads();
++ if(t==0) {bound=0;for(int w=0;w<(area+31)/32;++w) bound=max(bound,wave_bounds[w]);bounds[global_tile]=bound;}
++}
++
++template<int TILE>
++__global__ void bucket_backward(const float2* means,const float3* conics,const float4* colors,const float* opacity,
++ const bool* mask,int width,int height,int ignored_tile,int tw,int th,int buckets,int nids,
++ const int* offsets,const int* ids,const int* bucket_offsets,const int* bucket_tiles,
++ const float* checkpoints,const int* bounds,const float4* rendered,const float* alphas,const int* last,
++ const float4* vc,const float* va,float2* vm,float3* vq,float4* vcol,float* vo,float2* ab) {
++ int lane=threadIdx.x%32,bucket=blockIdx.x*4+threadIdx.x/32;
++ if(bucket>=buckets) return;
++ int global_tile=bucket_tiles[bucket];
++ if(mask && !mask[global_tile]) return;
++ int begin=offsets[global_tile]+32*(bucket-bucket_offsets[global_tile]);
++ if(begin>bounds[global_tile]) return;
++ int tiles=tw*th,image=global_tile/tiles,tid=global_tile%tiles;
++ int end=offsets[global_tile+1]; // Sentinel nids follows the flattened offsets.
++ int index=begin+lane;bool gaussian_valid=index<end;
++ int g=gaussian_valid ? ids[index] : 0;
++ float2 m=gaussian_valid ? means[g] : make_float2(0,0);
++ float3 q=gaussian_valid ? conics[g] : make_float3(0,0,0);
++ float4 c=gaussian_valid ? colors[g] : make_float4(0,0,0,0);
++ float op=gaussian_valid ? opacity[g] : 0;
++ float2 gm=make_float2(0,0),ga=make_float2(0,0);float3 gq=make_float3(0,0,0);
++ float4 gc=make_float4(0,0,0,0);float go=0;
++ float T=0;float4 prefix=make_float4(0,0,0,0);int area=TILE*TILE;
++ for(int k=0;k<area+31;++k) {
++  int p=k-lane;
++  int row=tid/tw*TILE+p/TILE,col=tid%tw*TILE+p%TILE;
++  bool inside=p>=0 && p<area && row<height && col<width;
++  if(lane==0 && k<area) {
++   const float* cp=checkpoints+(int64_t(bucket)*area+k)*5;
++   T=cp[0];prefix=make_float4(cp[1],cp[2],cp[3],cp[4]);
++  }
++  if(inside && gaussian_valid && T>0) {
++   int pixel=image*width*height+row*width+col;
++   if(index<=last[pixel]) {
++    float dx=m.x-(col+.5f),dy=m.y-(row+.5f);
++    float sigma=.5f*(q.x*dx*dx+q.z*dy*dy)+q.y*dx*dy;
++    float vis=__expf(-sigma),a=fminf(.999f,op*vis);
++    if(sigma>=0 && a>=1.f/255.f) {
++     float weight=a*T;float4 grad=vc[pixel],final=rendered[pixel];float ra=1.f/(1-a);
++     float4 after=make_float4(prefix.x+weight*c.x,prefix.y+weight*c.y,prefix.z+weight*c.z,prefix.w+weight*c.w);
++     float dalpha=(T*c.x-(final.x-after.x)*ra)*grad.x;
++     dalpha+=(T*c.y-(final.y-after.y)*ra)*grad.y;
++     dalpha+=(T*c.z-(final.z-after.z)*ra)*grad.z;
++     dalpha+=(T*c.w-(final.w-after.w)*ra)*grad.w;
++     dalpha+=(1-alphas[pixel])*ra*va[pixel];
++     gc.x+=weight*grad.x;gc.y+=weight*grad.y;gc.z+=weight*grad.z;gc.w+=weight*grad.w;
++     if(op*vis<=.999f) {
++      float ds=-op*vis*dalpha;
++      gq.x+=.5f*ds*dx*dx;gq.y+=ds*dx*dy;gq.z+=.5f*ds*dy*dy;
++      float mx=ds*(q.x*dx+q.y*dy),my=ds*(q.y*dx+q.z*dy);
++      gm.x+=mx;gm.y+=my;ga.x+=fabsf(mx);ga.y+=fabsf(my);go+=vis*dalpha;
++     }
++     T*=1-a;prefix=after;
++    }
++   }
++  }
++  T=__shfl_up(T,1,32);
++  prefix.x=__shfl_up(prefix.x,1,32);prefix.y=__shfl_up(prefix.y,1,32);
++  prefix.z=__shfl_up(prefix.z,1,32);prefix.w=__shfl_up(prefix.w,1,32);
++ }
++ if(gaussian_valid) {
++  atomicAdd(&vm[g].x,gm.x);atomicAdd(&vm[g].y,gm.y);
++  atomicAdd(&vq[g].x,gq.x);atomicAdd(&vq[g].y,gq.y);atomicAdd(&vq[g].z,gq.z);
++  atomicAdd(&vcol[g].x,gc.x);atomicAdd(&vcol[g].y,gc.y);atomicAdd(&vcol[g].z,gc.z);atomicAdd(&vcol[g].w,gc.w);
++  atomicAdd(vo+g,go);if(ab) {atomicAdd(&ab[g].x,ga.x);atomicAdd(&ab[g].y,ga.y);}
++ }
++}
++
++using Forward=std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
++template<int TILE>
++Forward checkpoint_forward_impl(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,
++ std::optional<at::Tensor> bg,std::optional<at::Tensor> mask,int64_t width,int64_t height,int64_t tile,
++ at::Tensor offsets,at::Tensor ids,at::Tensor bucket_offsets,int64_t buckets,std::optional<at::Tensor> reached=std::nullopt) {
++ c10::DeviceGuard guard(means.device());
++ int tw=offsets.size(-1),th=offsets.size(-2),images=offsets.numel()/(tw*th);
++ auto out=at::empty({images,height,width,4},means.options()),alpha=at::empty({images,height,width,1},means.options());
++ auto last=at::empty({images,height,width},offsets.options()),bounds=at::empty({offsets.numel()},offsets.options());
++ auto cp=at::empty({buckets,tile*tile,5},means.options());
++ checkpoint_forward<TILE><<<offsets.numel(),tile*tile,0,c10::hip::getCurrentHIPStream()>>>(
++  (float2*)means.data_ptr<float>(),(float3*)conics.data_ptr<float>(),(float4*)colors.data_ptr<float>(),opacity.data_ptr<float>(),
++  bg ? (float4*)bg->data_ptr<float>() : nullptr,mask ? mask->data_ptr<bool>() : nullptr,
++  width,height,tile,tw,th,offsets.numel(),ids.numel(),offsets.data_ptr<int>(),ids.data_ptr<int>(),bucket_offsets.data_ptr<int>(),
++  cp.data_ptr<float>(),(float4*)out.data_ptr<float>(),alpha.data_ptr<float>(),last.data_ptr<int>(),bounds.data_ptr<int>(),reached ? reached->data_ptr<int>() : nullptr);
++ C10_HIP_CHECK(hipGetLastError());return {out,alpha,last,cp,bounds};
++}
++using Result=std::tuple<std::optional<at::Tensor>,at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
++template<int TILE>
++Result checkpoint_backward_impl(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,std::optional<at::Tensor> mask,
++ int64_t width,int64_t height,int64_t tile,at::Tensor offsets,at::Tensor ids,at::Tensor bucket_offsets,at::Tensor bucket_tiles,
++ at::Tensor rendered,at::Tensor alpha,at::Tensor last,at::Tensor cp,at::Tensor bounds,at::Tensor vc,at::Tensor va,bool absolute) {
++ c10::DeviceGuard guard(means.device());
++ auto vm=at::zeros_like(means),vq=at::zeros_like(conics),vcol=at::zeros_like(colors),vo=at::zeros_like(opacity);
++ std::optional<at::Tensor> ab=absolute ? std::optional<at::Tensor>(at::zeros_like(means)) : std::nullopt;
++ int buckets=bucket_tiles.numel(),tw=(width+tile-1)/tile,th=(height+tile-1)/tile;
++ if(buckets) bucket_backward<TILE><<<(buckets+3)/4,128,0,c10::hip::getCurrentHIPStream()>>>(
++  (float2*)means.data_ptr<float>(),(float3*)conics.data_ptr<float>(),(float4*)colors.data_ptr<float>(),opacity.data_ptr<float>(),
++  mask ? mask->data_ptr<bool>() : nullptr,width,height,tile,tw,th,buckets,ids.numel(),offsets.data_ptr<int>(),ids.data_ptr<int>(),
++  bucket_offsets.data_ptr<int>(),bucket_tiles.data_ptr<int>(),cp.data_ptr<float>(),bounds.data_ptr<int>(),(float4*)rendered.data_ptr<float>(),
++  alpha.data_ptr<float>(),last.data_ptr<int>(),(float4*)vc.data_ptr<float>(),va.data_ptr<float>(),
++  (float2*)vm.data_ptr<float>(),(float3*)vq.data_ptr<float>(),(float4*)vcol.data_ptr<float>(),vo.data_ptr<float>(),ab ? (float2*)ab->data_ptr<float>() : nullptr);
++ C10_HIP_CHECK(hipGetLastError());return {ab,vm,vq,vcol,vo};
++}
++
++static void check_checkpoint_inputs(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,
++ std::optional<at::Tensor> bg,std::optional<at::Tensor> mask,int64_t width,int64_t height,int64_t tile) {
++ TORCH_CHECK(width>0 && height>0 && tile==16,"checkpoint rasterization requires tile16 and positive dimensions");
++ TORCH_CHECK((means.dim()==2 || means.dim()==3) && means.size(-1)==2,"unsupported means shape");
++ for(const auto& t:{means,conics,colors,opacity}) {
++  TORCH_CHECK(t.device()==means.device() && t.is_cuda() && t.is_contiguous() && t.scalar_type()==at::kFloat,"expected contiguous float32 tensors on one GPU");
++ }
++ TORCH_CHECK(conics.size(-1)==3 && colors.size(-1)==4 && conics.numel()/3==means.numel()/2 && colors.numel()/4==means.numel()/2 && opacity.numel()==means.numel()/2,"inconsistent Gaussian shapes");
++ if(bg) TORCH_CHECK(bg->device()==means.device() && bg->is_contiguous() && bg->scalar_type()==at::kFloat && bg->size(-1)==4,"invalid background");
++ if(mask) TORCH_CHECK(mask->device()==means.device() && mask->is_contiguous() && mask->scalar_type()==at::kBool,"invalid tile mask");
++}
++
++CheckpointForward rasterize_checkpoint_3dgs_fwd(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,
++ std::optional<at::Tensor> bg,std::optional<at::Tensor> mask,int64_t width,int64_t height,int64_t tile,
++ at::Tensor offsets,at::Tensor ids) {
++ check_checkpoint_inputs(means,conics,colors,opacity,bg,mask,width,height,tile);
++ c10::DeviceGuard guard(means.device());
++ TORCH_CHECK(offsets.dim()==3 && offsets.is_contiguous() && offsets.scalar_type()==at::kInt && offsets.device()==means.device(),"invalid offsets");
++ TORCH_CHECK(ids.dim()==1 && ids.is_contiguous() && ids.scalar_type()==at::kInt && ids.device()==means.device(),"invalid IDs");
++ int64_t images=offsets.size(0),tw=(width+15)/16,th=(height+15)/16;
++ TORCH_CHECK(offsets.size(1)==th && offsets.size(2)==tw && images*width*height<INT32_MAX && ids.numel()<INT32_MAX,"unsupported image/intersection size");
++ if(bg) TORCH_CHECK(bg->numel()==images*4,"background size mismatch");
++ if(mask) TORCH_CHECK(mask->sizes()==offsets.sizes(),"mask size mismatch");
++ auto sentinel=at::cat({offsets.flatten(),at::full({1},ids.numel(),offsets.options())});
++ auto lengths=sentinel.slice(0,1)-sentinel.slice(0,0,-1);
++ auto counts=at::floor_divide(lengths+31,32);
++ auto bucket_offsets=at::cat({at::zeros({1},offsets.options()),at::cumsum(counts,0,at::kInt)});
++ int64_t buckets=bucket_offsets[-1].item<int32_t>();
++ TORCH_CHECK(buckets>=0,"negative bucket count");
++ int64_t bytes=buckets*int64_t(256*5*sizeof(float));
++ size_t free_bytes,total_bytes;
++ C10_HIP_CHECK(hipMemGetInfo(&free_bytes,&total_bytes));
++ int64_t memory_limit=std::min<int64_t>(1024*1024*1024LL,int64_t(free_bytes/3));
++ std::optional<at::Tensor> reached;
++ if(bytes>memory_limit) {
++  auto [r,a,last]=rasterize_to_pixels_3dgs_fwd(means,conics,colors,opacity,bg,mask,width,height,tile,offsets,ids);
++  reached=at::empty({offsets.numel()},offsets.options());
++  checkpoint_tile_bounds<<<offsets.numel(),256,0,c10::hip::getCurrentHIPStream()>>>(
++      last.data_ptr<int>(),width,height,tw,th,reached->data_ptr<int>());
++  C10_HIP_CHECK(hipGetLastError());
++  auto visible_lengths=at::minimum(lengths,at::clamp_min(*reached-offsets.flatten()+1,0));
++  counts=at::floor_divide(visible_lengths+31,32);
++  bucket_offsets=at::cat({at::zeros({1},offsets.options()),at::cumsum(counts,0,at::kInt)});
++  buckets=bucket_offsets[-1].item<int32_t>();
++  TORCH_CHECK(buckets>=0,"negative visible bucket count");
++  bytes=buckets*int64_t(256*5*sizeof(float));
++  if(bytes>memory_limit) {
++   auto empty=at::empty({0},means.options());
++   return {r,a,last,empty,empty,empty,empty,empty};
++  }
++ }
++ auto bucket_tiles=at::repeat_interleave(counts,std::optional<int64_t>(buckets));
++ auto [r,a,last,cp,bounds]=checkpoint_forward_impl<16>(means,conics,colors,opacity,bg,mask,width,height,tile,offsets,ids,bucket_offsets,buckets,reached);
++
++ return {r,a,last,cp,bounds,bucket_offsets,bucket_tiles,sentinel};
++}
++CheckpointBackward rasterize_checkpoint_3dgs_bwd(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,std::optional<at::Tensor> mask,
++ int64_t width,int64_t height,int64_t tile,at::Tensor offsets,at::Tensor ids,at::Tensor bucket_offsets,at::Tensor bucket_tiles,
++ at::Tensor rendered,at::Tensor alpha,at::Tensor last,at::Tensor cp,at::Tensor bounds,at::Tensor vc,at::Tensor va,bool absolute) {
++ check_checkpoint_inputs(means,conics,colors,opacity,std::nullopt,mask,width,height,tile);
++ for(const auto& t:{offsets,ids,bucket_offsets,bucket_tiles,last,bounds})
++  TORCH_CHECK(t.device()==means.device() && t.is_contiguous() && t.scalar_type()==at::kInt,"invalid checkpoint indices");
++ for(const auto& t:{rendered,alpha,cp,vc,va})
++  TORCH_CHECK(t.device()==means.device() && t.is_contiguous() && t.scalar_type()==at::kFloat,"invalid checkpoint image tensors");
++ TORCH_CHECK(rendered.sizes()==vc.sizes() && alpha.sizes()==va.sizes() && rendered.size(-1)==4 && alpha.size(-1)==1,"invalid render gradient shapes");
++ TORCH_CHECK(rendered.numel()==alpha.numel()*4 && last.numel()==alpha.numel(),"invalid render sizes");
++ TORCH_CHECK(cp.numel()==bucket_tiles.numel()*int64_t(256*5) && offsets.numel()==bounds.numel()+1 && bucket_offsets.numel()==offsets.numel(),"invalid checkpoint metadata sizes");
++ return checkpoint_backward_impl<16>(means,conics,colors,opacity,mask,width,height,tile,offsets,ids,bucket_offsets,bucket_tiles,rendered,alpha,last,cp,bounds,vc,va,absolute);
++}
++namespace {
++constexpr int kTile = 16;
++constexpr int kThreads = 256;
++
++__global__ void vcp_counts_kernel(
++    const float* __restrict__ means, const float* __restrict__ conics,
++    const float* __restrict__ opacities, const bool* __restrict__ metric_map,
++    const int32_t* __restrict__ offsets, const int32_t* __restrict__ flat_ids,
++    int32_t* __restrict__ counts, int width, int height, int tile_width,
++    int tile_height, int n, int n_isects) {
++  const int tx = threadIdx.x, ty = threadIdx.y;
++  const int linear = ty * kTile + tx;
++  const int tile_x = blockIdx.x, tile_y = blockIdx.y;
++  const int tile = tile_y * tile_width + tile_x;
++  const int pixel_x = tile_x * kTile + tx, pixel_y = tile_y * kTile + ty;
++  bool done = pixel_x >= width || pixel_y >= height;
++  float transmittance = 1.f;
++
++  int start = offsets[tile];
++  int end = tile + 1 == tile_width * tile_height ? n_isects : offsets[tile + 1];
++  start = max(0, min(start, n_isects));
++  end = max(start, min(end, n_isects));
++  __shared__ int32_t ids[kThreads];
++  __shared__ float geometry[kThreads][6]; // mean xy, conic abc, opacity
++
++  for (int batch = start; batch < end; batch += kThreads) {
++    if (__syncthreads_count(done) == kThreads) break;
++    const int at = batch + linear;
++    if (at < end) {
++      const int g = flat_ids[at];
++      ids[linear] = g;
++      if (g >= 0 && g < n) {
++        const float* mean = means + 2 * g;
++        const float* conic = conics + 3 * g;
++        geometry[linear][0] = mean[0]; geometry[linear][1] = mean[1];
++        geometry[linear][2] = conic[0]; geometry[linear][3] = conic[1];
++        geometry[linear][4] = conic[2]; geometry[linear][5] = opacities[g];
++      }
++    }
++    __syncthreads();
++    const int batch_size = min(kThreads, end - batch);
++    for (int t = 0; t < batch_size; ++t) {
++      const int g = ids[t];
++      bool contributing = false;
++      if (!done && g >= 0 && g < n) {
++        const float dx = geometry[t][0] - (pixel_x + .5f);
++        const float dy = geometry[t][1] - (pixel_y + .5f);
++        const float sigma = .5f * (geometry[t][2] * dx * dx + geometry[t][4] * dy * dy)
++                          + geometry[t][3] * dx * dy;
++        const float alpha = min(.999f, geometry[t][5] * __expf(-sigma));
++        if (sigma >= 0.f && alpha >= 1.f / 255.f) {
++          const float next_t = transmittance * (1.f - alpha);
++          if (next_t <= 1e-4f) done = true; // terminal Gaussian is excluded.
++          else {
++            contributing = metric_map[pixel_y * width + pixel_x];
++            transmittance = next_t;
++          }
++        }
++      }
++      // All lanes, including finished pixels, participate in the ballot.
++      const unsigned long long votes = __ballot(contributing);
++      if (linear % warpSize == 0 && votes) atomicAdd(counts + g, __popcll(votes));
++    }
++    __syncthreads();
++  }
++}
++} // namespace
++
++at::Tensor rasterize_vcp_counts(at::Tensor means, at::Tensor conics, at::Tensor opacities,
++                         at::Tensor metric_map, at::Tensor tile_offsets,
++                         at::Tensor flat_ids) {
++  TORCH_CHECK(means.is_cuda() && conics.is_cuda() && opacities.is_cuda() && metric_map.is_cuda()
++              && tile_offsets.is_cuda() && flat_ids.is_cuda(), "all inputs must be device tensors");
++  TORCH_CHECK(means.device() == conics.device() && means.device() == opacities.device()
++              && means.device() == metric_map.device() && means.device() == tile_offsets.device()
++              && means.device() == flat_ids.device(), "all inputs must share a device");
++  TORCH_CHECK(means.is_contiguous() && conics.is_contiguous() && opacities.is_contiguous()
++              && metric_map.is_contiguous() && tile_offsets.is_contiguous() && flat_ids.is_contiguous(),
++              "all inputs must be contiguous");
++  TORCH_CHECK(means.scalar_type() == at::kFloat && conics.scalar_type() == at::kFloat
++              && opacities.scalar_type() == at::kFloat, "geometry must be float32");
++  TORCH_CHECK(metric_map.scalar_type() == at::kBool && tile_offsets.scalar_type() == at::kInt
++              && flat_ids.scalar_type() == at::kInt, "metricMap must be bool; offsets and IDs int32");
++  TORCH_CHECK(means.dim() == 3 && means.size(0) == 1 && means.size(2) == 2,
++              "means must be contiguous [1,N,2]");
++  TORCH_CHECK(conics.dim() == 3 && conics.size(0) == 1 && conics.size(1) == means.size(1)
++              && conics.size(2) == 3, "conics must be [1,N,3]");
++  TORCH_CHECK(opacities.dim() == 2 && opacities.size(0) == 1 && opacities.size(1) == means.size(1),
++              "opacities must be [1,N]");
++  TORCH_CHECK(metric_map.dim() == 3 && metric_map.size(0) == 1, "metricMap must be [1,H,W]");
++  TORCH_CHECK(tile_offsets.dim() == 3 && tile_offsets.size(0) == 1, "tileOffsets must be [1,th,tw]");
++  TORCH_CHECK(tile_offsets.size(1) == (metric_map.size(1) + 15) / 16
++              && tile_offsets.size(2) == (metric_map.size(2) + 15) / 16,
++              "tileOffsets must use 16-pixel tiles");
++  TORCH_CHECK(flat_ids.dim() == 1, "flatIDs must be flat");
++  const auto limit = std::numeric_limits<int>::max();
++  TORCH_CHECK(means.size(1) <= limit && metric_map.size(1) <= limit && metric_map.size(2) <= limit
++              && flat_ids.numel() <= limit && metric_map.size(1) * metric_map.size(2) <= limit,
++              "N, image dimensions, pixel count, and flatIDs length must fit int32");
++  TORCH_CHECK(metric_map.size(1)>0 && metric_map.size(2)>0, "positive image dimensions required");
++  c10::DeviceGuard guard(means.device());
++  auto out = at::zeros({means.size(1)}, means.options().dtype(at::kInt));
++  int width=metric_map.size(2), height=metric_map.size(1);
++  dim3 block(16,16), grid((width+15)/16,(height+15)/16);
++  vcp_counts_kernel<<<grid,block,0,c10::hip::getCurrentHIPStream()>>>(
++      means.data_ptr<float>(), conics.data_ptr<float>(), opacities.data_ptr<float>(),
++      metric_map.data_ptr<bool>(), tile_offsets.data_ptr<int32_t>(), flat_ids.data_ptr<int32_t>(),
++      out.data_ptr<int32_t>(), width,height,tile_offsets.size(2),tile_offsets.size(1),means.size(1),flat_ids.numel());
++  C10_HIP_CHECK(hipGetLastError());
++  return out;
++}
++
++} // namespace gsplat
++#endif
+diff --git a/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu b/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
+index 979082f..58625b7 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixels2DGSBwd.cu
+@@ -1,3 +1,4 @@
++// Modified for GlomeHomeTour gfx1200 ROCm support; see gsplat_gfx1200.patch.
+ #include <ATen/Dispatch.h>
+ #include <ATen/core/Tensor.h>
+ 
+@@ -179,7 +180,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+     float *normals_batch = &rgbs_batch[block_size * CDIM]; // [block_size * 3]
+     
+     #if USE_ROCM
+-    using warp_reduce_float_t = rocprim::warp_reduce<float,64>;
++    using warp_reduce_float_t = rocprim::warp_reduce<float,32>;
+     auto* warp_storage_base   =
+     (typename warp_reduce_float_t::storage_type*)
+         (normals_batch + block_size * 3);
+@@ -246,7 +247,7 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+     const uint32_t tr = block.thread_rank();
+     
+     #if USE_ROCM
+-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
++    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #else
+     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #endif
+@@ -634,16 +635,16 @@ __global__ void rasterize_to_pixels_2dgs_bwd_kernel(
+              * ==================================================
+              */
+             #if USE_ROCM
+-            rocprim_warpSum<CDIM, 64>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
+-            rocprim_warpSum<3, 64>(v_normal_local, warp_storage_base);   // 3-sized float array
+-            rocprim_warpSum<64>(v_xy_local, warp_storage_base);          // vec2
+-            rocprim_warpSum<64>(v_u_M_local, warp_storage_base);         // float
+-            rocprim_warpSum<64>(v_v_M_local, warp_storage_base);         // float
+-            rocprim_warpSum<64>(v_w_M_local, warp_storage_base);         // float
++            rocprim_warpSum<CDIM, 32>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
++            rocprim_warpSum<3, 32>(v_normal_local, warp_storage_base);   // 3-sized float array
++            rocprim_warpSum<32>(v_xy_local, warp_storage_base);          // vec2
++            rocprim_warpSum<32>(v_u_M_local, warp_storage_base);         // float
++            rocprim_warpSum<32>(v_v_M_local, warp_storage_base);         // float
++            rocprim_warpSum<32>(v_w_M_local, warp_storage_base);         // float
+             if (v_means2d_abs != nullptr) {
+-                rocprim_warpSum<64>(v_xy_abs_local, warp_storage_base);  // vec2
++                rocprim_warpSum<32>(v_xy_abs_local, warp_storage_base);  // vec2
+             }
+-            rocprim_warpSum<64>(v_opacity_local, warp_storage_base);     // float
++            rocprim_warpSum<32>(v_opacity_local, warp_storage_base);     // float
+             #else
+             warpSum<CDIM>(v_rgb_local, warp);
+             warpSum<3>(v_normal_local, warp);
+@@ -767,9 +768,9 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+     //rocPRIM shared memory allocation
+     const uint32_t block_size = tile_size * tile_size;
+     const uint32_t warps_per_block =
+-        (block_size + 63) / 64;                       // for 64-lane warp
++        (block_size + 31) / 32;                       // for 32-lane warp
+     std::size_t warp_scratch_bytes =
+-        warps_per_block * sizeof(typename rocprim::warp_reduce<float,64>::storage_type);
++        warps_per_block * sizeof(typename rocprim::warp_reduce<float,32>::storage_type);
+ 
+     int64_t shmem_size =
+         tile_size * tile_size *
+@@ -912,4 +913,3 @@ __INS__(513)
+ #undef __INS__
+ 
+ } // namespace gsplat
+-
+diff --git a/gsplat/cuda/csrc/RasterizeToPixels3DGSBwd.cu b/gsplat/cuda/csrc/RasterizeToPixels3DGSBwd.cu
+index 37300ab..efea18f 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixels3DGSBwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixels3DGSBwd.cu
+@@ -1,3 +1,4 @@
++// Modified for GlomeHomeTour gfx1200 ROCm support; see gsplat_gfx1200.patch.
+ #include <ATen/Dispatch.h>
+ #include <ATen/core/Tensor.h>
+ 
+@@ -27,7 +28,7 @@ __device__ void dpp_sclr_warpSum(T &val) {
+ 	// tmp = tmp + __builtin_amdgcn_mov_dpp(tmp, 0x142, 0xf, 0xf, 1); //BCAST15
+ 	// tmp = tmp + __builtin_amdgcn_mov_dpp(tmp, 0x143, 0xf, 0xf, 1); //BCAST31
+ 	// val = __shfl(tmp, 63);
+-    rocprim_warpSum<64>(val, NULL);
++    rocprim_warpSum<32>(val, NULL);
+ }
+ 
+ // This version does reduce but stores the result to a specific location (n_val) on a given lane (ln)
+@@ -44,7 +45,7 @@ __device__ void dpp_sprd_warpSum(T &val, int ln, T &n_val) {
+ 	// if (cg::this_thread_block().thread_rank() == ln)
+ 	//        n_val = tmp;
+     T tmp = val;
+-    rocprim_warpSum<64>(tmp, NULL);
++    rocprim_warpSum<32>(tmp, NULL);
+     if (cg::this_thread_block().thread_rank() == ln)
+         n_val = tmp;
+ }
+@@ -82,8 +83,8 @@ __device__ T dpp_warpMax(T &val) {
+ 	// tmp = max(tmp, __builtin_amdgcn_mov_dpp(tmp, 0x142, 0xf, 0xf, 1)); //BCAST15
+ 	// tmp = max(tmp, __builtin_amdgcn_mov_dpp(tmp, 0x143, 0xf, 0xf, 1)); //BCAST31
+ 	// return __shfl(tmp, 63);
+-    __shared__ typename rocprim::warp_reduce<int32_t, 64>::storage_type warp_storage;
+-    rocprim::warp_reduce<int32_t, 64> wreduce;
++    __shared__ typename rocprim::warp_reduce<int32_t, 32, true>::storage_type warp_storage;
++    rocprim::warp_reduce<int32_t, 32, true> wreduce;
+     int32_t max;
+     wreduce.reduce(val,            // 1) value held by this lane
+             max,               // 2) reference that will receive the result
+@@ -207,7 +208,7 @@ __global__ void rasterize_bs64_to_pixels_3dgs_bwd_kernel(
+     // each thread loads one gaussian at a time before rasterizing
+     const uint32_t tr = block.thread_rank();
+ 
+-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
++    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+ 
+     int32_t warp_bin_final =
+     dpp_warpMax(bin_final);
+@@ -473,7 +474,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
+         (float *)&conic_batch[batch_allocation_size]; // [batch_allocation_size * CDIM]
+     
+     #if USE_ROCM
+-    using warp_reduce_float_t = rocprim::warp_reduce<float,64>;
++    using warp_reduce_float_t = rocprim::warp_reduce<float,32>;
+     auto* warp_storage_base   =
+     (typename warp_reduce_float_t::storage_type*)
+         (rgbs_batch + batch_allocation_size * CDIM);
+@@ -500,14 +501,14 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
+     const uint32_t tr = block.thread_rank();
+     
+     #if USE_ROCM
+-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
++    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #else
+     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #endif
+     
+     #if USE_ROCM
+-        __shared__ typename rocprim::warp_reduce<int32_t, 64>::storage_type warp_storage;
+-        rocprim::warp_reduce<int32_t, 64> wreduce;
++        __shared__ typename rocprim::warp_reduce<int32_t, 32, true>::storage_type warp_storage;
++        rocprim::warp_reduce<int32_t, 32, true> wreduce;
+         int32_t warp_bin_final;
+         wreduce.reduce( bin_final,            // 1) value held by this lane
+                 warp_bin_final,               // 2) reference that will receive the result
+@@ -644,12 +645,36 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
+                 }
+             }
+             #if USE_ROCM
+-            rocprim_warpSum<CDIM, 64>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
+-            rocprim_warpSum<64>(v_conic_local, warp_storage_base); // float
+-            rocprim_warpSum<64>(v_xy_local, warp_storage_base);    // vec2
++            rocprim_warpSum<CDIM, 32>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
++            rocprim_warpSum<32>(v_conic_local, warp_storage_base); // float
++            rocprim_warpSum<32>(v_xy_local, warp_storage_base);    // vec2
+             if (v_means2d_abs != nullptr)
+-                rocprim_warpSum<64>(v_xy_abs_local, warp_storage_base);// vec2
+-            rocprim_warpSum<64>(v_opacity_local, warp_storage_base);// float
++                rocprim_warpSum<32>(v_xy_abs_local, warp_storage_base);// vec2
++            rocprim_warpSum<32>(v_opacity_local, warp_storage_base);// float
++#if defined(__gfx1200__)
++            // Coalesce the ten RGB+depth gradient atomics across wave lanes.
++            if constexpr (CDIM == 4) {
++            const uint32_t lane = warp.thread_rank();
++            const int32_t g = id_batch[t];
++            float *dst = v_opacities + g;
++            float value = v_opacity_local;
++            if (lane == 1) { dst = (float *)v_means2d + 2*g; value = v_xy_local.x; }
++            if (lane == 2) { dst = (float *)v_means2d + 2*g+1; value = v_xy_local.y; }
++            if (lane == 3) { dst = (float *)v_conics + 3*g; value = v_conic_local.x; }
++            if (lane == 4) { dst = (float *)v_conics + 3*g+1; value = v_conic_local.y; }
++            if (lane == 5) { dst = (float *)v_conics + 3*g+2; value = v_conic_local.z; }
++#pragma unroll
++            for (uint32_t k = 0; k < CDIM; ++k) {
++                if (lane == 6+k) { dst = (float *)v_colors + CDIM*g+k; value = v_rgb_local[k]; }
++            }
++            if (v_means2d_abs != nullptr) {
++                if (lane == 6+CDIM) { dst = (float *)v_means2d_abs + 2*g; value = v_xy_abs_local.x; }
++                if (lane == 7+CDIM) { dst = (float *)v_means2d_abs + 2*g+1; value = v_xy_abs_local.y; }
++            }
++            if (lane < 6+CDIM+(v_means2d_abs != nullptr ? 2 : 0)) atomicAdd(dst, value);
++            } else
++#endif
++            {
+             if (warp.thread_rank() == 0) {
+                 int32_t g = id_batch[t]; // flatten index in [I * N] or [nnz]
+                 float *v_rgb_ptr = (float *)(v_colors) + CDIM * g;
+@@ -675,6 +700,7 @@ __global__ void rasterize_to_pixels_3dgs_bwd_kernel(
+ 
+                 atomicAdd(v_opacities + g, v_opacity_local);
+             }
++            }
+             #else
+             warpSum<CDIM>(v_rgb_local, warp);
+             warpSum(v_conic_local, warp);
+@@ -761,7 +787,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
+     const uint32_t block_size = tile_size * tile_size;
+     uint32_t max_batch_size;
+     int64_t shmem_size;
+-    if (block_size == 64) { // wave64-optimized path
++    if (false) { // ponytail: wave64 path disabled for gfx1200; retune for wave64 GPUs.
+       max_batch_size = 32;
+       //max_batch_size = min(max_batch_size, block_size);
+       if (CDIM <= 32) {
+@@ -776,9 +802,9 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
+       if (CDIM <= 16) {
+         max_batch_size = block_size;
+       }
+-      const uint32_t warps_per_block = (block_size + 63) / 64; // for 64-lane warp
++      const uint32_t warps_per_block = (block_size + 31) / 32; // for 32-lane warp
+       std::size_t warp_scratch_bytes =
+-        warps_per_block * sizeof(typename rocprim::warp_reduce<float,64>::storage_type);
++        warps_per_block * sizeof(typename rocprim::warp_reduce<float,32>::storage_type);
+       shmem_size =
+         max_batch_size *
+         (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(float) * CDIM) + warp_scratch_bytes;
+@@ -813,7 +839,7 @@ void launch_rasterize_to_pixels_3dgs_bwd_kernel(
+         );
+     }
+ #else
+-    auto KERNEL = (block_size == 64) ?
++    auto KERNEL = (false) ?
+ 	    rasterize_bs64_to_pixels_3dgs_bwd_kernel<CDIM, float> :
+ 	    rasterize_to_pixels_3dgs_bwd_kernel<CDIM, float>;
+     hipError_t err = hipFuncSetAttribute(
+@@ -915,4 +941,3 @@ __INS__(513)
+ #undef __INS__
+ 
+ } // namespace gsplat
+-
+diff --git a/gsplat/cuda/csrc/RasterizeToPixels3DGSFwd.cu b/gsplat/cuda/csrc/RasterizeToPixels3DGSFwd.cu
+index 8369b83..9bea953 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixels3DGSFwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixels3DGSFwd.cu
+@@ -69,11 +69,16 @@ __global__ void rasterize_to_pixels_3dgs_fwd_kernel(
+ 
+     // when the mask is provided, render the background color and return
+     // if this tile is labeled as False
+-    if (masks != nullptr && inside && !masks[tile_id]) {
++    // A masked tile must return as a whole block, including border threads.
++    if (masks != nullptr && !masks[tile_id]) {
++        if (inside) {
+ #pragma unroll
+-        for (uint32_t k = 0; k < CDIM; ++k) {
+-            render_colors[pix_id * CDIM + k] =
+-                backgrounds == nullptr ? 0.0f : backgrounds[k];
++            for (uint32_t k = 0; k < CDIM; ++k) {
++                render_colors[pix_id * CDIM + k] =
++                    backgrounds == nullptr ? 0.0f : backgrounds[k];
++            }
++            render_alphas[pix_id] = 0.0f;
++            last_ids[pix_id] = 0;
+         }
+         return;
+     }
+diff --git a/gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSBwd.cu b/gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSBwd.cu
+index 2380afd..eec5901 100644
+--- a/gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSBwd.cu
++++ b/gsplat/cuda/csrc/RasterizeToPixelsFromWorld3DGSBwd.cu
+@@ -1,3 +1,4 @@
++// Modified for GlomeHomeTour gfx1200 ROCm support; see gsplat_gfx1200.patch.
+ #include <ATen/Dispatch.h>
+ #include <ATen/core/Tensor.h>
+ 
+@@ -190,7 +191,7 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
+         (float *)&quat_batch[block_size]; // [block_size * CDIM]
+         
+     #if USE_ROCM
+-    using warp_reduce_float_t = rocprim::warp_reduce<float,64>;
++    using warp_reduce_float_t = rocprim::warp_reduce<float,32>;
+     auto* warp_storage_base   =
+     (typename warp_reduce_float_t::storage_type*)
+         (rgbs_batch + block_size * CDIM);
+@@ -216,7 +217,7 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
+     // each thread loads one gaussian at a time before rasterizing
+     const uint32_t tr = block.thread_rank();
+     #if USE_ROCM
+-    cg::thread_block_tile<64> warp = cg::tiled_partition<64>(block);
++    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #else
+     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+     #endif
+@@ -376,11 +377,11 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
+                 }
+             }
+             #if USE_ROCM
+-            rocprim_warpSum<CDIM, 64>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
+-            rocprim_warpSum<64>(v_mean_local, warp_storage_base);        // vec3
+-            rocprim_warpSum<64>(v_scale_local, warp_storage_base);       // vec3
+-            rocprim_warpSum<64>(v_quat_local, warp_storage_base);        // vec4
+-            rocprim_warpSum<64>(v_opacity_local, warp_storage_base);     // float
++            rocprim_warpSum<CDIM, 32>(v_rgb_local, warp_storage_base);   // CDIM-sized float array
++            rocprim_warpSum<32>(v_mean_local, warp_storage_base);        // vec3
++            rocprim_warpSum<32>(v_scale_local, warp_storage_base);       // vec3
++            rocprim_warpSum<32>(v_quat_local, warp_storage_base);        // vec4
++            rocprim_warpSum<32>(v_opacity_local, warp_storage_base);     // float
+             #else
+             warpSum<CDIM>(v_rgb_local, warp);
+             warpSum(v_mean_local, warp);
+@@ -482,9 +483,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
+     //rocPRIM shared memory allocation
+     const uint32_t block_size = tile_size * tile_size;
+     const uint32_t warps_per_block =
+-        (block_size + 63) / 64;                       // for 64-lane warp
++        (block_size + 31) / 32;                       // for 32-lane warp
+     std::size_t warp_scratch_bytes =
+-        warps_per_block * sizeof(typename rocprim::warp_reduce<float,64>::storage_type);
++        warps_per_block * sizeof(typename rocprim::warp_reduce<float,32>::storage_type);
+ 
+     int64_t shmem_size =
+         tile_size * tile_size *
+@@ -639,4 +640,3 @@ __INS__(513)
+ #undef __INS__
+ 
+ } // namespace gsplat
+-
+diff --git a/gsplat/cuda/ext.cpp b/gsplat/cuda/ext.cpp
+index 7f7298c..414c624 100644
+--- a/gsplat/cuda/ext.cpp
++++ b/gsplat/cuda/ext.cpp
+@@ -53,6 +53,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def(
+         "rasterize_to_pixels_3dgs_bwd", &gsplat::rasterize_to_pixels_3dgs_bwd
+     );
++#if USE_ROCM
++    m.def("rasterize_vcp_counts", &gsplat::rasterize_vcp_counts);
++    m.def("rasterize_checkpoint_3dgs_fwd", &gsplat::rasterize_checkpoint_3dgs_fwd);
++    m.def("rasterize_checkpoint_3dgs_bwd", &gsplat::rasterize_checkpoint_3dgs_bwd);
++#endif
+     m.def("rasterize_to_indices_3dgs", &gsplat::rasterize_to_indices_3dgs);
+ 
+     m.def("projection_2dgs_fused_fwd", &gsplat::projection_2dgs_fused_fwd);
+diff --git a/gsplat/cuda/include/Common.cuh b/gsplat/cuda/include/Common.cuh
+index a43c87e..4894052 100644
+--- a/gsplat/cuda/include/Common.cuh
++++ b/gsplat/cuda/include/Common.cuh
+@@ -1,3 +1,4 @@
++// Modified for GlomeHomeTour gfx1200 ROCm support; see gsplat_gfx1200.patch.
+ #pragma once
+ 
+ #include <algorithm>
+@@ -11,6 +12,7 @@
+ #include <ATen/cuda/Atomic.cuh>
+ 
+ #else
++#include <ATen/ops/empty.h>
+ #include <hip/hip_cooperative_groups.h>
+ #include <c10/hip/HIPGuard.h>
+ #include <ATen/hip/Atomic.cuh>
+@@ -38,9 +40,10 @@ namespace gsplat {
+     do {                                                                       \
+         size_t temp_storage_bytes = 0;                                         \
+         auto res = func(nullptr, temp_storage_bytes, __VA_ARGS__);                        \
+-        auto &caching_allocator = *::c10::hip::HIPCachingAllocator::get();   \
+-        auto temp_storage = caching_allocator.allocate(temp_storage_bytes);    \
+-        res = func(temp_storage.get(), temp_storage_bytes, __VA_ARGS__);  \
++        auto temp_storage = at::empty(                                      \
++            {static_cast<int64_t>(temp_storage_bytes)},                    \
++            at::TensorOptions().device(at::kCUDA).dtype(at::kByte));        \
++        res = func(temp_storage.data_ptr(), temp_storage_bytes, __VA_ARGS__); \
+ 	assert(res == hipSuccess);                                            \
+     } while (false)
+ #endif
+diff --git a/gsplat/cuda/include/Ops.h b/gsplat/cuda/include/Ops.h
+index 3638a13..df5a6f2 100644
+--- a/gsplat/cuda/include/Ops.h
++++ b/gsplat/cuda/include/Ops.h
+@@ -564,3 +564,19 @@ rasterize_to_pixels_from_world_3dgs_bwd(
+ );
+ 
+ } // namespace gsplat
++
++#if USE_ROCM
++namespace gsplat {
++using CheckpointForward=std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
++using CheckpointBackward=std::tuple<std::optional<at::Tensor>,at::Tensor,at::Tensor,at::Tensor,at::Tensor>;
++at::Tensor rasterize_vcp_counts(at::Tensor means, at::Tensor conics, at::Tensor opacities,
++                              at::Tensor metric_map, at::Tensor tile_offsets, at::Tensor flat_ids);
++
++CheckpointForward rasterize_checkpoint_3dgs_fwd(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,
++ std::optional<at::Tensor> bg,std::optional<at::Tensor> mask,int64_t width,int64_t height,int64_t tile,
++ at::Tensor offsets,at::Tensor ids);
++CheckpointBackward rasterize_checkpoint_3dgs_bwd(at::Tensor means,at::Tensor conics,at::Tensor colors,at::Tensor opacity,std::optional<at::Tensor> mask,
++ int64_t width,int64_t height,int64_t tile,at::Tensor offsets,at::Tensor ids,at::Tensor bucket_offsets,at::Tensor bucket_tiles,
++ at::Tensor rendered,at::Tensor alpha,at::Tensor last,at::Tensor cp,at::Tensor bounds,at::Tensor vc,at::Tensor va,bool absolute);
++}
++#endif
+diff --git a/gsplat/cuda/include/Utils.cuh b/gsplat/cuda/include/Utils.cuh
+index ee6d46e..c03de6a 100644
+--- a/gsplat/cuda/include/Utils.cuh
++++ b/gsplat/cuda/include/Utils.cuh
+@@ -1,3 +1,4 @@
++// Modified for GlomeHomeTour gfx1200 ROCm support; see gsplat_gfx1200.patch.
+ #pragma once
+ 
+ #include "Common.h"
+@@ -233,11 +234,12 @@ inline __device__ void manual_warpSum(float val[N]) {
+     }  
+ }
+ 
+-template<int LOGICAL_WARP_SIZE = 64>
++template<int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum_scalar(float& val, typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+             warp_storage_base)
+ {
+-    using warp_reduce_t = rocprim::warp_reduce<float, LOGICAL_WARP_SIZE>;
++    // Distributed gradient writes require the reduced value in every lane.
++    using warp_reduce_t = rocprim::warp_reduce<float, LOGICAL_WARP_SIZE, true>;
+     //constexpr int NUM_WARPS = BLOCK_SIZE / LOGICAL_WARP_SIZE;
+ 
+     // One storage object per logical warp inside the block
+@@ -256,7 +258,7 @@ __device__ inline void rocprim_warpSum_scalar(float& val, typename rocprim::warp
+ 
+ //-----------------------------------------------------------------------------
+ //  1. float overload  ────────────────────────────────────────────────────────
+-template<int LOGICAL_WARP_SIZE = 64>
++template<int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum(float& x, typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+                     warp_storage_base)
+ {
+@@ -265,7 +267,7 @@ __device__ inline void rocprim_warpSum(float& x, typename rocprim::warp_reduce<f
+ 
+ //-----------------------------------------------------------------------------
+ //  2. vec2 / vec3 / vec4 overloads  ─────────────────────────────────────────-
+-template<int LOGICAL_WARP_SIZE = 64>
++template<int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum(vec2& v, typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+                     warp_storage_base)
+ {
+@@ -273,7 +275,7 @@ __device__ inline void rocprim_warpSum(vec2& v, typename rocprim::warp_reduce<fl
+     rocprim_warpSum_scalar<LOGICAL_WARP_SIZE>(v.y, warp_storage_base);
+ }
+ 
+-template<int LOGICAL_WARP_SIZE = 64>
++template<int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum(vec3& v, typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+                     warp_storage_base)
+ {
+@@ -282,7 +284,7 @@ __device__ inline void rocprim_warpSum(vec3& v, typename rocprim::warp_reduce<fl
+     rocprim_warpSum_scalar<LOGICAL_WARP_SIZE>(v.z, warp_storage_base);
+ }
+ 
+-template<int LOGICAL_WARP_SIZE = 64>
++template<int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum(vec4& v, typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+                     warp_storage_base)
+ {
+@@ -294,7 +296,7 @@ __device__ inline void rocprim_warpSum(vec4& v, typename rocprim::warp_reduce<fl
+ 
+ //-----------------------------------------------------------------------------
+ //  3. fixed-size float array overload  ───────────────────────────────────────
+-template<int N, int LOGICAL_WARP_SIZE = 64>
++template<int N, int LOGICAL_WARP_SIZE = 32>
+ __device__ inline void rocprim_warpSum(float (&a)[N], typename rocprim::warp_reduce<float,LOGICAL_WARP_SIZE>::storage_type*
+                     warp_storage_base)
+ {
+diff --git a/gsplat/rendering.py b/gsplat/rendering.py
+index d21e653..3c465a5 100644
+--- a/gsplat/rendering.py
++++ b/gsplat/rendering.py
+@@ -67,6 +67,7 @@ def rasterization(
+     # rolling shutter
+     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
+     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
++    footprint_multiplier: float = 1.0,
+ ) -> Tuple[Tensor, Tensor, Dict]:
+     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
+ 
+@@ -263,6 +264,10 @@ def rasterization(
+         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
+ 
+     """
++    if not 0 < footprint_multiplier <= 1:
++        raise ValueError("footprint_multiplier must be in (0, 1]")
++    if footprint_multiplier != 1 and with_eval3d:
++        raise ValueError("compact footprints require projected 3DGS")
+     meta = {}
+ 
+     batch_dims = means.shape[:-2]
+@@ -628,12 +633,27 @@ def rasterization(
+     else:  # RGB
+         pass
+ 
++    # FastGS compact boxes: the multiplier scales the opacity-cutoff ellipse.
++    # Values below one intentionally omit peripheral contributions; one retains
++    # gsplat's original support. This affects tile selection, not alpha values.
++    tile_radii = radii
++    if footprint_multiplier != 1:
++        with torch.no_grad():
++            visible = (radii > 0).all(dim=-1)
++            safe_conics = torch.where(visible[..., None], conics, torch.tensor([1., 0., 1.], device=device))
++            a, b, c = safe_conics.unbind(-1)
++            level = 2 * (opacities.clamp_min(1e-12) * 255).log().clamp_min(0) * footprint_multiplier
++            determinant = (a * c - b.square()).clamp_min(1e-20)
++            compact = torch.stack(((level * c / determinant).clamp_min(0).sqrt(),
++                                   (level * a / determinant).clamp_min(0).sqrt()), -1).ceil().to(torch.int32)
++            tile_radii = torch.where(visible[..., None], torch.minimum(radii, compact), 0)
++
+     # Identify intersecting tiles
+     tile_width = math.ceil(width / float(tile_size))
+     tile_height = math.ceil(height / float(tile_size))
+     tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+         means2d,
+-        radii,
++        tile_radii,
+         depths,
+         tile_size,
+         tile_width,
+diff --git a/setup.py b/setup.py
+index 16f3821..3841988 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1,3 +1,4 @@
++# Modified for GlomeHomeTour gfx1200 ROCm build selection; see gsplat_gfx1200.patch.
+ import glob
+ import os
+ import os.path as osp
+@@ -23,6 +24,9 @@ def get_rocm_arch():
+     Returns:
+         str: The gfx code (e.g., 'gfx942', 'gfx90a'), or 'gfx942' as fallback.
+     """
++    requested_arch = os.getenv("PYTORCH_ROCM_ARCH")
++    if requested_arch:
++        return requested_arch.split(";")[0]
+     try:
+         # Run rocminfo command
+         result = subprocess.run(

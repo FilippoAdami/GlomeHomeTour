@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+build/
+*.egg-info/
+.venv*/
+*.so
+current_scene/
+output/
+experiments/
+dn-splatter/
+lpipsPyTorch/
+submodules/

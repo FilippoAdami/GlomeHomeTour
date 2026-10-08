@@ -19,6 +19,10 @@ class TunablesTest {
         assertEquals(PhotometricGate.MEAN_MIN, Tunables.photometricMeanMin, 1e-6f)
         assertEquals(PhotometricGate.MEAN_MAX, Tunables.photometricMeanMax, 1e-6f)
         assertEquals(CaptureActivity.DECIMATION_STRIDE, Tunables.decimationStride)
+        assertEquals(true, Tunables.keyframeFilterEnabled)
+        assertEquals(8.0f, Tunables.keyframeMinPerM2, 1e-6f)
+        assertEquals(11.0f, Tunables.keyframeMaxPerM2, 1e-6f)
+        assertEquals(0.35f, Tunables.qualityGateBlurThreshold, 1e-6f)
     }
 
     /** VoxelGrid compares cosines in its hot loop; a stale cos means the angle setting does nothing. */
@@ -44,6 +48,14 @@ class TunablesTest {
         assertEquals(1f, v.photometricMeanMin, 1e-6f)
         assertEquals(255f, v.photometricMeanMax, 1e-6f)
         assertEquals(1L, v.decimationStride)
+        val vClamped = Tunables.Values.clamped(
+            parallaxDeg = 25f, coveragePercent = 85f, lumaMin = 40f, lumaMax = 250f, stride = 8L,
+            keyframeFilterEnabled = false, keyframeMinPerM2 = 0.5f, keyframeMaxPerM2 = 100f, qualityGateBlurThreshold = 1.5f,
+        )
+        assertEquals(false, vClamped.keyframeFilterEnabled)
+        assertEquals(1.0f, vClamped.keyframeMinPerM2, 1e-6f)
+        assertEquals(50.0f, vClamped.keyframeMaxPerM2, 1e-6f)
+        assertEquals(0.95f, vClamped.qualityGateBlurThreshold, 1e-6f)
     }
 
     /** An inverted gate ([min] above [max]) rejects every frame of the scan. */
@@ -59,11 +71,16 @@ class TunablesTest {
     fun `in range input is kept`() {
         val v = Tunables.Values.clamped(
             parallaxDeg = 30f, coveragePercent = 75f, lumaMin = 20f, lumaMax = 240f, stride = 6L,
+            keyframeFilterEnabled = true, keyframeMinPerM2 = 9.5f, keyframeMaxPerM2 = 12.5f, qualityGateBlurThreshold = 0.40f,
         )
         assertEquals(30f, v.parallaxMinDeg, 1e-6f)
         assertEquals(0.75f, v.coverageCompleteFraction, 1e-6f)
         assertEquals(20f, v.photometricMeanMin, 1e-6f)
         assertEquals(240f, v.photometricMeanMax, 1e-6f)
         assertEquals(6L, v.decimationStride)
+        assertEquals(true, v.keyframeFilterEnabled)
+        assertEquals(9.5f, v.keyframeMinPerM2, 1e-6f)
+        assertEquals(12.5f, v.keyframeMaxPerM2, 1e-6f)
+        assertEquals(0.40f, v.qualityGateBlurThreshold, 1e-6f)
     }
 }

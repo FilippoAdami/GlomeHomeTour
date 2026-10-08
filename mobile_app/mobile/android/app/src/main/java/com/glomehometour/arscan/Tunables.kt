@@ -35,6 +35,12 @@ object Tunables {
     /** Keep 1 of every N gate-passed frames. README §4/§5 wants this inside [6, 10]. */
     @Volatile var decimationStride: Long = CaptureActivity.DECIMATION_STRIDE
 
+    /** Pre-COLMAP keyframe filtering toggle and density bounds (keyframes per m² of floor area). */
+    @Volatile var keyframeFilterEnabled: Boolean = true
+    @Volatile var keyframeMinPerM2: Float = 8.0f
+    @Volatile var keyframeMaxPerM2: Float = 11.0f
+    @Volatile var qualityGateBlurThreshold: Float = 0.35f
+
     fun load(context: Context) {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         parallaxMinDeg = prefs.getFloat(KEY_PARALLAX_DEG, VoxelGrid.PARALLAX_MIN_DEG)
@@ -42,6 +48,10 @@ object Tunables {
         photometricMeanMin = prefs.getFloat(KEY_LUMA_MIN, PhotometricGate.MEAN_MIN)
         photometricMeanMax = prefs.getFloat(KEY_LUMA_MAX, PhotometricGate.MEAN_MAX)
         decimationStride = prefs.getLong(KEY_STRIDE, CaptureActivity.DECIMATION_STRIDE)
+        keyframeFilterEnabled = prefs.getBoolean(KEY_KEYFRAME_FILTER_ENABLED, true)
+        keyframeMinPerM2 = prefs.getFloat(KEY_KEYFRAME_MIN_M2, 8.0f)
+        keyframeMaxPerM2 = prefs.getFloat(KEY_KEYFRAME_MAX_M2, 11.0f)
+        qualityGateBlurThreshold = prefs.getFloat(KEY_QUALITY_BLUR_THRESHOLD, 0.35f)
     }
 
     /**
@@ -57,6 +67,10 @@ object Tunables {
         val photometricMeanMin: Float,
         val photometricMeanMax: Float,
         val decimationStride: Long,
+        val keyframeFilterEnabled: Boolean = true,
+        val keyframeMinPerM2: Float = 8.0f,
+        val keyframeMaxPerM2: Float = 11.0f,
+        val qualityGateBlurThreshold: Float = 0.35f,
     ) {
         companion object {
             /** [coveragePercent] is operator-facing 0-100, not the 0-1 fraction used internally. */
@@ -66,14 +80,25 @@ object Tunables {
                 lumaMin: Float,
                 lumaMax: Float,
                 stride: Long,
+                keyframeFilterEnabled: Boolean = true,
+                keyframeMinPerM2: Float = 8.0f,
+                keyframeMaxPerM2: Float = 11.0f,
+                qualityGateBlurThreshold: Float = 0.35f,
             ): Values {
                 val min = lumaMin.coerceIn(1f, 120f)
+                val kMin = keyframeMinPerM2.coerceIn(1.0f, 30.0f)
+                val kMax = keyframeMaxPerM2.coerceIn(kMin, 50.0f)
+                val blurThresh = qualityGateBlurThreshold.coerceIn(0.05f, 0.95f)
                 return Values(
                     parallaxMinDeg = parallaxDeg.coerceIn(5f, 60f),
                     coverageCompleteFraction = (coveragePercent / 100f).coerceIn(0.1f, 1f),
                     photometricMeanMin = min,
                     photometricMeanMax = lumaMax.coerceIn(min + 1f, 255f),
                     decimationStride = stride.coerceIn(1L, 60L),
+                    keyframeFilterEnabled = keyframeFilterEnabled,
+                    keyframeMinPerM2 = kMin,
+                    keyframeMaxPerM2 = kMax,
+                    qualityGateBlurThreshold = blurThresh,
                 )
             }
         }
@@ -86,6 +111,10 @@ object Tunables {
             .putFloat(KEY_LUMA_MIN, values.photometricMeanMin)
             .putFloat(KEY_LUMA_MAX, values.photometricMeanMax)
             .putLong(KEY_STRIDE, values.decimationStride)
+            .putBoolean(KEY_KEYFRAME_FILTER_ENABLED, values.keyframeFilterEnabled)
+            .putFloat(KEY_KEYFRAME_MIN_M2, values.keyframeMinPerM2)
+            .putFloat(KEY_KEYFRAME_MAX_M2, values.keyframeMaxPerM2)
+            .putFloat(KEY_QUALITY_BLUR_THRESHOLD, values.qualityGateBlurThreshold)
             .apply()
         load(context)
     }
@@ -101,4 +130,8 @@ object Tunables {
     private const val KEY_LUMA_MIN = "photometric_mean_min"
     private const val KEY_LUMA_MAX = "photometric_mean_max"
     private const val KEY_STRIDE = "decimation_stride"
+    private const val KEY_KEYFRAME_FILTER_ENABLED = "keyframe_filter_enabled"
+    private const val KEY_KEYFRAME_MIN_M2 = "keyframe_min_m2"
+    private const val KEY_KEYFRAME_MAX_M2 = "keyframe_max_m2"
+    private const val KEY_QUALITY_BLUR_THRESHOLD = "quality_blur_threshold"
 }

@@ -16,24 +16,17 @@ collection of modules (no nested subpackages) importing each other by bare modul
 
 ```
 backend/
-├── 00_ingestion/           # Step 1: package loading, quality gate, parallax dedup, VIO pose sync
-│                            # -> filtered images + transforms.json per scene
-├── 01_poses_refinment/      # Step 2: COLMAP triangulation against fixed ARCore poses,
+├── 00_ingestion/           # Ingestion (quality gate, blur/exposure filter, VIO sync)
+│                            #   moved directly on-device in mobile app; retained for standalone tools
+├── 01_poses_refinment/      # Step 1: COLMAP triangulation against fixed ARCore poses,
 │                            #   drift/Sampson diagnostics -> sparse/ reconstruction
-├── 02_depth_estimation/      # Step 3: Depth Anything 3 inference + surfel-cloud initialization
-│                            #   from the refined poses/images
-├── 03_2DGS_training/           # Step 4: 2DGS training/rendering/metrics, merged in from the
-│   ├── scene/ utils/ arguments/   #   standalone 2DGS project; reads COLMAP sparse/ (stage 2)
-│   ├── gaussian_renderer/         #   or transforms.json (stage 3)
-│   └── submodules/                #   diff-surfel-rasterization (HIP kernels, ROCm/RDNA4)
-├── 04_2DGS_refinment/         # Step 5: material learning & 2DGS refinement (unfilled; also
-│                            #   holds compressor/pbr_shader/planar_reflections/export_standard_ply
-│                            #   parked by the 2DGS merge — see its README)
-├── 05_2DGS_to_mesh/             # Step 6: mesh extraction (SuGaR-like) from the trained 2DGS scene
-│   ├── exporters/                  #   CAD (.dxf/.ifc) and glTF exporters
-│   └── kernels/                     #   surfel-projection compute kernels
-├── 06_mesh_refinment/             # Step 7: mesh refinement (unfilled)
-├── Utilities/                       # cross-stage tooling, not itself a pipeline step
+├── 02_depth_estimation/      # Step 2: Depth Anything 3 + StableNormal inference + surfel-cloud
+│                            #   initialization from refined poses/images
+├── 03_FastGS_DNSplatter/    # Step 3: gsplat training with depth and normal supervision
+│   ├── scene/                #   shared COLMAP readers for stages 01 and 02
+│   ├── gsplat_train.py       #   training and checkpoint export
+│   └── gsplat_gfx1200.patch #   ROCm 7.1 / gfx1200 kernel changes for AMD gsplat
+├── Utilities/               # cross-stage tooling, not itself a pipeline step
 │   ├── pipeline_paths.py               # sys.path bootstrap (see below)
 │   ├── run_full_benchmark.py            # end-to-end benchmark spanning multiple stages
 │   ├── worker/                           # RQ queue consumer / GPU job runner
@@ -189,22 +182,22 @@ backend/scenes/<scene_name>/
 
 ## 7. One-Command Pipeline (`run_pipeline.py`)
 
-A compressed capture in, a trained 2DGS scene out:
+A compressed capture in, a trained gsplat scene and TSDF mesh out:
 
 ```bash
-.venv/bin/python run_pipeline.py scenes/Bedroom2.zip
+.venv/bin/python run_pipeline.py scenes/Bedroom3.zip
 ```
 
-Work happens in a temporary `current_scene/` workspace. Six steps, each also a
+Work happens in a temporary `current_scene/` workspace. Pipeline steps, each also a
 standalone script that can be run, inspected and resumed on its own:
 
 | # | Step | Script | Writes |
 | --- | --- | --- | --- |
-| 0 | extract | `Utilities/step_extract.py` | `images/`, `transforms.json` |
-| 1 | filter_quality | `00_ingestion/step_filter_quality.py` | `discarded/` |
-| 2 | colmap | `01_poses_refinment/step_colmap.py` | `sparse/0/`, `colmap_diagnostics/` |
-| 3 | depth | `02_depth_estimation/step_depth.py` | `02_depth_estimation/depth/depth_maps/`, `depth/points3D_depth.ply` |
-| 4 | train | `03_2DGS_training/step_train.py` | `03_2DGS_training/2dgs/point_cloud/iteration_10000/` |
+| 0 | extract | `Utilities/step_extract.py` | `images/`, `00_ingestion/transforms.json` |
+| 1 | colmap | `01_poses_refinment/step_colmap.py` | `sparse/0/`, `01_poses_refinment/colmap_diagnostics/` |
+| 2 | depth | `02_depth_estimation/step_depth.py` | `02_depth_estimation/depth/depth_maps/`, `normal_maps/`, `points3D_depth.ply` |
+| 3 | train | `03_FastGS_DNSplatter/step_train.py` | `current_scene/03_FastGS_DNSplatter/checkpoint.pt`, `point_cloud/iteration_22000/` |
+| 4 | mesh | `04_3DGS_to_mesh/step_mesh.py` | `current_scene/04_3DGS_to_mesh/mesh.ply`, `mesh.json` |
 
 **Nothing is deleted mid-pipeline.** A frame a step rejects is *moved* into that
 step's own discard folder together with its camera entry, so every discard folder
@@ -222,42 +215,34 @@ Each step writes `<name>_log.txt`, `<name>_stats.json` and updates `pipeline_sta
 --keep-workspace        # keep current_scene/ on success
 ```
 
-Out of scope here: `04_2DGS_refinment/`, `05_2DGS_to_mesh/`, floorplan, panorama,
-and API/queue wiring.
-
 ## 8. Execution & Verification
 
-### Running Stage 2 (COLMAP pose refinement)
-Requires a system COLMAP binary on `PATH`, and `03_2DGS_training/` on `PYTHONPATH` (these
-scripts import `scene.colmap_loader` from there):
+### Running Stage 1 (COLMAP pose refinement)
+Requires a system COLMAP binary on `PATH`, and `03_FastGS_DNSplatter/` on `PYTHONPATH`:
 
 ```bash
-PYTHONPATH=backend/03_2DGS_training backend/.venv/bin/python3 \
+PYTHONPATH=backend/03_FastGS_DNSplatter backend/.venv/bin/python3 \
     backend/01_poses_refinment/convert_transforms_to_colmap.py \
     -s backend/scenes/<scene_name>/GS_input --refine_poses --diagnostics
 ```
 
-### Running 2DGS Model Training
-To train the progressive multi-scale 2DGS radiance field on AMD ROCm:
+### Running gsplat training and mesh extraction
+
+Stage 03 uses [AMD gsplat](https://github.com/AMD-Ecosystem/gsplat) with a local gfx1200 HIP patch. Build it in the backend ROCm environment, then run training and mesh extraction:
+
 ```bash
-cd backend/03_2DGS_training && ../.venv/bin/python3 train.py \
-    -s ../scenes/<scene_name>/GS_input \
-    -m ../scenes/<scene_name>/2DGS_results \
-    --iterations 30000
+backend/03_FastGS_DNSplatter/install_gsplat_gfx1200.sh backend/.venv/bin/python
+backend/.venv/bin/python backend/03_FastGS_DNSplatter/step_train.py --workspace backend/current_scene
+backend/.venv/bin/python backend/04_3DGS_to_mesh/step_mesh.py --workspace backend/current_scene
 ```
 
-`train_room.py` wraps this in a 4-stage progressive-resolution schedule (1/8 -> 1/4 -> 1/2 ->
-full). `render.py` renders held-out views and extracts a TSDF mesh; `metrics.py` reports
-PSNR/SSIM/LPIPS. Full flag reference: `03_2DGS_training/PIPELINE_NOTES.md`.
+The stage 03 checkpoint format changed to `checkpoint.pt`; old FastGS checkpoints need retraining. Stage 04 writes `04_3DGS_to_mesh/mesh.ply` and `mesh.json`. `--resolution 4 --frame-stride 8` lowers memory use for mesh extraction. The optional CPU refinement step is:
 
-The two native extensions must be built once into the venv first:
 ```bash
-backend/.venv/bin/pip install --no-build-isolation \
-    backend/03_2DGS_training/submodules/diff-surfel-rasterization \
-    backend/03_2DGS_training/submodules/simple-knn
+backend/.venv/bin/python backend/04_3DGS_to_mesh/refine_mesh.py --workspace backend/current_scene
 ```
-`--no-build-isolation` is required: an isolated PEP 517 env cannot see the ROCm torch build,
-and these extensions import `torch` at setup time.
+
+See [stage 03 setup](03_FastGS_DNSplatter/README.md) for ROCm details and license provenance.
 
 ### Running Automated Test Suites
 ```bash
@@ -267,4 +252,3 @@ backend/.venv/bin/pytest backend/tests/
 # Validate shared interchange schemas
 backend/.venv/bin/python3 shared/schemas/validate.py
 ```
-

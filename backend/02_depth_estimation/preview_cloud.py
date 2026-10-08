@@ -23,7 +23,7 @@ from PIL import Image
 from plyfile import PlyData
 
 _backend_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_backend_dir / "03_2DGS_training"))
+sys.path.insert(0, str(_backend_dir / "03_FastGS_DNSplatter"))
 from scene.colmap_loader import (  # noqa: E402
     qvec2rotmat, read_extrinsics_binary, read_intrinsics_binary)
 

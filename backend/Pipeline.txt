@@ -1,33 +1,22 @@
 Entire pipeline trial run
-00_ingestion [V]
-    -.zip extraction & /current_scene/ folder creation [V]
-    - images filtering for blur and exposure issues [V]
-    - images rotation to match portrait view [V]
+[Extract / Mobile Ingestion] [V]
+    - Ingestion (quality gate, blur/exposure filter, orientation) moved directly into mobile application
+    - step_extract.py unpacks capture archive into workspace /current_scene/
 01_poses_refinment [V]
     - transforms.json to colmap /sparse/0 folder [V]
     - unusable frames and poses removal (unregistered + Sampson filter) [V]
     - sparse cloud voxel dedup + outliers removal [V]
-    - floor count and scene's sqared footage [V]
-02_depth_estimation
+    - floor count and scene's squared footage [V]
+02_depth_estimation [V]
     - scene-size guided keyframe selection (COLMAP-track covisibility) [V]
-    - DA3 multiview depth estimation (N=6 K=3 res=756x420 - 13.4min) [V]
+    - DA3 multiview depth estimation (N=6 K=3 res=756x420) [V]
     - RGB-Guided Edge Filtering & RANSAC scale-shift alignment [V]
-    - Hybrid Dual-Guided Surfel Backprojection (Overexposure Masking + Cross-View Carving)
-    - Normal Tube Collapse ( 1.5 cm Normal-Aligned Deduplication) [V]
-    - surfel budget safety net [V] (no-op below max_surfels; escalates the voxel grid in 5mm
-      steps, capped at 10-20cm depending on path, to bring the cloud under budget -- does not
-      abort the stage, it accepts whatever count the capped voxel size lands on)
-03_2DGS_training
-    - depth-cloud install: step 4's 02_depth_estimation/depth/points3D_depth.ply is copied over
-      sparse/0/points3D.ply (COLMAP's original backed up as points3D_colmap.ply first) -- that
-      swap, not a train.py flag, is the entire mechanism by which the depth prior reaches
-      training; the loader (readColmapSceneInfo) is untouched [V]
-    - Stage 1: r=2 training, iter 0-1,000 -- densification ON (grad threshold 0.0004, warmup to
-      iter 200), poses locked [V]
-    - Stage 2: r=1 (full res) training, iter 1,000-3,000, chained via --start_checkpoint --
-      densification ON (stricter grad threshold 0.0002), opacity reset disabled (a depth-seeded
-      cloud is dense enough that a reset would prune ~85% of it), TrackGS pose refinement
-      (--refine_poses_during_training, pose_lr 1e-4, lambda_track 0.1) [V]
-    - continuous decoupled pruning (every 100 iters, both stages): opacity < 0.05 cull, view-evidence floater cull (>=8 frustums, <=2 observations)
-    - sensor saturation/glare masking on photometric + normal + dist + multiview losses throughout
-    - checkpoint + point_cloud.ply emitted per stage (03_2DGS_training/2dgs/point_cloud/iteration_<N>/point_cloud.ply, 03_2DGS_training/2dgs/chkpnt<N>.pth) [V]
+    - StableNormal unit surface normal map generation [V]
+    - Hybrid Dual-Guided Surfel Backprojection (Overexposure Masking + Cross-View Carving) [V]
+    - Normal Tube Collapse (1.5 cm Normal-Aligned Deduplication) [V]
+    - surfel budget safety net [V]
+03_FastGS_DNSplatter [V]
+    - depth-cloud install: step 2's 02_depth_estimation/depth/points3D_depth.ply copied to sparse/0/points3D.ply (COLMAP backup in points3D_colmap.ply) [V]
+    - FastGS accelerated 3D Gaussian Splatting training with multiview-aware tile/sample selection [V]
+    - DN-Splatter geometric supervision: DAv3 depth map loss (Pearson/GLDN) + StableNormal normal loss [V]
+    - output routing: checkpoint + point_cloud.ply saved to 03_FastGS_DNSplatter/output/point_cloud/iteration_<N>/point_cloud.ply [V]

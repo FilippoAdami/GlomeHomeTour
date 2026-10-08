@@ -150,6 +150,34 @@ class ScanGalleryActivity : AppCompatActivity() {
         return entry.fallbackZipFile?.inputStream()
     }
 
+    private fun openFirstFrame(entry: ScanEntry): InputStream? {
+        val zipStream = openZip(entry)
+        if (zipStream != null) return zipStream
+        entry.legacyFallbackDir?.let { dir ->
+            val imgFile = File(dir, "images/frame_00000.jpg")
+            if (imgFile.isFile) return imgFile.inputStream()
+            val anyImg = File(dir, "images").listFiles()?.firstOrNull { it.name.endsWith(".jpg") }
+            if (anyImg != null) return anyImg.inputStream()
+        }
+        if (entry.legacyFlatMediaSession) {
+            val prefix = "${entry.sessionName}_images_"
+            val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.Files.FileColumns._ID),
+                "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?",
+                arrayOf("Documents/${DatasetWriter.ALBUM}/", "$prefix%.jpg"),
+                "${MediaStore.Files.FileColumns.DISPLAY_NAME} ASC",
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val id = cursor.getLong(0)
+                    return contentResolver.openInputStream(ContentUris.withAppendedId(uri, id))
+                }
+            }
+        }
+        return null
+    }
+
     private fun loadScans(): List<ScanEntry> {
         val bySession = LinkedHashMap<String, ScanEntry>()
         collectFromMediaStore(bySession)
@@ -250,15 +278,13 @@ class ScanGalleryActivity : AppCompatActivity() {
         // Legacy loose-file sessions (captured before finish() zipped, or crashed mid-capture)
         // have no zip to read a frame out of; show no thumbnail rather than an empty grey box
         // that reads as a failed load.
-        if (entry.mediaZipId != null || entry.fallbackZipFile != null) {
-            val thumbnail = ImageView(this).apply {
-                scaleType = ImageView.ScaleType.CENTER_CROP
-                setBackgroundColor(color(R.color.action_disabled))
-                layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
-            }
-            row.addView(thumbnail)
-            ThumbnailFetcher.load(entry.sessionName, thumbnail) { openZip(entry) }
+        val thumbnail = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(color(R.color.action_disabled))
+            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
         }
+        row.addView(thumbnail)
+        ThumbnailFetcher.load(entry.sessionName, thumbnail) { openFirstFrame(entry) }
 
         val info = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -277,38 +303,86 @@ class ScanGalleryActivity : AppCompatActivity() {
         })
         row.addView(info)
 
-        // Right side toggles between the "Delete" label and a progress bar + percentage while a
-        // deletion is in flight, so a bulk delete of a large session doesn't look like a freeze.
+        val isProcessed = entry.mediaZipId != null || entry.fallbackZipFile != null
+
         val actionArea = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(dp(100), LinearLayout.LayoutParams.WRAP_CONTENT)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
         }
+
+        val processLabel = TextView(this).apply {
+            text = if (isProcessed) "Processed" else "Process"
+            setTextColor(color(if (isProcessed) R.color.action_ready else R.color.action))
+            textSize = 13f
+            isClickable = !isProcessed
+            isEnabled = !isProcessed
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { rightMargin = dp(14) }
+        }
+
         val deleteLabel = TextView(this).apply {
             text = "Delete"
             setTextColor(color(R.color.danger))
             textSize = 13f
-            gravity = Gravity.END
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
             )
         }
+
         val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             visibility = android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            layoutParams = LinearLayout.LayoutParams(dp(110), LinearLayout.LayoutParams.WRAP_CONTENT)
         }
+
         val progressText = TextView(this).apply {
             setTextColor(color(R.color.text_faint))
             textSize = 11f
             visibility = android.view.View.GONE
             setPadding(dp(6), 0, 0, 0)
         }
+
+        actionArea.addView(processLabel)
         actionArea.addView(deleteLabel)
         actionArea.addView(progressBar)
         actionArea.addView(progressText)
+
+        processLabel.setOnClickListener {
+            if (isProcessed) return@setOnClickListener
+            processLabel.visibility = android.view.View.GONE
+            deleteLabel.visibility = android.view.View.GONE
+            progressBar.visibility = android.view.View.VISIBLE
+            progressText.visibility = android.view.View.VISIBLE
+
+            processScan(entry, { percent ->
+                progressBar.progress = percent
+                progressText.text = "$percent%"
+            }) { success ->
+                progressBar.visibility = android.view.View.GONE
+                progressText.visibility = android.view.View.GONE
+                if (success) {
+                    processLabel.text = "Processed"
+                    processLabel.setTextColor(color(R.color.action_ready))
+                    processLabel.isClickable = false
+                    processLabel.isEnabled = false
+                    processLabel.visibility = android.view.View.VISIBLE
+                    deleteLabel.visibility = android.view.View.VISIBLE
+                    reload()
+                } else {
+                    processLabel.visibility = android.view.View.VISIBLE
+                    deleteLabel.visibility = android.view.View.VISIBLE
+                    android.widget.Toast.makeText(this, "Processing failed", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+
         deleteLabel.setOnClickListener {
             confirmDelete(entry) {
+                processLabel.visibility = android.view.View.GONE
                 deleteLabel.visibility = android.view.View.GONE
                 progressBar.visibility = android.view.View.VISIBLE
                 progressText.visibility = android.view.View.VISIBLE
@@ -321,6 +395,21 @@ class ScanGalleryActivity : AppCompatActivity() {
         row.addView(actionArea)
 
         return row
+    }
+
+    private fun processScan(entry: ScanEntry, onProgress: (Int) -> Unit, onComplete: (Boolean) -> Unit) {
+        Thread {
+            val accessor = if (entry.legacyFallbackDir != null) {
+                ScanProcessor.DirectoryFileAccessor(entry.legacyFallbackDir!!)
+            } else {
+                ScanProcessor.MediaStoreFlatAccessor(this, entry.sessionName)
+            }
+            val processor = ScanProcessor(this)
+            val success = processor.process(entry.sessionName, accessor) { percent ->
+                runOnUiThread { onProgress(percent) }
+            }
+            runOnUiThread { onComplete(success) }
+        }.start()
     }
 
     private fun confirmDelete(entry: ScanEntry, onConfirmed: () -> Unit) {

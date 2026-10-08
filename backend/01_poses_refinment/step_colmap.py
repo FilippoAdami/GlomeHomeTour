@@ -160,67 +160,11 @@ def clean_point_cloud(sparse_dir: Path, ctx: StepContext) -> None:
 def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostics_dir: Path,
                  discard_dir: Path, ctx: StepContext, matcher: str = "sequential") -> None:
     scene = load_scene(manifest_dir, images_root=workspace)
-    raw_names = set(scene.names)
-    raw_total = len(raw_names)
-    ctx.note(f"Input scene has {raw_total} frames")
-
-    # 1. Dynamic keyframe selector (pre-COLMAP ARCore keyframe selection)
-    t0_select = time.time()
-    sharpness_scores = None
-    fq_stats_path = manifest_dir / "filter_quality_stats.json"
-    if fq_stats_path.exists():
-        try:
-            fq_stats = json.loads(fq_stats_path.read_text())
-            per_frame = fq_stats.get("per_frame_sharpness", {})
-            if per_frame:
-                sharpness_scores = [float(per_frame.get(Path(f["file_path"]).name, 25.0)) for f in scene.frames]
-        except Exception:
-            sharpness_scores = None
-
-    if sharpness_scores is None:
-        try:
-            import cv2
-            from quality_gate import QualityGate
-            qg = QualityGate()
-            sharpness_scores = []
-            img_root = workspace / "images"
-            for f in scene.frames:
-                img_p = img_root / Path(f["file_path"]).name
-                if img_p.exists():
-                    im = cv2.imread(str(img_p))
-                    rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-                    sharpness_scores.append(float(qg.compute_blur_score(rgb)))
-                else:
-                    sharpness_scores.append(0.0)
-        except Exception as e:
-            ctx.note(f"Could not compute sharpness scores for keyframe selection: {e}")
-            sharpness_scores = None
-
-    selected_frames, kf_meta = select_keyframes_arcore(scene.frames, sharpness_scores=sharpness_scores)
-    ctx.metric("arcore_keyframe_selection", kf_meta)
-    extent = kf_meta.get("extent", {})
-    path = workspace / STAGE_DIRNAME
-    write_scene_size_txt(workspace=path, extent=extent)
-    area = extent.get("total_floor_area", "?")
-    ctx.note(f"ARCore room estimated floors total area {area} m²")
-
-    selected_names = {Path(f["file_path"]).name for f in selected_frames}
-    non_kf_names = raw_names - selected_names
-    if non_kf_names:
-        ctx.note(f"Pre-COLMAP keyframe selection: keeping {len(selected_names)}/{raw_total} frames "
-                 f"(budget [{kf_meta.get('budget', [0, 0])[0]}..{kf_meta.get('budget', [0, 0])[1]}])")
-        non_kf_dir = stage_dir / "colmap_non_keyframes"
-        split_scene(manifest_dir, non_kf_dir, non_kf_names, images_root=workspace)
-    t_select = time.time() - t0_select
-    update_pipeline_stats(workspace, "dynamic_keyframe_selector", t_select, raw_total)
-
-    # Re-read scene containing only selected keyframes for COLMAP
-    scene = load_scene(manifest_dir, images_root=workspace)
     all_names = set(scene.names)
     total = len(all_names)
-    ctx.note(f"Running COLMAP on {total} frames")
+    ctx.note(f"Running COLMAP on all {total} frames from capture")
 
-    # 2. COLMAP processing (feature matching, manual model, triangulation, pose prior mapper)
+    # 1. COLMAP processing (feature matching, manual model, triangulation, pose prior mapper)
     t0_colmap = time.time()
     run_colmap(workspace, diagnostics_dir, ctx, matcher)
     t_colmap = time.time() - t0_colmap
@@ -308,10 +252,11 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     t_cloud = time.time() - t0_cloud
     update_pipeline_stats(workspace, "pointcloud_refinement", t_cloud, kept)
 
-    # 5. Scene alignment & diagnostics
+    # 4. Scene alignment & diagnostics
     t0_align = time.time()
     extent = scene_extent(sparse_dir, transforms_path=manifest_dir / "transforms.json")
     (stage_dir / "scene_extent.json").write_text(json.dumps(extent, indent=2))
+    write_scene_size_txt(workspace=stage_dir, extent=extent)
     ctx.metric("scene_extent", extent)
     aligned = extent["aligned"]
     x, y, z = aligned["point_cloud"]["size_m"]

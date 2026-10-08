@@ -66,8 +66,8 @@ $$u = \frac{n \times \text{ref}}{\|n \times \text{ref}\|}, \quad v = n \times u$
   - `<workspace>/sparse/0/`: COLMAP model (poses + points).
   - `<workspace>/transforms.json`: Camera intrinsics.
 - **Output:**
-  - `<workspace>/depth/depth_maps/*.npy`: Dense float32 metric depth maps in meters.
-  - `<workspace>/depth/normal_maps/*.npy`: Dense float32 polished unit surface normal maps.
+  - `<workspace>/depth/depth_maps/*.npy`: Dense float16 metric depth maps in meters.
+  - `<workspace>/depth/normal_maps/*.npy`: Dense float16 polished unit surface normal maps.
   - `<workspace>/depth/depth_images/*.jpg`: Side-by-side RGB and colorized depth diagnostics.
   - `<workspace>/depth/normal_images/*.jpg`: Side-by-side RGB and colorized surface normal diagnostics.
   - `<workspace>/depth/poses_da3.npz`: Aligned camera extrinsics and intrinsics.

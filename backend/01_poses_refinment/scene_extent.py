@@ -180,13 +180,8 @@ def scene_extent(sparse_dir: Path, up_axis: int = 1, transforms_path: Path | Non
     trimmed = cloud.points[np.all((cloud.points >= lo) & (cloud.points <= hi), axis=1)]
 
     north_deg = estimate_north_heading_deg(sparse_dir, transforms_path)
-    if north_deg is not None:
-        # Align scene so +X is North (which is 90 deg clockwise from +Y_plot)
-        align_deg = float((90.0 - north_deg) % 360.0)
-        alignment_mode = "compass"
-    else:
-        align_deg = horizontal_align_deg(trimmed, up_axis)
-        alignment_mode = "wall"
+    align_deg = horizontal_align_deg(trimmed, up_axis)
+    alignment_mode = "wall"
 
     points_aligned = rotate_horizontal(cloud.points, align_deg, up_axis)
     trimmed_aligned = rotate_horizontal(trimmed, align_deg, up_axis)

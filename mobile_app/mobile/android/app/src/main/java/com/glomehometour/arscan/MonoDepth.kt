@@ -11,17 +11,19 @@ import java.nio.FloatBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Monocular depth as the geometry source when the ARCore Depth API isn't available.
+ * ============================================================================
+ * GHOST CODE / DEPRECATED (Do Not Use in Production)
  *
- * Measured on the target device (Redmi Note 10S, "rosemary"): isDepthModeSupported returns false
- * for both AUTOMATIC and RAW_DEPTH_ONLY, and the feature point cloud returns 0 points for whole
- * seconds at a time. Neither can fill a voxel grid, which is why coverage sat at 0% with nothing
- * to draw. This is the fallback the project architecture always called for -- a deliberately
- * small on-device depth model, guidance only, never exported.
+ * This on-device monocular depth ONNX model (ZipDepth) was an experimental fallback
+ * superseded on 2026-09-02 by FeatureParallaxTracker's closed-form multi-view
+ * 2-ray geometric triangulation.
  *
- * The model, the ONNX wiring and the ARCore-anchored metric fit are lifted from
- * mobile_depth_map/, where they were validated on this same phone.
+ * All runtime density scoring, parallax verification, and relocalization are now
+ * handled directly by FeatureParallaxTracker. This file is retained solely as an
+ * archival reference and MUST NOT be instantiated or submitted to during capture.
+ * ============================================================================
  */
+@Deprecated("Superseded by FeatureParallaxTracker multi-view ray triangulation")
 
 /**
  * Sensor pixels <-> model input pixels for a rotate-to-upright, centre-crop-to-square, scale-to-

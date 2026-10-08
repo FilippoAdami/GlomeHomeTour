@@ -223,7 +223,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             writeText("trajectory.csv", "text/csv", csv)
             writeText("coverage_summary.json", "application/json", summaryJson)
             writeText("focus_metadata.json", "application/json", focusJson)
-            onDone(zipAndCleanup())
+            onDone(destination)
         }
     }
 
