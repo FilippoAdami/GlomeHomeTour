@@ -1,0 +1,741 @@
+{
+  "mesh_sha256": "7d120117127b2c71ce5e9589dfa0cb503f013f9eadbb81bb2bac9cbd6c51d63f",
+  "method": "Manual inspection of frozen RGB crops and masks, then shared visible mesh support. Names apply only to tracks containing the anchor observation; a source ID alone is insufficient.",
+  "annotations": [
+    {
+      "source_id": 1,
+      "frame": "frame_00905",
+      "category": "wooden_ceiling"
+    },
+    {
+      "source_id": 2,
+      "frame": "frame_00715",
+      "category": "bed_cover"
+    },
+    {
+      "source_id": 3,
+      "frame": "frame_00397",
+      "category": "storage_cabinet"
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00698",
+      "category": "framed_wall_decoration"
+    },
+    {
+      "source_id": 5,
+      "frame": "frame_00975",
+      "category": "wall"
+    },
+    {
+      "source_id": 10,
+      "frame": "frame_00645",
+      "category": "books"
+    },
+    {
+      "source_id": 14,
+      "frame": "frame_00463",
+      "category": "wooden_floor"
+    },
+    {
+      "source_id": 17,
+      "frame": "frame_01344",
+      "category": "hanging_bag"
+    },
+    {
+      "source_id": 18,
+      "frame": "frame_01346",
+      "category": "wall_rack"
+    },
+    {
+      "source_id": 29,
+      "frame": "frame_00098",
+      "category": "curtain"
+    },
+    {
+      "source_id": 32,
+      "frame": "frame_00114",
+      "category": "radiator"
+    },
+    {
+      "source_id": 51,
+      "frame": "frame_00221",
+      "category": "figurine"
+    },
+    {
+      "source_id": 58,
+      "frame": "frame_00221",
+      "category": "figurine_base"
+    },
+    {
+      "source_id": 64,
+      "frame": "frame_00232",
+      "category": "paper_sign"
+    },
+    {
+      "source_id": 65,
+      "frame": "frame_00243",
+      "category": "photo_collage"
+    },
+    {
+      "source_id": 72,
+      "frame": "frame_00283",
+      "category": "storage_box"
+    },
+    {
+      "source_id": 159,
+      "frame": "frame_00879",
+      "category": "storage_box"
+    },
+    {
+      "source_id": 92,
+      "frame": "frame_00360",
+      "category": "boxing_bag"
+    },
+    {
+      "source_id": 251,
+      "frame": "frame_00455",
+      "category": "boxing_bag"
+    },
+    {
+      "source_id": 59,
+      "frame": "frame_00221",
+      "category": "wall_mounted_device"
+    },
+    {
+      "source_id": 73,
+      "frame": "frame_00283",
+      "category": "wooden_frame"
+    },
+    {
+      "source_id": 93,
+      "frame": "frame_00808",
+      "category": "suspension_chain"
+    },
+    {
+      "source_id": 95,
+      "frame": "frame_00430",
+      "category": "hanging_bag"
+    },
+    {
+      "source_id": 104,
+      "frame": "frame_00948",
+      "category": "wooden_beam"
+    },
+    {
+      "source_id": 108,
+      "frame": "frame_00429",
+      "category": "wooden_beam"
+    },
+    {
+      "source_id": 109,
+      "frame": "frame_00476",
+      "category": "bed_frame"
+    },
+    {
+      "source_id": 115,
+      "frame": "frame_00463",
+      "category": "wooden_floor"
+    },
+    {
+      "source_id": 120,
+      "frame": "frame_00519",
+      "category": "wooden_beam"
+    },
+    {
+      "source_id": 123,
+      "frame": "frame_00693",
+      "category": "stuffed_toy"
+    },
+    {
+      "source_id": 125,
+      "frame": "frame_00604",
+      "category": "nightstand"
+    },
+    {
+      "source_id": 128,
+      "frame": "frame_00617",
+      "category": "electrical_fitting"
+    },
+    {
+      "source_id": 132,
+      "frame": "frame_00653",
+      "category": "wall_hook"
+    },
+    {
+      "source_id": 139,
+      "frame": "frame_01341",
+      "category": "wooden_floor"
+    },
+    {
+      "source_id": 140,
+      "frame": "frame_00104",
+      "category": "decorative_object"
+    },
+    {
+      "source_id": 146,
+      "frame": "frame_01193",
+      "category": "desk_lamp"
+    },
+    {
+      "source_id": 154,
+      "frame": "frame_00807",
+      "category": "suspension_chain"
+    },
+    {
+      "source_id": 163,
+      "frame": "frame_00847",
+      "category": "wooden_beam"
+    },
+    {
+      "source_id": 165,
+      "frame": "frame_00879",
+      "category": "wall_shelf"
+    },
+    {
+      "source_id": 170,
+      "frame": "frame_00942",
+      "category": "wall_board"
+    },
+    {
+      "source_id": 171,
+      "frame": "frame_00950",
+      "category": "paper_chart"
+    },
+    {
+      "source_id": 174,
+      "frame": "frame_00983",
+      "category": "framed_wall_decoration"
+    },
+    {
+      "source_id": 179,
+      "frame": "frame_00983",
+      "category": "wooden_beam"
+    },
+    {
+      "source_id": 183,
+      "frame": "frame_01007",
+      "category": "fan"
+    },
+    {
+      "source_id": 184,
+      "frame": "frame_01006",
+      "category": "fan_base"
+    },
+    {
+      "source_id": 185,
+      "frame": "frame_01054",
+      "category": "radiator"
+    },
+    {
+      "source_id": 188,
+      "frame": "frame_01155",
+      "category": "rug"
+    },
+    {
+      "source_id": 189,
+      "frame": "frame_01100",
+      "category": "wall_map"
+    },
+    {
+      "source_id": 192,
+      "frame": "frame_01098",
+      "category": "light_fixture"
+    },
+    {
+      "source_id": 193,
+      "frame": "frame_01129",
+      "category": "office_chair"
+    },
+    {
+      "source_id": 194,
+      "frame": "frame_01159",
+      "category": "desk"
+    },
+    {
+      "source_id": 204,
+      "frame": "frame_01173",
+      "category": "computer_tower"
+    },
+    {
+      "source_id": 205,
+      "frame": "frame_01155",
+      "category": "storage_box"
+    },
+    {
+      "source_id": 206,
+      "frame": "frame_01169",
+      "category": "globe"
+    },
+    {
+      "source_id": 209,
+      "frame": "frame_01149",
+      "category": "wall_cross"
+    },
+    {
+      "source_id": 210,
+      "frame": "frame_01144",
+      "category": "wall_shelf"
+    },
+    {
+      "source_id": 219,
+      "frame": "frame_01193",
+      "category": "speaker"
+    },
+    {
+      "source_id": 220,
+      "frame": "frame_01169",
+      "category": "computer_mouse"
+    },
+    {
+      "source_id": 225,
+      "frame": "frame_01193",
+      "category": "monitor"
+    },
+    {
+      "source_id": 226,
+      "frame": "frame_01187",
+      "category": "paper_chart"
+    },
+    {
+      "source_id": 229,
+      "frame": "frame_01193",
+      "category": "monitor_stand"
+    },
+    {
+      "source_id": 230,
+      "frame": "frame_01193",
+      "category": "wall_clock"
+    },
+    {
+      "source_id": 253,
+      "frame": "frame_01373",
+      "category": "blanket"
+    },
+    {
+      "source_id": 62,
+      "frame": "frame_00246",
+      "category": "fabric_object"
+    },
+    {
+      "source_id": 70,
+      "frame": "frame_00272",
+      "category": "fabric_object"
+    },
+    {
+      "source_id": 42,
+      "frame": "frame_00157",
+      "category": "radiator"
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00560",
+      "category": "framed_wall_decoration"
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00983",
+      "category": "framed_document"
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_01169",
+      "category": "paper_portrait",
+      "mask_index": 0
+    },
+    {
+      "frame": "frame_00083",
+      "mask_index": 5,
+      "source_id": 23,
+      "category": "dumbbells"
+    },
+    {
+      "frame": "frame_00083",
+      "mask_index": 4,
+      "source_id": 27,
+      "category": "bench_frame"
+    },
+    {
+      "frame": "frame_00797",
+      "mask_index": 8,
+      "source_id": 148,
+      "category": "towel"
+    }
+  ],
+  "same_object": [
+    {
+      "source_ids": [
+        72,
+        159
+      ],
+      "evidence_frames": [
+        "frame_00283",
+        "frame_00879"
+      ],
+      "reason": "Same orange/black storage box, strong shared visible surface, no distinct co-visible masks.",
+      "observations": [
+        {
+          "frame": "frame_00283",
+          "mask_index": 7,
+          "source_id": 72
+        },
+        {
+          "frame": "frame_00879",
+          "mask_index": 6,
+          "source_id": 159
+        }
+      ]
+    },
+    {
+      "source_ids": [
+        92,
+        251
+      ],
+      "evidence_frames": [
+        "frame_00360",
+        "frame_00455"
+      ],
+      "reason": "Same suspended boxing bag body, strong shared visible surface, no distinct co-visible masks.",
+      "observations": [
+        {
+          "frame": "frame_00360",
+          "mask_index": 0,
+          "source_id": 92
+        },
+        {
+          "frame": "frame_00455",
+          "mask_index": 0,
+          "source_id": 251
+        }
+      ]
+    },
+    {
+      "source_ids": [
+        62,
+        70
+      ],
+      "evidence_frames": [
+        "frame_00246",
+        "frame_00272"
+      ],
+      "min_similarity": 0.5,
+      "min_overlap": 0.8,
+      "reason": "The same yellow fabric object behind the wooden frame; RGB appearance/placement and repeated shared surface establish identity despite weak source prototypes.",
+      "observations": [
+        {
+          "frame": "frame_00246",
+          "mask_index": 1,
+          "source_id": 62
+        },
+        {
+          "frame": "frame_00272",
+          "mask_index": 0,
+          "source_id": 70
+        }
+      ]
+    },
+    {
+      "source_ids": [
+        32,
+        42
+      ],
+      "evidence_frames": [
+        "frame_00114",
+        "frame_00157"
+      ],
+      "min_similarity": 0.6,
+      "min_overlap": 0.7,
+      "reason": "The same radiator below the window, with repeated shared surface; the radiator near the fan remains separate.",
+      "observations": [
+        {
+          "frame": "frame_00114",
+          "mask_index": 0,
+          "source_id": 32
+        },
+        {
+          "frame": "frame_00157",
+          "mask_index": 2,
+          "source_id": 42
+        }
+      ]
+    }
+  ],
+  "part_of": [
+    {
+      "parent_source": 51,
+      "child_source": 58,
+      "frame": "frame_00221",
+      "reason": "The base is physically attached beneath the figurine; retain its separately identifiable part track.",
+      "role": "base"
+    },
+    {
+      "parent_source": 183,
+      "child_source": 184,
+      "frame": "frame_01006",
+      "reason": "The base belongs to the fan above it, with its part identity retained.",
+      "parent_mask_index": 3,
+      "child_mask_index": 4,
+      "role": "base"
+    },
+    {
+      "parent_source": 225,
+      "child_source": 229,
+      "frame": "frame_01193",
+      "reason": "The monitor stand supports the monitor; keep the separately identified part.",
+      "role": "stand"
+    },
+    {
+      "parent_source": 183,
+      "child_source": 183,
+      "parent_mask_index": 3,
+      "child_mask_index": 2,
+      "frame": "frame_01006",
+      "reason": "The central hub and surrounding grille are separately masked parts of the same fan, verified in the RGB crop.",
+      "role": "central_hub"
+    }
+  ],
+  "rejected_merges": [
+    {
+      "source_ids": [
+        13,
+        27
+      ],
+      "reason": "Shared projection alone does not establish the same object; RGB crops cover different furnishings."
+    },
+    {
+      "source_ids": [
+        28,
+        159
+      ],
+      "reason": "Books and their storage box remain separately identifiable."
+    },
+    {
+      "source_ids": [
+        21,
+        139
+      ],
+      "reason": "Skirting and floor are ambiguous parts; proximity/overlap alone is insufficient."
+    }
+  ],
+  "anchor_archive_sha256": {
+    "frame_00098_final.npz": "6824b1c571d5ea1e17df6554a079d96b0d30b582be9f09f4aa1d5a5b6dc6b376",
+    "frame_00104_final.npz": "0130d1abd9ae76c4529403698abcef95cd6576907c00683fef945568d67b3e77",
+    "frame_00114_final.npz": "49c664affc215f9191cae5ab8d6b0c7ef5647556c2f2af7e763bf991aaa4c878",
+    "frame_00157_final.npz": "43d1989c4033cb4b90687fee37518f02d4006dc6c6132468c3b9748e4b3728ab",
+    "frame_00221_final.npz": "8e03e847222d7170121ecdc141a1e537666273034f98b304f925d20eaca84820",
+    "frame_00232_final.npz": "2af10eb27000e2d436ad66a68d3bfa5cc4f84940b8ea7850ced63b0f1f9e077b",
+    "frame_00243_final.npz": "26ca7dd90a01882daa0b7b8be3dae84e1ede94acec235c9531acbdbcae984e10",
+    "frame_00246_final.npz": "a1e74ae53b7ed4c44fac28da0a017b9c17d1cb28c4e0833dcd624cff904cb371",
+    "frame_00272_final.npz": "3dc25b578b2989429c6c48439e0bd9fe0e34150c401ee1fe31cf71b053694910",
+    "frame_00283_final.npz": "52e149076acc9470a30ad03d409646cdd5bf007146561f3e9b3aee31a7eabe63",
+    "frame_00360_final.npz": "507e52efe6d329031d396c508eb36fad88e19cda3e6d14920980bb0d86797d58",
+    "frame_00397_final.npz": "a1365bb1ae59435f1663d06018cd8bd7985ccd33014372328c25706f11a5bd3e",
+    "frame_00429_final.npz": "502da54891395291d3cbd7e3f5d34cd26e2705b8e41f442f0431981fb2965d6c",
+    "frame_00430_final.npz": "44725c8dd83065b5f079fa969dd3ae9e8a46288d03f6a738a5e7be31d92114e3",
+    "frame_00455_final.npz": "b666419d86bd67f65167660504ac92a1b288102dc2d1bd843a04930f9037caf6",
+    "frame_00463_final.npz": "8ef960190607923097acd9e869e5f2895af5f97fd930f014a98f0e8d9a7a6e83",
+    "frame_00476_final.npz": "ff1b907198459bd8cbc5fab5cd9a352dd0ebd6f0a849cf2957a36c4c12300be3",
+    "frame_00519_final.npz": "5d88facc1a7e7523fce7b55e1b0304c23083dc9e61f27d7305bf595af2cea5dd",
+    "frame_00604_final.npz": "013b44c506b55ccc2ef7e1bd9e296bfe5037a3a9d24a7f21b41503ae045f4eaa",
+    "frame_00617_final.npz": "cf37412338a47d68e157ba1f8db75072b9771df7567f47f4af1accf191e672d4",
+    "frame_00645_final.npz": "d4dc87f274bbcd8021b367d2a9ca414d8e96db1d77233d19680a8a5262c51fee",
+    "frame_00653_final.npz": "594ada1ee9bffd79f5eadd1eba5ae0ad927499c9dbaece5ec98cbb37e0057949",
+    "frame_00693_final.npz": "25bde7c15b52062a0b4e172c231dc2279be834c10fc01efd907030d6c2184605",
+    "frame_00698_final.npz": "cbf61d1ed486384fb5f787dddf78e4e5bbcd43a2c8a3c107db22cdc8e8821fa4",
+    "frame_00715_final.npz": "1e73dc0ed5482e0beb9a47e61b7efc839043c10f8cf22e1920bf4bce47349725",
+    "frame_00807_final.npz": "5ebc71d67beca45c1107e58a8e8599db46d4aca6e9df6b4a20114aaef996a995",
+    "frame_00808_final.npz": "6095a6931e035e1e3c6295548b4b5234442f1be53136da7b63616e5c5a5313d5",
+    "frame_00847_final.npz": "d67c62c70ca39638a8301668bb9022bb67ee4d0c6f61365ddcf75710bd4d9243",
+    "frame_00879_final.npz": "b0582133708ce78059affcf2a1bea8ced13ff99cf7833503a245599a8e801d5c",
+    "frame_00905_final.npz": "aa7b5bfb4b8da438449f934b036aea19802cd6bab219beb495c3ef0ab878abca",
+    "frame_00942_final.npz": "3f5b98aeccc82f964dea91178321a26300fe826cde9778bb54b861b7e018fb40",
+    "frame_00948_final.npz": "8ebb9341b968b61c6e8c8de61ad5b867e5a98ad345fbe6021a078da01cca11a6",
+    "frame_00950_final.npz": "30bb241d8b9a762aab78e9a7790db0dbbf5d800b8f71e236fd60d985bf78fccd",
+    "frame_00969_final.npz": "e4be3c233efce8cd37dd9f555b029d06540d3078efe9b5f7be529c58130ede13",
+    "frame_00975_final.npz": "0c7274c5440f14b8306f224d0369c65a5546dc67241398e9a589d6a53a8e7621",
+    "frame_00983_final.npz": "d9c59adc9dc246fde9ed8f74ea614816db21344538508edc4ea9ddd8ddd24d60",
+    "frame_01006_final.npz": "d1ce5cb10c40a128d072a2eea503bee86bc7a631a3f9f709180ada0191cde4c9",
+    "frame_01007_final.npz": "6411d30cf950551d44651f2a3bc03d20c81e81f3fe874527b3bdab96ab48a386",
+    "frame_01054_final.npz": "9cdd484b68f9fa24df8ca5a8d90a5663b015e6c6a0daed57b517a2b63e9a2d59",
+    "frame_01098_final.npz": "2cc58f425821dc9c38745d2f0bdf9b1fd697f275e594a805e9db274d463daca6",
+    "frame_01100_final.npz": "dcbc0c67565066b48eee439a2f2d4f0be74432649e3cedcc5ae0593020b6b72f",
+    "frame_01129_final.npz": "39f6df0451d4bea9f56a23bbb6d8a256ad82209c36be2ce4dde049cfb8648ae1",
+    "frame_01144_final.npz": "9a2deefd62daa83eac955f6655fded1f4441298c65739990d08a587e663066f6",
+    "frame_01149_final.npz": "d5a9cd860dfa1e6d87dac3c361e325a4f49c24555a3d3612e273d647cc90683c",
+    "frame_01155_final.npz": "96955bf800e103559bede4dfa3f25b7c3177eaafa148beb9031c87e335cf1bc1",
+    "frame_01159_final.npz": "2552fe09424f1ca7075cb57870ce662ac7b8566207d354583630f849eff7fbcc",
+    "frame_01169_final.npz": "b65347bda20e5ef23330fe37cdcb955c25ae722103338de7e15f37549491c650",
+    "frame_01173_final.npz": "d94dcefd12d7d16f0bacfeb8d8a77a44f317a001c1e2672b87cbfe6185099d07",
+    "frame_01187_final.npz": "232dcd4f0786d8c4a5e01e83fcf5f2d6629ebf69dcf02481fda07ad1299056fb",
+    "frame_01193_final.npz": "5fe53704c8030ee4f20d7cc61fe1d6df0d47137489da3ec5b4f6fccc63c08623",
+    "frame_01341_final.npz": "517c87c4c61df50d3b540255d01654dbe23bc82c6fef3c82f196228eb1706dcf",
+    "frame_01344_final.npz": "b410d974820b2d54cda9e2a38a5d0e0eeb816c17afbc92db7b9259941f24497d",
+    "frame_01346_final.npz": "6ee45043d20376ef979c0621643096ab21f8f49fcce4ca0e40882d2da95ae4ee",
+    "frame_01373_final.npz": "5e0f7eb231703804d967757abfa7f147c578986ec5833f4e2ee87fe4d051c477",
+    "frame_00560_final.npz": "08f442b6bb768024946465e6b8468077aef5bedf15f8d99c0e0137c7222ef502",
+    "frame_00417_final.npz": "e98e6acbbdf36d25783938bed5ed9605f87ad9aa3e6a1f155842ef824645a840",
+    "frame_00083_final.npz": "56d345e69c8304cbb2e57b326b95c44ccbdbb431dc83839d85097f31a9ff17c6",
+    "frame_00797_final.npz": "6b55a64f8252ae343744f3752810cefe8501296d669f18fd2597641c55f597d7"
+  },
+  "split_evidence": [
+    {
+      "source_id": 4,
+      "frame": "frame_00969",
+      "reason": "One archived mask covers two distinct framed pictures, alongside a third picture."
+    },
+    {
+      "source_id": 128,
+      "frame": "frame_00617",
+      "reason": "Switch and outlet are spatially separate electrical fixtures."
+    },
+    {
+      "source_id": 219,
+      "frame": "frame_01193",
+      "reason": "Two separate speakers flank the monitor in the same view."
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00560",
+      "mask_index": 1,
+      "reason": "Two separately framed paintings on the same wall."
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00983",
+      "mask_index": 2,
+      "reason": "Two separately framed team pictures/certificates."
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_01169",
+      "mask_index": 0,
+      "reason": "Three separate paper portraits pinned to the wall."
+    }
+  ],
+  "distinct_masks": [
+    {
+      "source_id": 4,
+      "frame": "frame_00969",
+      "mask_index": 0
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00969",
+      "mask_index": 1
+    },
+    {
+      "source_id": 128,
+      "frame": "frame_00617",
+      "mask_index": 4
+    },
+    {
+      "source_id": 219,
+      "frame": "frame_01193",
+      "mask_index": 4
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00560",
+      "mask_index": 1
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_00983",
+      "mask_index": 2
+    },
+    {
+      "source_id": 4,
+      "frame": "frame_01169",
+      "mask_index": 0
+    }
+  ],
+  "disconnected_same_object": [
+    {
+      "observations": [
+        {
+          "frame": "frame_00360",
+          "mask_index": 0,
+          "source_id": 92
+        },
+        {
+          "frame": "frame_00807",
+          "mask_index": 1,
+          "source_id": 92
+        }
+      ],
+      "min_similarity": 0.95,
+      "reason": "Same blue cylindrical boxing bag and black strap/chain hardware in opposite RGB views. Registered cached-depth native extents overlap; missing back-surface geometry prevents shared-face association. This associates identity only and does not invent surfaces."
+    },
+    {
+      "observations": [
+        {
+          "frame": "frame_00360",
+          "mask_index": 0,
+          "source_id": 92
+        },
+        {
+          "frame": "frame_00455",
+          "mask_index": 0,
+          "source_id": 251
+        }
+      ],
+      "min_similarity": 0.65,
+      "reason": "Same suspended blue bag body and black hardware in reviewed RGB views 360 and 455. After calibrated depth rejects foreground/background mesh hits, view455 has no supported surface. Associate its catalog identity with the observed bag without inventing geometry; normal shared-face association is unavailable."
+    },
+    {
+      "observations": [
+        {
+          "frame": "frame_00455",
+          "mask_index": 0,
+          "source_id": 251
+        },
+        {
+          "frame": "frame_00417",
+          "mask_index": 0,
+          "source_id": 251
+        }
+      ],
+      "min_similarity": 0.95,
+      "reason": "The blue suspended bag body appears at the left image edge in417 and fully in455, beside the same white/orange cabinets. The isolated partial-view mesh fragments lie within the reviewed front/back bag-body extent; shared-face overlap is unavailable. This joins one physical body, not another object with the same source prototype."
+    }
+  ],
+  "unresolved_masks": [
+    {
+      "frame": "frame_01169",
+      "mask_index": 10,
+      "source_id": 4,
+      "reason": "Three adjacent paper forms share one connected frozen mask. Individual identities cannot be established from source prototypes and current shared-face evidence; this entry is a group hypothesis, not a confirmed single physical object."
+    },
+    {
+      "frame": "frame_00221",
+      "mask_index": 8,
+      "source_id": 4,
+      "reason": "Frozen views change granularity between an individual printed photograph and its surrounding photo collage. This track cannot establish the parent/part identities of the collage; keep the source provenance and group uncertainty instead of asserting a single physical object."
+    },
+    {
+      "frame": "frame_00083",
+      "mask_index": 5,
+      "source_id": 23,
+      "reason": "The frozen mask groups two adjacent dumbbells. Their group can be tracked across views, but the incomplete geometry and connected masks do not establish separate stable identities for the individual dumbbells; do not claim this group is one physical object."
+    }
+  ],
+  "object_extents": [
+    {
+      "observations": [
+        {
+          "frame": "frame_00360",
+          "mask_index": 0,
+          "source_id": 92
+        },
+        {
+          "frame": "frame_00807",
+          "mask_index": 1,
+          "source_id": 92
+        }
+      ],
+      "complete_object_coverage": true,
+      "reason": "Complementary front/back RGB views show the entire suspended blue bag body. Registered cached positive points bound that body in native 3D. Far floor/wall/ceiling fragments cannot be its disconnected pieces; withhold only this body identity outside the union extent padded by20cm. Keep geometry and competing labels; chains remain separately identifiable. The opaque blue body can also be contradicted by repeated unobscured background silhouettes; transparent fabric or unreviewed objects cannot authorize that rule.",
+      "opaque_surface": true
+    }
+  ]
+}

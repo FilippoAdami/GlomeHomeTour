@@ -1,0 +1,14 @@
+[Unit]
+Description=Glome Home Tour Local Backend and Web App
+After=network.target
+
+[Service]
+Type=simple
+User=monday
+WorkingDirectory=/home/monday/Desktop/GlomeHomeTour
+ExecStart=/home/monday/Desktop/GlomeHomeTour/start_glome.sh
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

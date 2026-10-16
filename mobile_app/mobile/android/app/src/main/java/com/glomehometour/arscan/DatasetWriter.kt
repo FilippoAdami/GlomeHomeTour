@@ -155,6 +155,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         afMode: Int = 0,
         focalLengthMm: Float = 0f,
         compassHeadingDeg: Float? = null,
+        numPoints: Int = 0,
     ): Boolean {
         if (queued.get() >= MAX_QUEUED) {
             droppedQueue.incrementAndGet()
@@ -182,6 +183,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             DatasetFormat.Keyframe(
                 name, matrix, timestampNs, fx, fy, cx, cy,
                 focusDistanceDiopters, afState, afMode, focalLengthMm, compassHeadingDeg,
+                numPoints = numPoints,
             )
         )
         queued.incrementAndGet()

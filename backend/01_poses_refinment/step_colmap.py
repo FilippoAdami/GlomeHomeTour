@@ -68,6 +68,103 @@ MAX_ROTATION_DRIFT_DEG = 10.0
 MAX_TRANSLATION_DRIFT_M = 0.25
 VOXEL_SIZE_M = 0.01
 OUTLIER_NEIGHBOURS, OUTLIER_STD_RATIO = 20, 2.0
+MIN_FEATURE_PRUNE = 30          # Catastrophic: <30 registered 3D points are pruned
+MIN_FEATURE_LOCK = 100          # Weak: 30..99 registered 3D points kept, but poses locked to ARCore VIO
+MAX_FEATURE_REJECT_FRAC = 0.10  # Refuse wholesale deletion if >10% of frames have <30 pts
+
+
+def count_registered_features(sparse_dir: Path) -> dict[str, int]:
+    """Parse sparse/0/images.txt and return image_name -> count of triangulated 3D points."""
+    images_txt = sparse_dir / "images.txt"
+    if not images_txt.exists():
+        return {}
+    counts = {}
+    lines = [l for l in images_txt.read_text().splitlines() if not l.startswith("#")]
+    i = 0
+    while i < len(lines):
+        parts = lines[i].split()
+        i += 1
+        if len(parts) < 10:
+            continue
+        name = parts[9]
+        obs_parts = lines[i].split() if i < len(lines) else []
+        i += 1
+        reg_count = 0
+        if obs_parts:
+            for k in range(2, len(obs_parts), 3):
+                if int(obs_parts[k]) != -1:
+                    reg_count += 1
+        counts[Path(name).name] = reg_count
+    return counts
+
+
+def lock_poses_to_arcore(sparse_dir: Path, manifest_dir: Path, lock_names: set[str], ctx: StepContext) -> int:
+    """Reset poses of lock_names in sparse/0/ to ARCore VIO poses, preventing BA distortion."""
+    if not lock_names:
+        return 0
+    transforms_path = manifest_dir / "transforms.json"
+    if not transforms_path.exists():
+        return 0
+    transforms = json.loads(transforms_path.read_text())
+
+    from convert_transforms_to_colmap import OPENGL_TO_OPENCV
+    from scene.colmap_loader import rotmat2qvec
+
+    name_to_pose = {}
+    for f in transforms.get("frames", []):
+        base = Path(f["file_path"]).name
+        c2w = np.array(f["transform_matrix"]) @ OPENGL_TO_OPENCV
+        w2c = np.linalg.inv(c2w)
+        qvec = rotmat2qvec(w2c[:3, :3])
+        tvec = w2c[:3, 3]
+        name_to_pose[base] = (qvec, tvec)
+
+    images_txt = sparse_dir / "images.txt"
+    lines = images_txt.read_text().splitlines()
+    new_lines = []
+    i = 0
+    locked_count = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#") or not line.strip():
+            new_lines.append(line)
+            i += 1
+            continue
+        parts = line.split()
+        if len(parts) >= 10:
+            name = parts[9]
+            base = Path(name).name
+            obs_line = lines[i + 1] if i + 1 < len(lines) else ""
+            if (name in lock_names or base in lock_names) and base in name_to_pose:
+                qvec, tvec = name_to_pose[base]
+                image_id = parts[0]
+                camera_id = parts[8]
+                new_line = (f"{image_id} {qvec[0]:.8f} {qvec[1]:.8f} {qvec[2]:.8f} {qvec[3]:.8f} "
+                            f"{tvec[0]:.8f} {tvec[1]:.8f} {tvec[2]:.8f} {camera_id} {name}")
+                new_lines.append(new_line)
+                new_lines.append(obs_line)
+                locked_count += 1
+            else:
+                new_lines.append(line)
+                new_lines.append(obs_line)
+            i += 2
+        else:
+            new_lines.append(line)
+            i += 1
+
+    images_txt.write_text("\n".join(new_lines) + "\n")
+
+    # Remove existing .bin files before model_converter so it converts the updated .txt -> .bin
+    for bin_file in sparse_dir.glob("*.bin"):
+        bin_file.unlink()
+
+    cmd = ["colmap", "model_converter",
+           "--input_path", str(sparse_dir),
+           "--output_path", str(sparse_dir),
+           "--output_type", "BIN"]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, env=subprocess_env({"QT_QPA_PLATFORM": "xcb"}))
+    ctx.note(f"Locked {locked_count} weak frame(s) (30..99 pts) to original ARCore VIO poses in sparse/0/")
+    return locked_count
 
 
 def run_colmap(workspace: Path, diagnostics_dir: Path, ctx: StepContext,
@@ -231,11 +328,32 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
                  f"(>30 deg or >80 cm): {sorted(drift_outliers)}")
         keep = keep - drift_outliers
 
+    # Feature count gating (prune catastrophic < 30 pts; lock weak 30..99 pts to ARCore VIO)
+    feature_counts = count_registered_features(sparse_dir)
+    catastrophic_frames = set()
+    if feature_counts:
+        catastrophic_frames = {n for n, c in feature_counts.items() if c < MIN_FEATURE_PRUNE and n in keep}
+        if len(catastrophic_frames) / max(1, len(registered)) > MAX_FEATURE_REJECT_FRAC:
+            ctx.note(f"REFUSED to drop frames with <{MIN_FEATURE_PRUNE} features: "
+                     f"{len(catastrophic_frames)}/{len(registered)} frames exceed {MAX_FEATURE_REJECT_FRAC:.0%} cap.")
+            catastrophic_frames = set()
+        elif catastrophic_frames:
+            ctx.note(f"Feature count filter: dropping {len(catastrophic_frames)} frame(s) with <{MIN_FEATURE_PRUNE} "
+                     f"triangulated points: {sorted(catastrophic_frames)}")
+            keep = keep - catastrophic_frames
+
     drop = sorted(all_names - keep)
     kept, rejected = split_scene(manifest_dir, discard_dir, drop, images_root=workspace)
     if drop:
         with ctx.timer("prune_model"):
             prune_model(str(sparse_dir), set(drop))
+
+    # Lock surviving weak frames (MIN_FEATURE_PRUNE <= count < MIN_FEATURE_LOCK) back to ARCore VIO
+    surviving_weak = {n for n, c in feature_counts.items() if MIN_FEATURE_PRUNE <= c < MIN_FEATURE_LOCK and n in keep}
+    locked_count = 0
+    if surviving_weak:
+        locked_count = lock_poses_to_arcore(sparse_dir, manifest_dir, surviving_weak, ctx)
+
     t_sampson = time.time() - t0_sampson
     update_pipeline_stats(workspace, "sampson_error_gating_and_model_pruning", t_sampson, total)
 
@@ -243,6 +361,10 @@ def colmap_step(workspace: Path, manifest_dir: Path, stage_dir: Path, diagnostic
     ctx.metric("discarded", rejected)
     ctx.metric("kept_pct", round(100.0 * kept / max(1, total), 1))
     ctx.metric("discarded_unregistered", sorted(unregistered)[:50])
+    if feature_counts:
+        ctx.metric("feature_counts_median", float(np.median(list(feature_counts.values()))))
+    ctx.metric("catastrophic_feature_frames", len(catastrophic_frames))
+    ctx.metric("weak_feature_frames_locked", locked_count)
     ctx.note(f"Kept {kept}/{total} ({100.0 * kept / max(1, total):.1f}%), "
              f"moved {rejected} to {discard_dir}/")
 

@@ -124,3 +124,21 @@ def test_max_rotation_preserved_during_pruning():
         ang = rotation_angle_deg(rots[k], rots[k + 1])
         assert ang <= 16.5, f"Rotation jump {ang:.1f} deg between {sel[k]['file_path']} and {sel[k+1]['file_path']} exceeds 16 deg limit"
 
+
+def test_feature_aware_dynamic_filtering():
+    # 50 frames with varying num_points; median is ~200
+    frames = [_make_dummy_frame(i, i * 0.05, 1.4, 0.0) for i in range(50)]
+    for i, f in enumerate(frames):
+        f["num_points"] = 200
+
+    # Frame 10 is very feature-sparse (15 points), Frame 11 is feature-rich (250 points)
+    frames[10]["num_points"] = 15
+    frames[11]["num_points"] = 250
+
+    sel, meta = select_keyframes_arcore(frames, target_count=25)
+    sel_paths = [f["file_path"] for f in sel]
+
+    # Frame 10 should be avoided in favor of frame 11
+    assert "images/000010.jpg" not in sel_paths
+    assert "images/000011.jpg" in sel_paths
+

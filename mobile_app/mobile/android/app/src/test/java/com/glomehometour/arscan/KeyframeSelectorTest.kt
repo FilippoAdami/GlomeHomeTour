@@ -99,4 +99,22 @@ class KeyframeSelectorTest {
         assertTrue("Should swap candidate frame 1 for sharper neighbor frame 2",
             result.selectedIndices.contains(2) || result.sharpnessSwappedCount > 0)
     }
+
+    @Test
+    fun `neighbor swapping prefers feature-rich temporal neighbors`() {
+        val selector = KeyframeSelector(minTranslationM = 0.30f)
+        val frames = mutableListOf<KeyframeSelector.PoseFrame>()
+        // Frame 0: at 0.0m, healthy features (300 points)
+        frames.add(KeyframeSelector.PoseFrame(0, "f0.jpg", identityMatrix(0f, 0f, 0f), 25.0f, numPoints = 300))
+        // Frame 1: at 0.35m, feature-sparse (20 points)
+        frames.add(KeyframeSelector.PoseFrame(1, "f1.jpg", identityMatrix(0.35f, 0f, 0f), 25.0f, numPoints = 20))
+        // Frame 2: at 0.37m (2 cm away from frame 1), feature-rich (320 points)
+        frames.add(KeyframeSelector.PoseFrame(2, "f2.jpg", identityMatrix(0.37f, 0f, 0f), 25.0f, numPoints = 320))
+        // Frame 3: at 0.80m, healthy features (300 points)
+        frames.add(KeyframeSelector.PoseFrame(3, "f3.jpg", identityMatrix(0.80f, 0f, 0f), 25.0f, numPoints = 300))
+
+        val result = selector.selectKeyframes(frames)
+        assertTrue("Should swap feature-deficient candidate frame 1 for feature-rich neighbor frame 2",
+            result.selectedIndices.contains(2))
+    }
 }

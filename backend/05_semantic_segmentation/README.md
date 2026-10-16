@@ -1,5 +1,147 @@
 # 06c: class-agnostic instance pipeline
 
+## Frozen-input 3D panoptic reconstruction
+
+`run_panoptic3d.py` reads existing 2D results and geometry. It never calls a
+segmentation, embedding, depth, or normal model. Earlier commands in this
+document describe the separate 2D experiments and are **not** prerequisites
+to rerun for this 3D stage.
+
+From the repository root:
+
+```bash
+OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 backend/.venv/bin/python \
+  backend/06c_semantic_segmentation/run_panoptic3d.py \
+  --run-name panoptic3d_general
+
+backend/.venv/bin/python -m pytest backend/tests/test_panoptic3d.py backend/tests/test_panoptic3d_baseline.py -q
+```
+
+The command above uses no scene review. `--review-file` is opt-in human
+evidence; the supplied scene review includes object-specific relationships
+and a bag extent, so reviewed results are not proof of generalization.
+The inspection snapshots are research checkpoints, not an accepted release.
+
+Use a new `panoptic3d_*` run name. Outputs stay in that new direct child of
+`current_scene/06c_semantic_segmentation/`; existing inputs and the old three
+3D result directories are read-only. Collection refuses an existing run.
+`--phase evidence`, `--phase solve`, and `--phase evaluate` allow completing
+individual stages. Solve/evaluate operate on the saved evidence in the named
+run; retain separate run directories when comparing revisions.
+
+The evaluated candidate is `panoptic3d_v13`. Its fixed-set source IoU improves
+0.3866 → 0.6102, with unchanged frozen inputs and no new holes. **Acceptance
+remains pending:** protected bag instance IoU declines 0.7816 → 0.7527, and
+fixed-set instance boundary F1 declines slightly. See the
+[full report](../../agents_files/artifacts/panoptic3d/FINAL_REPORT.md), including
+per-object results and the remaining contour/geometry limitations.
+
+Required frozen inputs:
+
+- `inputs/{mesh.ply,T_mesh_to_raw.npy,images/,sparse/0/}`.
+- `full362_final_pipeline/npz_data/*_final.npz`: original-resolution `labels`,
+  `masks`, `ids`, and cached `embeddings`. Repeated IDs are permitted and are
+  not semantic class names or proof that two masks are one physical object.
+- Evaluation uses the preserved `mesh_objects_step3/mesh_cleaned_no_floaters.ply`.
+- Optional `02_depth_estimation/depth/{poses_da3.npz,depth_alignment.json,depth_maps/}`.
+  Cached intrinsics/poses must match; unreliable frames are excluded. Zero
+  depth is unknown. Depth is metric camera Z. The mesh-to-raw transform is
+  applied once to raycasting geometry; exports retain native mesh coordinates.
+  A reliable registered map with positive depth on at least half a mask also
+  supplies a conservative 0.5–99.5 percentile depth extent padded by 20 cm.
+  Unknown rays outside it abstain even if mesh-based calibration fails.
+  This extent never authorizes deletion; completeness records it as uncertain
+  geometry rather than a precise missing surface.
+
+The evidence combines visible face correspondences, symmetric mask-boundary
+distance, incidence angles, competing observations, and calibrated depth
+agreement. Near-identical camera poses share a view budget. Small masks and
+boundaries receive extra rays, not a geometry deletion rule. Source masks start
+as observation hypotheses; shared visible surface and cached appearance link
+them across views, subject to co-visible separation constraints. Disconnected
+mesh pieces can retain one identity. The frozen embedding export contains
+source-level prototypes, so it cannot independently distinguish repeated
+physical objects within one source ID.
+Frames with fewer than 100 triangulated COLMAP tracks are treated as weak poses,
+using the existing pose-stage weak-support threshold. Their observations remain
+in the catalog and diagnostic projections, but provide no surface votes, region
+transfer geometry, depth calibration, or cleanup evidence. Raw detected keypoints
+are not counted as pose support. Per-frame support counts and trusted-camera
+metrics are saved separately; weak-only entries have `unreliable_pose` completeness.
+
+The optional scene review provides visually established categories, aliases,
+and part relations with anchor frames. Mesh and anchor-archive SHA-256 checks
+prevent applying it to changed inputs. Alias exceptions name exact reviewed observations and still require shared
+geometric and cached appearance evidence; other occurrences of those source IDs
+do not inherit the exception. Explicit disconnected-object associations need
+recorded visual evidence. Rejected merges remain enforced constraints. Names apply only to tracks containing the
+reviewed observation; other tracks retain their source IDs and uncertain
+category. Reviewed multi-object masks seed separate regions; shared visible
+triangles transfer these regions to other views. Unmatched regions stay separate
+and uncertain. Parts retain their track IDs beneath one physical object ID.
+An optional reviewed `object_extents` record may bound an already established
+identity using complementary views that show the complete object. Reliable
+cached points from those exact observations supply the union of native 3D
+0.5–99.5 percentile bounds padded by 20 cm. Only that object's votes outside
+the extent are withheld; competing labels and geometry remain. Partial or
+unreliable views cannot authorize this rule. The scene review uses it for the
+blue bag body, whose false floor/wall fragments otherwise survive mask voting.
+
+A complete-object extent marked `opaque_surface: true` also permits a
+conservative silhouette check. If two independent trusted camera groups show
+that object's assigned face at least 12 pixels inside another object's mask,
+with calibrated depth placing the mesh in free space, its label becomes
+unknown. The object must be observed in each contributing frame. Resolved
+physical identity exempts aliases and parts; a reused source ID does not exempt
+a different object. This check runs after cleanup and never changes geometry
+or deletion eligibility. Conflict counts, original face indices and previous
+labels/confidence make the label abstention reversible. It is not applied to
+transparent, partially observed or unreviewed objects.
+
+Outputs:
+
+| Artifact | Contract |
+| --- | --- |
+| `segmented_mesh.ply` | Exact per-face physical `instance_id`, direct track/`part_id`, and RGB; vertex RGB is only a blended preview. ID 0 is unknown. |
+| `instances/*.ply`, `parts/*.ply` | Physical objects include their reviewed parts; part exports remain separate. Disconnected pieces retain identity; missing geometry produces a catalog entry without an invented mesh. |
+| `instances_manifest.json` | Stable anchor key, numeric instance ID, source IDs, observation provenance, class evidence, part relation, confidence, topology, and reprojection completeness. |
+| `evidence/`, `observation_support.npz`, `instance_votes.npz` | Sparse competing evidence, camera-group support, visibility, depth conflicts, unknown/no-hit pixels. |
+| `face_assignments.npz`, `geometry_audit.npz` | Original face indices, assignments/confidence, uncertain and removed faces; the original mesh reconstructs every edit reversibly. |
+| `object_extent_constraints.json` | Reviewed complete-object anchors, cached 3D bounds, and original face indices where one identity's votes were withheld. |
+| `removed_geometry.ply`, `floater_review.jpg`, `cleanup.json`, `unsupported_components.json` | Removal rule, supporting view counts, disagreements, new boundaries, supported-surface loss, splits, and repairs. |
+| `review_set.json`, `review/*.jpg`, `review/*.npz` | Fixed 16-camera review; frozen 2D, baseline/revised projections, disagreements, and exact mask arrays. |
+| `REPORT.md`, `metrics.json`, `frame_metrics.json`, `baseline_recovery.json`, `baseline_comparison.npz` | Per-object and macro recall/IoU/leakage/boundary scores, small-object results, missing rays, and geometry completeness. |
+| `inputs.json`, `configuration.json`, `scene_review.json` | Input hashes, pose/depth policy, numerical settings, code fingerprints, and applied review evidence. |
+
+Cleanup checks every detached triangle centroid against calibrated cached
+depth. A whole vertex-isolated component is removable only when every face
+has repeated independent free-space evidence and none has agreeing depth.
+Labels projected onto repeatedly contradicted geometry are recorded separately
+from supported surface. Attached or conflicting geometry remains for review;
+no unsupported planar fill or hole repair is invented. New boundary edges are
+checked before export.
+
+Metrics measure agreement with frozen 2D observations, not independent human
+ground truth. Literal source-ID scores accompany object-scoped alias scores. The same static
+(object, source) lookup applies to reference and both predictions; an alias
+cannot turn a different object using the same source ID into a correct prediction.
+Baseline labels come from exact surviving exported triangles and the original
+per-channel palette decoder for unresolved faces; unmatched colors stay unknown.
+Instance metrics are relative to the resolved hypotheses; old components are
+matched using retained geometry, so these scores alone cannot prove physical
+identity correctness. Missing rays and depth-supported missing foreground are
+reported separately from wrong labels. Completeness checks every unambiguous
+full-resolution frozen-mask pixel, including detections missed by the metric lattice.
+Input hashes are captured before evidence accumulation and verified after it,
+before solve/evaluation, and at evaluation completion. Evaluation rejects changed
+solve code fingerprints. Unknown 2D pixels are excluded from
+negative evidence. Fixed review scores and all-camera scores are both needed:
+walls and floors must not conceal failures on small objects. Additional
+`diagnostics/` views illustrate reviewed assemblies and repeated objects without
+changing the fixed 16-camera comparison. Confidence is a weighted evidence
+fraction, not a calibrated probability. Unreviewed within-mask mixtures,
+single-view hypotheses, and missing geometry retain explicit uncertainty.
+
 Inputs are in `../current_scene/06c_semantic_segmentation/inputs/`. Keep each
 stage's outputs under `../current_scene/06c_semantic_segmentation/` in a named
 run directory. The older `06_semantic_segmentation/` is a reference, not a
@@ -364,3 +506,139 @@ The refined $12\times 12$ single-pass pipeline incorporates:
 difficult frames. Grid 8 compiled reached 10.99 FPS; grid 10 alone reached
 9.01 FPS. The extra decoder passes and connected-region work explain the
 remaining drop to 4.30 FPS when gap prompting runs on every frame.
+
+Inspection snapshots (2026-10-13): [current state](../../agents_files/artifacts/panoptic3d/CURRENT_STATE.md) and [baseline/current checkpoint meshes](../../agents_files/artifacts/panoptic3d/inspection_checkpoints_2026-10-13/README.md). The bag-only snapshot has cached validation; full-scene final acceptance remains pending.
+
+## Frozen-prior 3D refinement
+
+[`mesh_prior_refinement.py`](mesh_prior_refinement.py) provides a separate refinement
+workflow for an existing sealed mesh and frozen multi-view source evidence. Source
+IDs are opaque: correction uses evidence, mesh topology, RGB, and geometry, without
+object names, coordinates, structural roles, or prescribed instance counts.
+
+The reviewed sequence is confidence correction with `correct_confident_faces`,
+graph cleanup with `refine_graph_labels`, then a second graph pass supplying the
+pre-correction labels as `geometry_reference_labels`. The reference pass learns
+separate component orientation models from corroborated surfaces; it evaluates
+whole components to preserve local roughness and differently oriented instances.
+Evidence rows and reference labels must match the exact mesh face ordering, and
+view counts must represent independent camera groups. Geometry remains unchanged.
+
+The accepted snapshot is `agents_files/artifacts/projection_refinement/generic_graph_orientations`.
+Open it from the repository with:
+
+```bash
+bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 189
+```
+
+The window title identifies the snapshot. Its source hashes, verification and
+reproduction scripts are preserved with the artifacts. The existing step2/step3
+orchestration has not been switched to this workflow. Accuracy on other scenes
+still requires empirical validation.
+
+An optional final pass, [`wall_orientation_refinement.py`](wall_orientation_refinement.py),
+excludes horizontal triangles from the wall class. Call `refine_wall_orientations`
+with the wall IDs, a gravity axis, and a length tolerance derived from reconstruction
+uncertainty. A face normal within 45 degrees of either gravity direction triggers
+exclusion, regardless of lateral support or patch size.
+
+Neighboring labels and frozen source evidence determine the non-wall owner.
+When available, only components with corroborating source evidence can supply
+new ownership, preventing unobserved remnants from growing. Without a labeled
+neighbor, the pass uses proximity along the mesh; disconnected pieces fall back
+to spatial proximity. Every excluded
+triangle receives an existing positive non-wall label. Other labels and geometry
+are preserved. Input without any existing non-wall label raises an error rather
+than inventing an identity. This pass uses the supplied wall role, with no fixed
+IDs, scene coordinates, object-specific rules, or instance-count targets.
+
+The separate inspection candidate is available with:
+
+```bash
+bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 5 generic_wall_horizontal_cut_anchored
+```
+
+This strict policy also excludes valid horizontal wall caps in other scenes;
+enable it only when that exclusion is intended. Candidate visual acceptance
+remains pending.
+
+[`planar_gap_completion.py`](planar_gap_completion.py) adds semantic labels to
+selected unknown sealing faces while preserving every existing positive label.
+It provides two conservative completion methods:
+
+- `complete_planar_gaps` uses the nearest compatible original labeled boundary.
+  All three triangle vertices must fit that reference plane within the supplied
+  reconstruction tolerance, and plane normals must agree within 20 degrees.
+  Normal signs are ignored because generated sealing fans can fold back.
+- `complete_bounded_gaps` handles folded generated patches whose local normals
+  are unreliable. A patch must be closed, with at least 95% of boundary length
+  carrying one owner and trusted seeds on at least 50%. An existing different
+  label inside the patch vetoes completion. Patch membership is separate from
+  face eligibility, so observed unknowns can remain protected inside a hole.
+
+Both methods use caller-selected masks and opaque IDs. They must receive the
+exact mesh face ordering; neither changes geometry. The ceiling experiment
+restricts eligibility to added sealing faces without frozen observations and
+uses existing ceiling components corroborated by three independent views,
+three effective views and at least 75% source evidence. Both methods evaluate
+the original labels independently, preventing inferred faces from training the
+other completion method. Unsupported or mixed patches can remain unknown.
+
+Inspect the separate candidate with:
+
+```bash
+bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_ceiling_bounded_completion
+```
+
+Its geometry, original labels, source snapshots and hashes are preserved in the
+artifact directory. This is semantic inference over existing hole fills, not
+evidence that the generated caps reconstruct the physical ceiling accurately.
+
+[`surface_label_refinement.py`](surface_label_refinement.py) corrects existing
+labels on caller-selected surface patches. `reclaim_compatible_surfaces` groups
+faces by label, normal continuity and local RGB continuity, fits an area-weighted
+plane, and checks nearby original reference triangles against that plane and
+appearance. Plane residuals use the supplied reconstruction tolerance; supported
+local roughness is retained. RGB values must use the normalized 0–1 range.
+
+The ceiling correction experiment protects reviewed non-wall objects using the
+checkpoint before wall cleanup, together with corroborated object components.
+It permits wall surfaces to move to ceiling only where geometry and appearance
+support an existing ceiling plane. References come from original mesh faces;
+inferred cap faces do not train these surface models. It then repeats the guarded
+unknown-face completion using the corrected labels. The separate candidate is:
+
+```bash
+bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_ceiling_corrected
+```
+
+Spotlight now separates display vertices along the active class boundary, so its
+color cannot interpolate onto adjacent ceiling, wall or unknown triangles. Saved
+mesh geometry, face ordering and labels are unaffected. Reopen an existing viewer
+to load this display fix. Press `S` to switch between Spotlight, Solo and Rainbow.
+
+`complete_geometric_regions` is a separate whole-region fallback for mixed-label
+boundaries. It fits each connected unknown region using exact surface-area
+moments. Neighboring triangle planes vote by shared boundary length, discounted
+by whole-region plane residual and normal disagreement (20-degree angular scale).
+The supplied reconstruction tolerance and measured region roughness set the
+distance scale. The best supported owner receives the entire eligible region;
+all positive labels and excluded faces remain fixed. Classes are opaque IDs.
+Unlike the conservative methods above, this deliberately chooses an owner even
+when the evidence is ambiguous. A region without a labeled boundary is left
+unchanged; no global owner or invented ID is used.
+
+The reversible `experiment_geometric_regions.py` applies this fallback to all
+remaining unknown faces of `generic_ceiling_corrected`. Its current-scene check
+requires zero remaining unknowns and exact preservation of existing labels:
+
+```bash
+bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_geometric_region_completion
+```
+
+Geometry remains unchanged. Whole-region ownership also retains folds in generated
+caps, so individual inferred triangles may disagree with their owner's overall
+surface orientation. This candidate does not enforce triangle-level orientation
+constraints on newly labeled caps. The user visually accepted this checkpoint for
+the current scene; it is now the inspection launcher's default. This is not
+empirical validation on other scenes or automatic integration into the pipeline.

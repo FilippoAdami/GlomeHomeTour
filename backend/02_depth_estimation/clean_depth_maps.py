@@ -105,6 +105,71 @@ def clean_depth_ceiling(
     return d, n_cleared
 
 
+def clean_depth_discontinuities(
+    depth_map: np.ndarray,
+    img_rgb: np.ndarray | None,
+    max_depth_gradient: float = 0.045,
+    min_step_ratio: float = 0.08,
+    edge_dilation: int = 2,
+    canny_low: int = 30,
+    canny_high: int = 80,
+) -> tuple[np.ndarray, int]:
+    """Sever curved neural interpolation ramps connecting foreground silhouettes to background surfaces.
+
+    Combines:
+    1. Relative Depth Gradient severing (||grad(D)|| / D > max_depth_gradient).
+    2. RGB Edge-guided boundary correlation with dilation around object silhouettes.
+    3. Planar step-ratio safeguard: only cuts where the local 11x11 window contains a true
+       foreground-background jump (step_ratio > min_step_ratio), strictly protecting flat walls.
+    """
+    d = depth_map.copy()
+    valid = (d > 0.1) & np.isfinite(d)
+    if not np.any(valid):
+        return depth_map, 0
+
+    h, w = depth_map.shape[:2]
+
+    # 1. Normalized depth gradient
+    gx = cv2.Sobel(d, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(d, cv2.CV_32F, 0, 1, ksize=3)
+    rel_grad = np.sqrt(gx**2 + gy**2) / np.maximum(d, 1e-3)
+
+    # 2. Local step ratio in an 11x11 window (safeguard for planar walls)
+    ksize = 11
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ksize, ksize))
+    d_pos = np.where(valid, d, 999.0).astype(np.float32)
+    d_min = cv2.erode(d_pos, kernel)
+    d_zero = np.where(valid, d, 0.0).astype(np.float32)
+    d_max = cv2.dilate(d_zero, kernel)
+    step_ratio = (d_max - d_min) / np.maximum(d_min, 0.1)
+
+    # Ramp detection: elevated gradient strictly within a real step zone
+    is_ramp = valid & (rel_grad > max_depth_gradient) & (step_ratio > min_step_ratio)
+
+    # 3. RGB Edge guidance
+    if img_rgb is not None:
+        if img_rgb.shape[:2] != (h, w):
+            img_rgb = cv2.resize(img_rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
+        edges = cv2.Canny(blurred, canny_low, canny_high)
+        dist_edge = cv2.distanceTransform((edges == 0).astype(np.uint8), cv2.DIST_L2, 5)
+        # Along RGB contours, cut even milder ramps
+        near_edge = dist_edge <= 5.0
+        is_ramp |= (valid & near_edge & (rel_grad > (max_depth_gradient * 0.75)) & (step_ratio > (min_step_ratio * 0.75)))
+
+    # Dilate cut along the boundary to completely sever curved webs
+    if edge_dilation > 0:
+        d_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * edge_dilation + 1, 2 * edge_dilation + 1))
+        is_ramp = cv2.dilate(is_ramp.astype(np.uint8), d_kernel) > 0
+        # STRICT SAFEGUARD: Never delete points on continuous planar surfaces
+        is_ramp &= (step_ratio > (min_step_ratio * 0.75)) & valid
+
+    n_cleared = int(np.sum(is_ramp))
+    d[is_ramp] = 0.0
+    return d, n_cleared
+
+
 def clean_grazing_angles(
     depth_map: np.ndarray,
     normals_cam: np.ndarray,
@@ -156,6 +221,8 @@ def clean_all_depth_maps(
     enable_saturation_mask: bool = True,
     enable_depth_ceiling: bool = True,
     max_grazing_angle_deg: float = 85.0,
+    enable_discontinuity_cleaning: bool = True,
+    discontinuity_gradient_threshold: float = 0.045,
     enable_freespace_filter: bool = True,
     freespace_margin_m: float = 0.08,
     max_freespace_violations: int = 0,
@@ -169,6 +236,7 @@ def clean_all_depth_maps(
     cleaned = [d.copy() for d in depth_maps]
     stats: dict[str, int | float] = {
         "gradient": 0,
+        "discontinuity": 0,
         "saturation": 0,
         "ceiling": 0,
         "grazing": 0,
@@ -185,7 +253,7 @@ def clean_all_depth_maps(
             cleaned[i], n_c = clean_depth_ceiling(cleaned[i], depth_ceiling)
             stats["ceiling"] += n_c
 
-    # 2. Saturation masking, Sobel gradients, and Grazing angles (Multi-threaded & Precomputed Ray Grid)
+    # 2. Saturation masking, Sobel gradients, Grazing angles & Discontinuity severing
     if len(cleaned) > 0:
         h, w = cleaned[0].shape[:2]
         fx, fy = float(intrinsics.fl_x), float(intrinsics.fl_y)
@@ -200,24 +268,28 @@ def clean_all_depth_maps(
 
         def _clean_frame_substep(i: int):
             d = cleaned[i]
-            n_s, n_g, n_gr = 0, 0, 0
-            if enable_saturation_mask and images is not None and i < len(images) and images[i] is not None:
-                d, n_s = clean_saturation_mask(d, images[i])
+            n_s, n_g, n_gr, n_disc = 0, 0, 0, 0
+            img_i = images[i] if (images is not None and i < len(images)) else None
+            if enable_saturation_mask and img_i is not None:
+                d, n_s = clean_saturation_mask(d, img_i)
             if max_depth_gradient > 0.0:
                 d, n_g = clean_single_depth_gradient(d, max_depth_gradient=max_depth_gradient)
             if normal_maps is not None and i < len(normal_maps) and normal_maps[i] is not None and max_grazing_angle_deg > 0.0:
                 d, n_gr = clean_grazing_angles(d, normal_maps[i], intrinsics,
                                                max_grazing_angle_deg=max_grazing_angle_deg,
                                                precomputed_ray_dir=cached_ray_dir)
-            return i, d, n_s, n_g, n_gr
+            if enable_discontinuity_cleaning:
+                d, n_disc = clean_depth_discontinuities(d, img_i, max_depth_gradient=discontinuity_gradient_threshold)
+            return i, d, n_s, n_g, n_gr, n_disc
 
         max_workers = min(8, os.cpu_count() or 4)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for i, d, n_s, n_g, n_gr in pool.map(_clean_frame_substep, range(len(cleaned))):
+            for i, d, n_s, n_g, n_gr, n_disc in pool.map(_clean_frame_substep, range(len(cleaned))):
                 cleaned[i] = d
                 stats["saturation"] += n_s
                 stats["gradient"] += n_g
                 stats["grazing"] += n_gr
+                stats["discontinuity"] += n_disc
 
     # 3. Cross-view free space carving & epipolar depth consensus alignment (GPU accelerated)
     if (enable_freespace_filter or enable_depth_alignment or min_consensus_views > 0) and len(cleaned) > 1:
@@ -460,6 +532,8 @@ def clean_depth_maps_in_place(
     enable_saturation_mask: bool = True,
     enable_depth_ceiling: bool = True,
     max_grazing_angle_deg: float = 85.0,
+    enable_discontinuity_cleaning: bool = True,
+    discontinuity_gradient_threshold: float = 0.045,
     enable_freespace_filter: bool = True,
     max_freespace_violations: int = 0,
     freespace_margin_m: float = 0.08,
@@ -541,6 +615,8 @@ def clean_depth_maps_in_place(
         enable_saturation_mask=enable_saturation_mask,
         enable_depth_ceiling=enable_depth_ceiling,
         max_grazing_angle_deg=max_grazing_angle_deg,
+        enable_discontinuity_cleaning=enable_discontinuity_cleaning,
+        discontinuity_gradient_threshold=discontinuity_gradient_threshold,
         enable_freespace_filter=enable_freespace_filter,
         freespace_margin_m=freespace_margin_m,
         max_freespace_violations=max_freespace_violations,
@@ -561,6 +637,7 @@ def clean_depth_maps_in_place(
         f"  - Saturation/Bloom pixels cleared: {int(stats['saturation']):,}\n"
         f"  - Depth ceiling outliers cleared: {int(stats['ceiling']):,}\n"
         f"  - Edge-gradient flying pixels cleared: {int(stats['gradient']):,}\n"
+        f"  - Discontinuity ramp pixels cleared: {int(stats['discontinuity']):,}\n"
         f"  - Grazing angle pixels cleared: {int(stats['grazing']):,}\n"
         f"  - Free-space phantom pixels cleared: {int(stats['freespace']):,}\n"
         f"  - Uncorroborated floater pixels cleared: {int(stats['uncorroborated']):,}\n"
@@ -578,6 +655,8 @@ def main(argv=None):
     parser.add_argument("--no-saturation-mask", action="store_true", help="Disable dynamic saturation/bloom masking")
     parser.add_argument("--no-depth-ceiling", action="store_true", help="Disable adaptive depth ceiling clipping")
     parser.add_argument("--max-grazing-angle", type=float, default=85.0, help="Max grazing angle threshold in degrees (default: 85.0)")
+    parser.add_argument("--no-discontinuity-cleaning", action="store_true", help="Disable depth discontinuity edge ramp cleaning")
+    parser.add_argument("--discontinuity-gradient", type=float, default=0.045, help="Discontinuity relative gradient threshold (default: 0.045)")
     parser.add_argument("--no-freespace", action="store_true", help="Disable cross-view free-space carving")
     parser.add_argument("--no-depth-alignment", action="store_true", help="Disable continuous multi-view epipolar depth alignment")
     parser.add_argument("--alignment-margin", type=float, default=0.08, help="Geometric tolerance in meters for cross-view alignment")
@@ -590,7 +669,10 @@ def main(argv=None):
         enable_saturation_mask=not args.no_saturation_mask,
         enable_depth_ceiling=not args.no_depth_ceiling,
         max_grazing_angle_deg=args.max_grazing_angle,
+        enable_discontinuity_cleaning=not args.no_discontinuity_cleaning,
+        discontinuity_gradient_threshold=args.discontinuity_gradient,
         enable_freespace_filter=not args.no_freespace,
+        freespace_margin_m=args.alignment_margin,
         enable_depth_alignment=not args.no_depth_alignment,
         alignment_margin_m=args.alignment_margin,
         min_consensus_views=args.min_consensus_views,

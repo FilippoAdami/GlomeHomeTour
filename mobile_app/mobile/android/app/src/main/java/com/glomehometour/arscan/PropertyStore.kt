@@ -30,6 +30,7 @@ class PropertyStore(context: Context) {
         val id: String = UUID.randomUUID().toString(),
         var address: String,
         var agentNote: String? = null,
+        var serverPropertyId: String? = null,
         val createdAtMs: Long = System.currentTimeMillis(),
         var uploadStatus: UploadStatus = UploadStatus.LOCAL_ONLY,
     )
@@ -93,6 +94,13 @@ class PropertyStore(context: Context) {
         rooms.removeAll { it.sessionName == sessionName }
     }
 
+    fun updateProperty(property: Property) = mutate { props, _ ->
+        val idx = props.indexOfFirst { it.id == property.id }
+        if (idx >= 0) {
+            props[idx] = property
+        }
+    }
+
     private fun mutate(block: (MutableList<Property>, MutableList<RoomScan>) -> Unit) {
         synchronized(lock) {
             val (properties, rooms) = read()
@@ -112,6 +120,7 @@ class PropertyStore(context: Context) {
                     id = o.getString("id"),
                     address = o.getString("address"),
                     agentNote = o.optString("agent_note").takeIf { it.isNotEmpty() },
+                    serverPropertyId = o.optString("server_property_id").takeIf { it.isNotEmpty() },
                     createdAtMs = o.optLong("created_at_ms"),
                     uploadStatus = enumOr(o.optString("upload_status"), UploadStatus.LOCAL_ONLY),
                 )
@@ -144,6 +153,7 @@ class PropertyStore(context: Context) {
                 put("id", p.id)
                 put("address", p.address)
                 put("agent_note", p.agentNote ?: "")
+                put("server_property_id", p.serverPropertyId ?: "")
                 put("created_at_ms", p.createdAtMs)
                 put("upload_status", p.uploadStatus.name)
             })

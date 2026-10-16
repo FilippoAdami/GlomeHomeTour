@@ -206,6 +206,14 @@ def select_keyframes_arcore(
     look_dirs = -rots[:, :, 2]
     pitches = np.degrees(np.arcsin(np.clip(look_dirs[:, 1], -1.0, 1.0)))
 
+    # Dynamic feature density threshold: 35% of session median, clamped within safe floors [40, 150]
+    pts_list = [int(f["num_points"]) for f in frames if "num_points" in f]
+    if pts_list:
+        median_pts = float(np.median(pts_list))
+        dynamic_feature_threshold = int(np.clip(median_pts * 0.35, 40, 150))
+    else:
+        dynamic_feature_threshold = 0
+
     # 2. First pass: sequential walk with minimum baseline, angular change & gap floor
     selected_indices = [0]
     max_walk_gap = 8
@@ -223,12 +231,20 @@ def select_keyframes_arcore(
             if float(sharpness_scores[i]) < 10.0:
                 is_blurry = True
 
+        is_feature_sparse = False
+        if dynamic_feature_threshold > 0:
+            if int(frames[i].get("num_points", 100)) < dynamic_feature_threshold:
+                is_feature_sparse = True
+
         # Accept if moved sufficiently, or if gap reaches safety floor (avoid large jumps),
         # or if camera is looking up at the ceiling, or if large angular change occurs
         if gap >= max_walk_gap or ang >= 15.0 or dist >= 0.35:
             selected_indices.append(i)
-        elif not is_blurry:
+        elif not is_blurry and not is_feature_sparse:
             if (dist >= min_translation_m or ang >= min_rotation_deg) or (is_up and gap >= 2):
+                selected_indices.append(i)
+        elif not is_blurry and gap >= 4:
+            if (dist >= min_translation_m or ang >= min_rotation_deg):
                 selected_indices.append(i)
 
     # Always keep final frame to anchor capture completion
@@ -276,6 +292,10 @@ def select_keyframes_arcore(
                 s_val = float(sharpness_scores[idx])
                 if s_val < 15.0:
                     combined[k] -= (15.0 - s_val) * 0.1
+            if dynamic_feature_threshold > 0:
+                p_val = int(frames[idx].get("num_points", 100))
+                if p_val < dynamic_feature_threshold:
+                    combined[k] -= (dynamic_feature_threshold - p_val) * 0.05
 
         min_cost = float(np.min(combined))
         if min_cost == float("inf"):
@@ -285,42 +305,56 @@ def select_keyframes_arcore(
         drop_idx = int(np.argmin(combined)) + 1
         selected_indices.pop(drop_idx)
 
-    # 5. Optional sharpness-aware neighbor swapping
-    # If sharpness scores are provided, check if a direct temporal neighbor (within +/- 3 frames)
-    # has significantly higher sharpness while maintaining almost identical camera pose (< 18cm, < 8 deg).
+    # 5. Optional feature & sharpness-aware neighbor swapping
+    # If sharpness scores or feature points are provided, check if a direct temporal neighbor (within +/- 5 frames)
+    # has significantly higher feature count / sharpness while maintaining almost identical camera pose (< 18cm, < 8 deg).
     swapped_count = 0
-    if sharpness_scores is not None and len(sharpness_scores) == n_total:
-        s_scores = np.asarray(sharpness_scores, dtype=np.float64)
-        for _ in range(2):
-            any_swap = False
-            for idx_in_sel in range(1, len(selected_indices) - 1):
-                curr = selected_indices[idx_in_sel]
-                prev_sel = selected_indices[idx_in_sel - 1]
-                next_sel = selected_indices[idx_in_sel + 1]
+    s_scores = np.asarray(sharpness_scores, dtype=np.float64) if (sharpness_scores is not None and len(sharpness_scores) == n_total) else None
+    for _ in range(2):
+        any_swap = False
+        for idx_in_sel in range(1, len(selected_indices) - 1):
+            curr = selected_indices[idx_in_sel]
+            prev_sel = selected_indices[idx_in_sel - 1]
+            next_sel = selected_indices[idx_in_sel + 1]
 
-                curr_sharpness = s_scores[curr]
-                best_cand = curr
-                best_sharpness = curr_sharpness
+            curr_sharpness = s_scores[curr] if s_scores is not None else 25.0
+            curr_pts = int(frames[curr].get("num_points", 100))
+            best_cand = curr
+            best_sharpness = curr_sharpness
+            best_pts = curr_pts
 
-                # Search candidate neighbors between prev_sel and next_sel within +/- 5 frames
-                for cand in range(max(prev_sel + 1, curr - 5), min(next_sel, curr + 6)):
-                    if cand == curr:
-                        continue
-                    dist = float(np.linalg.norm(centers[curr] - centers[cand]))
-                    ang = rotation_angle_deg(rots[curr], rots[cand])
+            # Search candidate neighbors between prev_sel and next_sel within +/- 5 frames
+            for cand in range(max(prev_sel + 1, curr - 5), min(next_sel, curr + 6)):
+                if cand == curr:
+                    continue
+                dist = float(np.linalg.norm(centers[curr] - centers[cand]))
+                ang = rotation_angle_deg(rots[curr], rots[cand])
 
-                    if dist <= 0.18 and ang <= 8.0:
-                        cand_sharpness = s_scores[cand]
+                if dist <= 0.18 and ang <= 8.0:
+                    cand_sharpness = s_scores[cand] if s_scores is not None else 25.0
+                    cand_pts = int(frames[cand].get("num_points", 100))
+
+                    if dynamic_feature_threshold > 0 and best_pts < dynamic_feature_threshold:
+                        if cand_pts >= dynamic_feature_threshold and cand_sharpness >= 15.0:
+                            best_cand = cand
+                            best_pts = cand_pts
+                            best_sharpness = cand_sharpness
+                        elif cand_pts > best_pts * 1.4 and cand_sharpness >= 15.0:
+                            best_cand = cand
+                            best_pts = cand_pts
+                            best_sharpness = cand_sharpness
+                    elif s_scores is not None:
                         if cand_sharpness > best_sharpness * 1.30 and cand_sharpness > curr_sharpness + 4.0:
                             best_sharpness = cand_sharpness
                             best_cand = cand
+                            best_pts = cand_pts
 
-                if best_cand != curr:
-                    selected_indices[idx_in_sel] = best_cand
-                    swapped_count += 1
-                    any_swap = True
-            if not any_swap:
-                break
+            if best_cand != curr:
+                selected_indices[idx_in_sel] = best_cand
+                swapped_count += 1
+                any_swap = True
+        if not any_swap:
+            break
 
     selected_frames = [frames[i] for i in selected_indices]
     sel_centers = centers[selected_indices]

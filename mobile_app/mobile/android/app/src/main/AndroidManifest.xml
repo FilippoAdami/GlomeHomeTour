@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- No storage permission: the dataset is written through MediaStore under Documents/,
          which needs none on API 29+ (minSdk here is 30). See DatasetWriter. -->
@@ -8,6 +9,7 @@
 
     <application
         android:allowBackup="false"
+        android:usesCleartextTraffic="true"
         android:label="Glome AR-Scan"
         android:theme="@style/Theme.GlomeArScan">
         <meta-data android:name="com.google.ar.core" android:value="required" />
@@ -28,6 +30,7 @@
             android:name=".PropertyDetailActivity"
             android:exported="false"
             android:screenOrientation="portrait" />
+        <activity android:name=".TourViewerActivity" android:exported="false" />
         <activity
             android:name=".SettingsActivity"
             android:exported="false"

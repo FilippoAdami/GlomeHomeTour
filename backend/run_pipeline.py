@@ -53,6 +53,7 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("depth", "02_depth_estimation/step_depth.py"),
     ("train", "03_FastGS_DNSplatter/step_train.py"),
     ("mesh", "04_3DGS_to_mesh/step_mesh.py"),
+    ("mesh_cleanup", "06c_semantic_segmentation/step1_remove_mesh_floaters.py"),
     ("floorplan", "05_floor_plan/step_floorplan.py"),
     ("segmentation", "06_semantic_segmentation/step_segmentation.py"),
 )

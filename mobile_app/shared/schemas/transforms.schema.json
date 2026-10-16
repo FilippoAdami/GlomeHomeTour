@@ -30,6 +30,7 @@
           "cx": { "type": "number" },
           "cy": { "type": "number" },
           "compass_heading_deg": { "type": ["number", "null"] },
+          "num_points": { "type": ["integer", "null"], "minimum": 0 },
           "transform_matrix": {
             "type": "array",
             "minItems": 4,

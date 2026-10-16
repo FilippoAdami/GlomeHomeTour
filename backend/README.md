@@ -198,6 +198,7 @@ standalone script that can be run, inspected and resumed on its own:
 | 2 | depth | `02_depth_estimation/step_depth.py` | `02_depth_estimation/depth/depth_maps/`, `normal_maps/`, `points3D_depth.ply` |
 | 3 | train | `03_FastGS_DNSplatter/step_train.py` | `current_scene/03_FastGS_DNSplatter/checkpoint.pt`, `point_cloud/iteration_22000/` |
 | 4 | mesh | `04_3DGS_to_mesh/step_mesh.py` | `current_scene/04_3DGS_to_mesh/mesh.ply`, `mesh.json` |
+| 5 | mesh_cleanup | `06c_semantic_segmentation/step1_remove_mesh_floaters.py` | `step1_cleaned_mesh/mesh_cleaned.ply`, `mesh_sealed_colored.ply`, `mesh_sealed_red.ply` |
 
 **Nothing is deleted mid-pipeline.** A frame a step rejects is *moved* into that
 step's own discard folder together with its camera entry, so every discard folder
@@ -236,11 +237,7 @@ backend/.venv/bin/python backend/03_FastGS_DNSplatter/step_train.py --workspace 
 backend/.venv/bin/python backend/04_3DGS_to_mesh/step_mesh.py --workspace backend/current_scene
 ```
 
-The stage 03 checkpoint format changed to `checkpoint.pt`; old FastGS checkpoints need retraining. Stage 04 writes `04_3DGS_to_mesh/mesh.ply` and `mesh.json`. `--resolution 4 --frame-stride 8` lowers memory use for mesh extraction. The optional CPU refinement step is:
-
-```bash
-backend/.venv/bin/python backend/04_3DGS_to_mesh/refine_mesh.py --workspace backend/current_scene
-```
+The stage 03 checkpoint format changed to `checkpoint.pt`; old FastGS checkpoints need retraining. Stage 04 writes the raw TSDF mesh to `04_3DGS_to_mesh/mesh.ply`. The next default step removes floaters and outliers, then seals the cleaned mesh in memory. It keeps `mesh_cleaned.ply` for semantic segmentation, writes blended patches to `mesh_sealed_colored.ply`, and marks them in `mesh_sealed_red.ply`. Web export reads `mesh_sealed_colored.ply`. `--resolution 4 --frame-stride 8` lowers memory use for mesh extraction.
 
 See [stage 03 setup](03_FastGS_DNSplatter/README.md) for ROCm details and license provenance.
 
@@ -252,3 +249,58 @@ backend/.venv/bin/pytest backend/tests/
 # Validate shared interchange schemas
 backend/.venv/bin/python3 shared/schemas/validate.py
 ```
+
+### Filling selected acquisition holes
+
+`04_3DGS_to_mesh/fill_mesh_holes.py` reports closed mesh boundary loops and can fill
+small, nearly planar loops inside explicitly selected 3D boxes. Run manual
+variants on the unsealed, floater-cleaned mesh; coordinates are in that mesh's frame:
+
+```bash
+backend/.venv/bin/python backend/04_3DGS_to_mesh/fill_mesh_holes.py \
+  --input backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply \
+  --report agents_files/artifacts/mesh_holes/boundary_loops.json
+```
+
+Inspect loop IDs, bounds, diameter, and plane deviation in the report. Define
+only regions known to be continuous surfaces in a JSON list, for example:
+
+```json
+[{"name":"wall patch","min":[0,0,0],"max":[0.5,0.5,0.5],"max_diameter_m":0.15,"max_plane_deviation_m":0.02}]
+```
+
+Pass `--regions regions.json --output repaired_mesh.ply` with the same input
+and report arguments to produce a separate mesh. All vertices of a loop must
+lie inside one box. Open boundary chains, nonmanifold boundaries, large holes,
+and nonplanar holes are left alone. This does not make the whole scene
+watertight or infer missing geometry where no closed boundary exists.
+
+For automatic filling, pass `--auto --output mesh_auto_filled.ply` instead of
+`--regions`. Add `--red-output mesh_auto_filled_red.ply` for a second full mesh
+with bright red patch interiors; the first output blends patch colors from the
+surrounding vertices. This fills closed loops whose best fitting planar box is
+at most 50 × 50 cm, plus narrow gaps up to 2 m long and 30 cm wide. Small
+holes must be within 2 cm of a fitted plane; medium and narrow gaps allow up
+to 10 cm. Noisy rim normals are reported but do not veto a patch. Branched
+boundary junctions are split into individual cycles, while triangulation
+conflicts with existing edges are resolved without adding nonmanifold edges. Patch
+interiors have up to 15 mm of surface depth while their boundary edges remain
+manifold. The report identifies every filled loop. Broad or nonplanar major
+openings remain for inspection.
+
+To close every detected boundary loop, including room-scale and nonplanar
+openings, use `--seal-all` in place of `--auto`. Keep the result separate from
+the selective repair:
+
+```bash
+backend/.venv/bin/python backend/04_3DGS_to_mesh/fill_mesh_holes.py \
+  --input backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply \
+  --seal-all \
+  --output backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_sealed_colored.ply \
+  --red-output backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_sealed_red.ply \
+  --report agents_files/artifacts/mesh_holes/seal_all_report.json
+```
+
+The report includes the remaining boundary count. A zero count means the mesh
+is closed by edge incidence; large caps can still cross unknown scene geometry
+and should be inspected in the red version.

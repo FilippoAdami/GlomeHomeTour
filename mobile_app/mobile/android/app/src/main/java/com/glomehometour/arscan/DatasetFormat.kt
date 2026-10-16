@@ -33,6 +33,8 @@ object DatasetFormat {
          * Lets the backend rotate the otherwise-arbitrary ARCore world yaw to a real-world
          * orientation. Null if the magnetometer hadn't produced a reading yet. */
         val compassHeadingDeg: Float? = null,
+        /** Number of sparse 3D feature points tracked in ARCore's PointCloud at frame capture time. */
+        val numPoints: Int = 0,
     )
 
     /**
@@ -78,6 +80,7 @@ object DatasetFormat {
             append("\"fl_x\": ${f(frame.fx)}, \"fl_y\": ${f(frame.fy)}, ")
             append("\"cx\": ${f(frame.cx)}, \"cy\": ${f(frame.cy)}, ")
             append("\"compass_heading_deg\": ${frame.compassHeadingDeg?.let { f(it) } ?: "null"}, ")
+            append("\"num_points\": ${frame.numPoints}, ")
             append("\"transform_matrix\": [")
             for (r in 0 until 4) {
                 append("[")

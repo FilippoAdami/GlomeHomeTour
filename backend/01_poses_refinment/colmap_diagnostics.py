@@ -30,6 +30,12 @@ import matplotlib
 matplotlib.use("Agg")  # diagnostics run headless / over ssh
 import matplotlib.pyplot as plt
 import cv2
+import sys
+_backend = Path(__file__).resolve().parents[1]
+if str(_backend) not in sys.path:
+    sys.path.insert(0, str(_backend))
+from Utilities.pipeline_paths import bootstrap
+bootstrap()
 
 from scene.colmap_loader import qvec2rotmat
 
@@ -144,8 +150,10 @@ def drift_report(init_images, refined_images, points3D, images_dir, out_dir,
         r_delta = rotation_delta_deg(ref["R_c2w"], init["R_c2w"])
         trans_d.append(t_delta)
         rot_d.append(r_delta)
+        reg_pts = int(np.sum(ref["p3d_ids"] != -1)) if len(ref.get("p3d_ids", [])) else 0
         rows.append({"image": name, "translation_delta_m": t_delta,
                      "rotation_delta_deg": r_delta,
+                     "registered_features": reg_pts,
                      "init_tx": init["t_c2w"][0], "init_ty": init["t_c2w"][1],
                      "init_tz": init["t_c2w"][2],
                      "refined_tx": ref["t_c2w"][0], "refined_ty": ref["t_c2w"][1],
@@ -166,12 +174,22 @@ def drift_report(init_images, refined_images, points3D, images_dir, out_dir,
     rot_outliers = [r["image"] for r in rows if r["rotation_delta_deg"] > rot_thresh_deg]
     trans_outliers = [r["image"] for r in rows if r["translation_delta_m"] > trans_thresh_m]
 
+    feat_counts = np.array([r["registered_features"] for r in rows]) if rows else np.zeros(0)
+
     summary = {
         "num_frames": len(common),
         "point_cloud": {
             "total_points": len(points3D),
             "mean_reprojection_error_px": float(np.mean(errors)) if errors.size else 0.0,
             "mean_track_length": float(np.mean(track_lens)) if track_lens.size else 0.0,
+        },
+        "registered_features_per_frame": {
+            "min": int(feat_counts.min()) if feat_counts.size else 0,
+            "median": float(np.median(feat_counts)) if feat_counts.size else 0.0,
+            "mean": float(np.mean(feat_counts)) if feat_counts.size else 0.0,
+            "max": int(feat_counts.max()) if feat_counts.size else 0,
+            "below_30": int(np.sum(feat_counts < 30)) if feat_counts.size else 0,
+            "below_100": int(np.sum(feat_counts < 100)) if feat_counts.size else 0,
         },
         "translation_drift": {
             "mean_m": float(np.mean(trans_d)), "max_m": float(np.max(trans_d)),
@@ -200,6 +218,8 @@ def drift_report(init_images, refined_images, points3D, images_dir, out_dir,
     print(f"Triangulated points:        {len(points3D):,}")
     print(f"Mean track length:          {summary['point_cloud']['mean_track_length']:.2f}")
     print(f"Mean reproj. error (COLMAP):{summary['point_cloud']['mean_reprojection_error_px']:.4f} px")
+    if feat_counts.size:
+        print(f"Features per frame (med/min): {np.median(feat_counts):.0f} / {feat_counts.min()} (frames < 100: {np.sum(feat_counts < 100)})")
     print(f"Translation drift:          mean {np.mean(trans_d)*100:.2f} cm, max {np.max(trans_d)*100:.2f} cm")
     print(f"Rotation drift:             mean {np.mean(rot_d):.3f} deg, max {np.max(rot_d):.3f} deg")
     print(f"Frames beyond {rot_thresh_deg} deg:        {len(rot_outliers)} / {len(common)}")

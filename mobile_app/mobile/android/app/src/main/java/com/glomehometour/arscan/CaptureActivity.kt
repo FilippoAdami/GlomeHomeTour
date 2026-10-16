@@ -1004,7 +1004,7 @@ class CaptureActivity : AppCompatActivity() {
                 // Once scan has started, never drop frames for dark areas (user already verified lights)
                 if (verdict == PhotometricGate.Verdict.OK || verdict == PhotometricGate.Verdict.DARK) {
                     if (tooFastForCapture()) droppedMotion++
-                    else if (isKeyframe()) exported = writeKeyframe(image, sample.timestampNs)
+                    else if (isKeyframe()) exported = writeKeyframe(image, sample.timestampNs, sample.numPoints)
                 }
             } finally {
                 image.close()
@@ -1210,7 +1210,7 @@ class CaptureActivity : AppCompatActivity() {
         return isDecimationKeyframe(gatePassedCounter)
     }
 
-    private fun writeKeyframe(image: android.media.Image, timestampNs: Long): Boolean {
+    private fun writeKeyframe(image: android.media.Image, timestampNs: Long, numPoints: Int = 0): Boolean {
         val w = writer ?: return false
         val r = renderer
         val p = r?.pipeline
@@ -1226,6 +1226,7 @@ class CaptureActivity : AppCompatActivity() {
             p?.latestAfMode ?: 0,
             p?.latestFocalLengthMm ?: 0f,
             compassHeadingDeg,
+            numPoints = numPoints,
         )
     }
 

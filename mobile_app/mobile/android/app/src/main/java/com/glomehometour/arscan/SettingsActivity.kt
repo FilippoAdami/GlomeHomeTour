@@ -29,6 +29,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var keyframeMinM2Field: EditText
     private lateinit var keyframeMaxM2Field: EditText
     private lateinit var qualityBlurField: EditText
+    private lateinit var serverUrlField: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,6 +50,24 @@ class SettingsActivity : AppCompatActivity() {
             setTextColor(color(R.color.text_faint))
             textSize = 12f
             setPadding(0, 0, 0, dp(16))
+        })
+        column.addView(TextView(this).apply {
+            text = "Glome server address (port 8000)"
+            setTextColor(color(R.color.text_primary))
+            textSize = 14f
+        })
+        serverUrlField = EditText(this).apply {
+            setText(GlomeUploader.serverBaseUrl(this@SettingsActivity))
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setTextColor(color(R.color.text_primary))
+            textSize = 15f
+        }
+        column.addView(serverUrlField)
+        column.addView(TextView(this).apply {
+            text = "Use the computer's LAN address on a phone. The web viewer must be running on port 5173; emulator default is 10.0.2.2."
+            setTextColor(color(R.color.text_faint))
+            textSize = 11f
+            setPadding(0, 0, 0, dp(14))
         })
 
         parallaxField = addField(
@@ -148,6 +167,7 @@ class SettingsActivity : AppCompatActivity() {
 
     /** Unparseable input keeps the current value; out-of-range input is clamped (Values.clamped). */
     private fun save() {
+        val serverSaved = GlomeUploader.saveServerBaseUrl(this, serverUrlField.text.toString())
         val values = Tunables.Values.clamped(
             parallaxDeg = parallaxField.floatOr(Tunables.parallaxMinDeg),
             coveragePercent = coverageField.floatOr(Tunables.coverageCompleteFraction * 100f),
@@ -160,7 +180,11 @@ class SettingsActivity : AppCompatActivity() {
             qualityGateBlurThreshold = qualityBlurField.floatOr(Tunables.qualityGateBlurThreshold),
         )
         Tunables.save(this, values)
-        Toast.makeText(this, "Saved -- applies to the next scan", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            this,
+            if (serverSaved) "Saved -- applies to the next scan" else "Capture settings saved; invalid server URL left unchanged",
+            Toast.LENGTH_SHORT,
+        ).show()
         finish()
     }
 

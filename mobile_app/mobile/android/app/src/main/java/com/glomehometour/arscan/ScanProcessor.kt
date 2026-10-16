@@ -158,6 +158,7 @@ class ScanProcessor(private val context: Context) {
                             filePath = fObj.getString("file_path"),
                             c2w = mat,
                             sharpnessScore = blur,
+                            numPoints = fObj.optInt("num_points", 100),
                         )
                     )
                 }

@@ -1,0 +1,84 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOrgMember(orgId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/organisations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function getOrgMemberRole(orgId) {
+      return get(/databases/$(database)/documents/organisations/$(orgId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isOrgAdmin(orgId) {
+      return isAuthenticated() && isOrgMember(orgId) && getOrgMemberRole(orgId) == 'admin';
+    }
+
+    function isOrgAgentOrAdmin(orgId) {
+      return isAuthenticated() && isOrgMember(orgId) &&
+        (getOrgMemberRole(orgId) == 'admin' || getOrgMemberRole(orgId) == 'agent');
+    }
+
+    // Organisations collection
+    match /organisations/{orgId} {
+      allow create: if isAuthenticated();
+      allow read: if isOrgMember(orgId);
+      allow update, delete: if isOrgAdmin(orgId);
+
+      // Members sub-collection
+      match /members/{memberId} {
+        allow read: if isOrgMember(orgId);
+        // Only admin can write/update/delete members, or user creating own admin member document on initial org setup
+        allow create: if isAuthenticated() && (isOrgAdmin(orgId) || request.auth.uid == memberId);
+        allow update, delete: if isOrgAdmin(orgId);
+      }
+
+      // Invites sub-collection
+      match /invites/{inviteId} {
+        allow read: if isOrgMember(orgId) || (isAuthenticated() && resource.data.email == request.auth.token.email);
+        allow create, delete: if isOrgAdmin(orgId);
+        // An invited user can update 'accepted' status if email matches
+        allow update: if isAuthenticated() &&
+          resource.data.email == request.auth.token.email &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['accepted']);
+      }
+    }
+
+    // Properties collection
+    match /properties/{propertyId} {
+      allow read: if isAuthenticated() && (
+        isOrgMember(resource.data.orgId) ||
+        // Check if caller has a share link pointing to this property
+        exists(/databases/$(database)/documents/shareLinks/$(request.auth.uid + '_' + propertyId))
+      );
+
+      allow create: if isAuthenticated() &&
+        isOrgAgentOrAdmin(request.resource.data.orgId) &&
+        request.resource.data.uploadedBy == request.auth.uid;
+
+      allow update: if isAuthenticated() && isOrgMember(resource.data.orgId);
+      allow delete: if isAuthenticated() && isOrgAdmin(resource.data.orgId);
+
+      // Pipeline jobs sub-collection: read by org members, write denied for normal clients (admin/backend only)
+      match /pipelineJobs/{jobId} {
+        allow read: if isOrgMember(get(/databases/$(database)/documents/properties/$(propertyId)).data.orgId);
+        allow write: if false;
+      }
+    }
+
+    // Share links collection
+    match /shareLinks/{linkId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isOrgAgentOrAdmin(request.resource.data.orgId);
+      allow delete: if isAuthenticated() && resource.data.createdBy == request.auth.uid;
+      allow update: if false;
+    }
+  }
+}

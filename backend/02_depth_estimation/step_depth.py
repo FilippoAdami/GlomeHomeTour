@@ -420,6 +420,8 @@ def run_depth_estimation_substep(
             enable_saturation_mask=True,
             enable_depth_ceiling=True,
             max_grazing_angle_deg=MAX_GRAZING_ANGLE_DEG,
+            enable_discontinuity_cleaning=True,
+            discontinuity_gradient_threshold=0.045,
             enable_freespace_filter=True,
             freespace_margin_m=0.08,
             max_freespace_violations=0,
@@ -432,9 +434,9 @@ def run_depth_estimation_substep(
         ctx.note(
             f"Cleaned & aligned depth maps on GPU: cleared {int(clean_stats['saturation']):,} bloom, "
             f"{int(clean_stats['ceiling']):,} ceiling, {int(clean_stats['gradient']):,} edge-gradient, "
-            f"{int(clean_stats['grazing']):,} grazing, {int(clean_stats['freespace']):,} free-space phantoms, "
-            f"{int(clean_stats['uncorroborated']):,} uncorroborated floaters, and aligned {int(clean_stats['aligned_pixels']):,} "
-            f"multi-view pixels (mean adj: {clean_stats['mean_adjustment_m']*100:.2f} cm)"
+            f"{int(clean_stats['discontinuity']):,} discontinuity ramps, {int(clean_stats['grazing']):,} grazing, "
+            f"{int(clean_stats['freespace']):,} free-space phantoms, {int(clean_stats['uncorroborated']):,} uncorroborated floaters, "
+            f"and aligned {int(clean_stats['aligned_pixels']):,} multi-view pixels (mean adj: {clean_stats['mean_adjustment_m']*100:.2f} cm)"
         )
     vram_substeps["clean_depth_maps"] = _get_vram_info()
 

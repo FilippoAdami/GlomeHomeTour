@@ -1,0 +1,42 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Helper: check if the caller is a member of an org
+    function isOrgMember(orgId) {
+      return firestore.exists(
+        /databases/(default)/documents/organisations/$(orgId)/members/$(request.auth.uid)
+      );
+    }
+
+    // Helper: check if the caller is an admin of an org
+    function isOrgAdmin(orgId) {
+      let memberDoc = firestore.get(
+        /databases/(default)/documents/organisations/$(orgId)/members/$(request.auth.uid)
+      );
+      return memberDoc != null && memberDoc.data.role == 'admin';
+    }
+
+    // Scan archives: uploaded by authenticated agents/admins of the org
+    // Path: orgs/{orgId}/archives/{filename}
+    match /orgs/{orgId}/archives/{filename} {
+      allow read: if request.auth != null && isOrgMember(orgId);
+      allow create: if request.auth != null && isOrgMember(orgId)
+                    && request.resource.size < 5 * 1024 * 1024 * 1024; // 5 GB max
+      allow delete: if request.auth != null && isOrgAdmin(orgId);
+    }
+
+    // Processed outputs: only readable by org members
+    // Path: orgs/{orgId}/outputs/{propertyId}/{filename}
+    match /orgs/{orgId}/outputs/{propertyId}/{filename} {
+      allow read: if request.auth != null && isOrgMember(orgId);
+      // Writes only from Admin SDK (backend pipeline) — deny client writes
+      allow write: if false;
+    }
+
+    // Deny everything else
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

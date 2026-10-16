@@ -24,6 +24,7 @@ class KeyframeSelector(
         val filePath: String,
         val c2w: FloatArray, // 4x4 row-major matrix
         val sharpnessScore: Float = 25.0f,
+        val numPoints: Int = 100,
     )
 
     data class ExtentResult(
@@ -76,6 +77,11 @@ class KeyframeSelector(
             Math.toDegrees(asin(lookY.coerceIn(-1.0f, 1.0f).toDouble())).toFloat()
         }
 
+        // Dynamic feature density threshold: 35% of session median, clamped within safe floors [40, 150]
+        val allPoints = frames.map { it.numPoints }.sorted()
+        val medianPoints = if (allPoints.isNotEmpty()) allPoints[allPoints.size / 2] else 100
+        val dynamicFeatureThreshold = (medianPoints * 0.35f).coerceIn(40f, 150f).toInt()
+
         // 1. Room extent & budget
         val extent = estimateRoomExtent(centers, nTotal)
         val computedTarget = extent.targetBudget.coerceIn(2, nTotal)
@@ -103,11 +109,17 @@ class KeyframeSelector(
 
             val isUp = pitches[i] > 2.0f
             val isBlurry = frames[i].sharpnessScore < 10.0f
+            val isFeatureSparse = frames[i].numPoints < dynamicFeatureThreshold
 
             if (gap >= maxWalkGap || ang >= 15.0f || dist >= 0.35f) {
                 selected.add(i)
-            } else if (!isBlurry) {
+            } else if (!isBlurry && !isFeatureSparse) {
                 if ((dist >= minTranslationM || ang >= minRotationDeg) || (isUp && gap >= 2)) {
+                    selected.add(i)
+                }
+            } else if (!isBlurry && gap >= 4) {
+                // If sparse but gap is expanding, accept to avoid excessive spacing
+                if (dist >= minTranslationM || ang >= minRotationDeg) {
                     selected.add(i)
                 }
             }
@@ -162,6 +174,10 @@ class KeyframeSelector(
                 if (sVal < 15.0f) {
                     combined -= (15.0f - sVal) * 0.1f // prioritize pruning blurry frames
                 }
+                val pVal = frames[curr].numPoints
+                if (pVal < dynamicFeatureThreshold) {
+                    combined -= (dynamicFeatureThreshold - pVal) * 0.05f // prioritize pruning feature-sparse frames
+                }
 
                 if (combined < minCost) {
                     minCost = combined
@@ -175,7 +191,7 @@ class KeyframeSelector(
             selected.removeAt(dropIdxInSelected)
         }
 
-        // 5. Sharpness-aware neighbor swapping
+        // 5. Feature & Sharpness-aware neighbor swapping
         var swappedCount = 0
         for (pass in 0 until 2) {
             var anySwap = false
@@ -186,6 +202,7 @@ class KeyframeSelector(
 
                 var bestCand = curr
                 var bestSharpness = frames[curr].sharpnessScore
+                var bestPoints = frames[curr].numPoints
 
                 val searchStart = max(prev + 1, curr - 5)
                 val searchEnd = min(next - 1, curr + 5)
@@ -197,9 +214,29 @@ class KeyframeSelector(
 
                     if (dist <= 0.18f && ang <= 8.0f) {
                         val candSharpness = frames[cand].sharpnessScore
-                        if (candSharpness > bestSharpness * 1.30f && candSharpness > frames[curr].sharpnessScore + 4.0f) {
-                            bestSharpness = candSharpness
+                        val candPoints = frames[cand].numPoints
+
+                        // Priority A: If current frame is feature-deficient (< dynamicFeatureThreshold),
+                        // prefer a spatial neighbor with healthy feature count (>= dynamicFeatureThreshold)
+                        // and acceptable sharpness (>= 15.0)
+                        if (bestPoints < dynamicFeatureThreshold && candPoints >= dynamicFeatureThreshold && candSharpness >= 15.0f) {
                             bestCand = cand
+                            bestPoints = candPoints
+                            bestSharpness = candSharpness
+                        }
+                        // Priority B: If both are feature-deficient, prefer neighbor with significantly more points (+40%)
+                        else if (bestPoints < dynamicFeatureThreshold && candPoints > bestPoints * 1.4f && candSharpness >= 15.0f) {
+                            bestCand = cand
+                            bestPoints = candPoints
+                            bestSharpness = candSharpness
+                        }
+                        // Priority C: If both have healthy feature counts, prefer sharper neighbor
+                        else if (bestPoints >= dynamicFeatureThreshold && candPoints >= dynamicFeatureThreshold) {
+                            if (candSharpness > bestSharpness * 1.30f && candSharpness > frames[curr].sharpnessScore + 4.0f) {
+                                bestSharpness = candSharpness
+                                bestCand = cand
+                                bestPoints = candPoints
+                            }
                         }
                     }
                 }
