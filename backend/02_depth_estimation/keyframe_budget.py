@@ -2,7 +2,7 @@
 """How many keyframes a scene needs, and which ones.
 
 * :func:`frame_budget` -- the empirical indoor rule ``N = 50 + (8..11) * A_floor``
-  over ``01_poses_refinment/scene_size.txt``. Frame count is driven by the room,
+  over ``depth/scene_size.txt``. Frame count is driven by the room,
   not by a fraction of however long the operator happened to walk.
 * :func:`coverage_topup` / :func:`coverage_prune` -- move a selection into that
   band from below or above, judging every frame by the *places* it observes
@@ -45,12 +45,20 @@ VIEWS_PER_CELL = 3
 
 
 def read_scene_size(path: Path) -> dict[str, float]:
-    """Parse ``scene_extent.py``/``floor_count.py``'s ``key: value`` txt."""
+    """Parse scene dimensions, rejecting outputs without metric scale."""
     out = {}
     for line in Path(path).read_text().splitlines():
         if ":" in line:
             k, v = line.split(":", 1)
-            out[k.strip()] = float(v.strip())
+            k, v = k.strip(), v.strip()
+            if k == "coordinate_units":
+                if v != "m":
+                    raise ValueError(f"{path} uses {v}, not calibrated metres")
+                continue
+            try:
+                out[k] = float(v)
+            except ValueError:
+                continue
     if "floors" not in out:
         out["floors"] = 1.0
     missing = {"x", "y", "z", "area_m2"} - out.keys()

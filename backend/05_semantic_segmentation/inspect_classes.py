@@ -602,40 +602,40 @@ def _resolve_path(p: Path) -> Path:
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive 3D Class & Instance Inspector")
-    parser.add_argument(
-        "--mesh",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply"),
-        help="Path to input 3D mesh PLY",
-    )
-    parser.add_argument(
-        "--structural-json",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/structural_classes.json"),
-        help="Path to structural_classes.json",
-    )
-    parser.add_argument(
-        "--instances-csv",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/instances_summary.csv"),
-        help="Path to instances_summary.csv",
-    )
-    parser.add_argument(
-        "--per-class-dir",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/per_class_meshes"),
-        help="Path to per_class_meshes directory",
-    )
+    parser.add_argument("--workspace", type=Path, default=Path("backend/current_scene"), help="Workspace root or scan directory")
+    parser.add_argument("--mesh", type=Path, default=None, help="Path to input 3D mesh PLY")
+    parser.add_argument("--structural-json", type=Path, default=None, help="Path to structural_classes.json")
+    parser.add_argument("--instances-csv", type=Path, default=None, help="Path to instances_summary.csv")
+    parser.add_argument("--per-class-dir", type=Path, default=None, help="Path to per_class_meshes directory")
     parser.add_argument("--class-id", type=int, default=None, help="Initial class ID to display")
     parser.add_argument("--mode", type=str, default="spotlight", choices=["spotlight", "solo", "rainbow"])
     parser.add_argument("--headless", action="store_true", help="Run automated test without opening window")
     args = parser.parse_args()
 
+    try:
+        import scene_inputs
+        scan = scene_inputs.resolve_scene(args.workspace)
+        stage_out = scene_inputs.resolve_stage_output(scan)
+        default_mesh = stage_out / "mesh_segmented.ply" if (stage_out / "mesh_segmented.ply").is_file() else scene_inputs.resolve_mesh(scan)
+        default_struct = stage_out / "structural_classes.json"
+        default_inst = stage_out / "instances_summary.csv"
+        default_per_class = stage_out / "per_class_meshes"
+    except Exception:
+        default_mesh = Path("backend/current_scene/05_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply")
+        default_struct = Path("backend/current_scene/05_semantic_segmentation/step3_structural_detection/structural_classes.json")
+        default_inst = Path("backend/current_scene/05_semantic_segmentation/step3_structural_detection/instances_summary.csv")
+        default_per_class = Path("backend/current_scene/05_semantic_segmentation/per_class_meshes")
+
+    mesh_path = _resolve_path(args.mesh or default_mesh)
+    structural_json_path = _resolve_path(args.structural_json or default_struct)
+    instances_csv_path = _resolve_path(args.instances_csv or default_inst)
+    per_class_dir = _resolve_path(args.per_class_dir or default_per_class)
+
     run_inspector(
-        mesh_path=_resolve_path(args.mesh),
-        structural_json_path=_resolve_path(args.structural_json),
-        instances_csv_path=_resolve_path(args.instances_csv),
-        per_class_dir=_resolve_path(args.per_class_dir),
+        mesh_path=mesh_path,
+        structural_json_path=structural_json_path,
+        instances_csv_path=instances_csv_path,
+        per_class_dir=per_class_dir,
         initial_cid=args.class_id,
         initial_mode=args.mode,
         headless=args.headless,

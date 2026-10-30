@@ -1,16 +1,22 @@
 package com.glomehometour.arscan
 
 import android.app.AlertDialog
+import android.content.ClipData
 import android.content.ContentUris
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.util.Log
 import android.view.Gravity
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.FileProvider
 import java.io.File
 import java.io.InputStream
 import java.text.SimpleDateFormat
@@ -33,6 +39,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         var legacyMediaSession: Boolean = false,
         var legacyFlatMediaSession: Boolean = false,
         var legacyFallbackDir: File? = null,
+        var hasCheckpoint: Boolean = false,
     )
 
     companion object {
@@ -40,8 +47,8 @@ class ScanGalleryActivity : AppCompatActivity() {
          * that crashed before finish() could zip and clean it up, e.g.
          * "scan_20260913_133535_transforms.json" or "scan_20260913_133535_images_frame_00005.jpg". */
         private val FLAT_SESSION_FILE = Regex(
-            "^(.+?)_(?:images_frame_\\d+\\.jpg|transforms\\.json|trajectory\\.csv|" +
-                "coverage_summary\\.json|focus_metadata\\.json|probe\\.jpg)$",
+            "^(.+?)_(?:(?:scan_\\d+_)?(?:images_frame_\\d+\\.jpg|transforms\\.json|trajectory\\.csv|" +
+                "coverage_summary\\.json|focus_metadata\\.json)|certificate\\.json|probe\\.jpg|processing_checkpoint\\.json)$",
         )
     }
 
@@ -156,17 +163,16 @@ class ScanGalleryActivity : AppCompatActivity() {
         entry.legacyFallbackDir?.let { dir ->
             val imgFile = File(dir, "images/frame_00000.jpg")
             if (imgFile.isFile) return imgFile.inputStream()
-            val anyImg = File(dir, "images").listFiles()?.firstOrNull { it.name.endsWith(".jpg") }
+            val anyImg = dir.walkTopDown().firstOrNull { it.isFile && it.name.endsWith(".jpg") }
             if (anyImg != null) return anyImg.inputStream()
         }
         if (entry.legacyFlatMediaSession) {
-            val prefix = "${entry.sessionName}_images_"
             val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             contentResolver.query(
                 uri,
                 arrayOf(MediaStore.Files.FileColumns._ID),
-                "${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?",
-                arrayOf("Documents/${DatasetWriter.ALBUM}/", "$prefix%.jpg"),
+                "(${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?) AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ? AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?",
+                arrayOf("Documents/${DatasetWriter.ALBUM}/", "Documents/${DatasetWriter.ALBUM}", "${entry.sessionName}_%", "%.jpg"),
                 "${MediaStore.Files.FileColumns.DISPLAY_NAME} ASC",
             )?.use { cursor ->
                 if (cursor.moveToFirst()) {
@@ -227,6 +233,9 @@ class ScanGalleryActivity : AppCompatActivity() {
                             val session = flatMatch.groupValues[1]
                             val entry = out.getOrPut(session) { ScanEntry(session, 0L, 0L) }
                             entry.legacyFlatMediaSession = true
+                            if (displayName.endsWith("processing_checkpoint.json")) {
+                                entry.hasCheckpoint = true
+                            }
                             entry.sizeBytes += size
                             entry.lastModifiedMs = maxOf(entry.lastModifiedMs, modifiedMs)
                         }
@@ -258,6 +267,9 @@ class ScanGalleryActivity : AppCompatActivity() {
                 val size = f.walkTopDown().filter { it.isFile }.sumOf { it.length() }
                 val entry = out.getOrPut(f.name) { ScanEntry(f.name, 0L, 0L) }
                 entry.legacyFallbackDir = f
+                if (File(f, "processing_checkpoint.json").isFile) {
+                    entry.hasCheckpoint = true
+                }
                 entry.sizeBytes += size
                 entry.lastModifiedMs = maxOf(entry.lastModifiedMs, f.lastModified())
             }
@@ -314,7 +326,11 @@ class ScanGalleryActivity : AppCompatActivity() {
         }
 
         val processLabel = TextView(this).apply {
-            text = if (isProcessed) "Processed" else "Process"
+            text = when {
+                isProcessed -> "Processed"
+                entry.hasCheckpoint -> "Resume"
+                else -> "Process"
+            }
             setTextColor(color(if (isProcessed) R.color.action_ready else R.color.action))
             textSize = 13f
             isClickable = !isProcessed
@@ -322,6 +338,17 @@ class ScanGalleryActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply { rightMargin = dp(14) }
+        }
+
+        val shareLabel = TextView(this).apply {
+            text = "Share"
+            setTextColor(color(R.color.action))
+            textSize = 13f
+            visibility = if (isProcessed) android.view.View.VISIBLE else android.view.View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { rightMargin = dp(14) }
+            setOnClickListener { shareScan(entry) }
         }
 
         val deleteLabel = TextView(this).apply {
@@ -347,6 +374,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         }
 
         actionArea.addView(processLabel)
+        actionArea.addView(shareLabel)
         actionArea.addView(deleteLabel)
         actionArea.addView(progressBar)
         actionArea.addView(progressText)
@@ -354,6 +382,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         processLabel.setOnClickListener {
             if (isProcessed) return@setOnClickListener
             processLabel.visibility = android.view.View.GONE
+            shareLabel.visibility = android.view.View.GONE
             deleteLabel.visibility = android.view.View.GONE
             progressBar.visibility = android.view.View.VISIBLE
             progressText.visibility = android.view.View.VISIBLE
@@ -365,17 +394,24 @@ class ScanGalleryActivity : AppCompatActivity() {
                 progressBar.visibility = android.view.View.GONE
                 progressText.visibility = android.view.View.GONE
                 if (success) {
+                    ScanProcessor.markProcessed(entry.sessionName)
                     processLabel.text = "Processed"
                     processLabel.setTextColor(color(R.color.action_ready))
                     processLabel.isClickable = false
                     processLabel.isEnabled = false
                     processLabel.visibility = android.view.View.VISIBLE
+                    shareLabel.visibility = android.view.View.VISIBLE
                     deleteLabel.visibility = android.view.View.VISIBLE
-                    reload()
+                    Toast.makeText(this, "Processing complete!", Toast.LENGTH_SHORT).show()
                 } else {
+                    entry.hasCheckpoint = true
+                    processLabel.text = "Resume"
+                    processLabel.setTextColor(color(R.color.action))
+                    processLabel.isClickable = true
+                    processLabel.isEnabled = true
                     processLabel.visibility = android.view.View.VISIBLE
                     deleteLabel.visibility = android.view.View.VISIBLE
-                    android.widget.Toast.makeText(this, "Processing failed", android.widget.Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "Processing interrupted. Tap Resume to continue.", Toast.LENGTH_LONG).show()
                 }
             }
         }
@@ -383,6 +419,7 @@ class ScanGalleryActivity : AppCompatActivity() {
         deleteLabel.setOnClickListener {
             confirmDelete(entry) {
                 processLabel.visibility = android.view.View.GONE
+                shareLabel.visibility = android.view.View.GONE
                 deleteLabel.visibility = android.view.View.GONE
                 progressBar.visibility = android.view.View.VISIBLE
                 progressText.visibility = android.view.View.VISIBLE
@@ -395,6 +432,10 @@ class ScanGalleryActivity : AppCompatActivity() {
         row.addView(actionArea)
 
         return row
+    }
+
+    private fun shareScan(entry: ScanEntry) {
+        ScanProcessor.shareScan(this, entry.sessionName)
     }
 
     private fun processScan(entry: ScanEntry, onProgress: (Int) -> Unit, onComplete: (Boolean) -> Unit) {

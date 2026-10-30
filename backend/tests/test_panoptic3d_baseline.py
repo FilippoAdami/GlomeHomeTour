@@ -6,7 +6,7 @@ import sys
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / '06c_semantic_segmentation'))
+sys.path.insert(0, str(ROOT / '05_semantic_segmentation'))
 from panoptic3d_baseline import class_color, legacy_face_sources, recover_baseline_labels
 
 

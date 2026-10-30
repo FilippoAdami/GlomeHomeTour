@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'06c_semantic_segmentation'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'05_semantic_segmentation'))
 from planar_gap_completion import complete_planar_gaps
 from detect_structural_classes import build_mesh_dual_graph
 from refine_class_boundaries import compute_mesh_derivatives

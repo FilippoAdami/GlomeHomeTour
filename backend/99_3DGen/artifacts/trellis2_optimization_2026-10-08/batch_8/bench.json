@@ -1,0 +1,40 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "../images/bench.jpg",
+  "output": "../artifacts/trellis2_optimization_2026-10-08/batch_8/bench.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "steps": 8,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "inference_seconds": 66.58987172500201,
+  "glb_export_seconds": 9.556381906000752,
+  "peak_allocated_gib": 4.762181282043457,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.7742772349993174
+    ],
+    "get_cond": [
+      1.65921598299974,
+      3.312109873000736
+    ],
+    "sample_sparse_structure": [
+      10.824690664001537
+    ],
+    "sample_shape_slat_cascade": [
+      31.504539679001027
+    ],
+    "sample_tex_slat": [
+      13.96422306599925
+    ],
+    "decode_latent": [
+      2.5467046030025813
+    ]
+  },
+  "glb_bytes": 5101532,
+  "model_load_seconds": 0.0,
+  "gpu_resident_setup_seconds": 0.0,
+  "total_seconds": 76.14625363100276
+}

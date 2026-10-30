@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -22,6 +23,9 @@ import numpy as np
 import shapely
 from shapely.geometry import MultiPoint, LineString
 
+_depth_dir = Path(__file__).resolve().parents[1] / "02_depth_estimation"
+if str(_depth_dir) not in sys.path:
+    sys.path.insert(0, str(_depth_dir))
 from floor_bands import count_floor_bands
 
 # Empirical indoor keyframe constants

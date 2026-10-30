@@ -24,6 +24,7 @@ FIXTURE_SCHEMA_PAIRS = [
     ("asset_manifest.example.json", "asset_manifest.schema.json"),
     ("asset_manifest.free.example.json", "asset_manifest.schema.json"),
     ("mesh_manifest.example.json", "mesh_manifest.schema.json"),
+    ("certificate.example.json", "certificate.schema.json"),
 ]
 
 

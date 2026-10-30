@@ -1,0 +1,113 @@
+{
+  "date": "2026-10-08",
+  "hardware": "AMD Radeon RX 9060 XT, 16 GiB",
+  "software": "ROCm 7.1.1, PyTorch 2.10.0+rocm7.0",
+  "input": "Pixal3D/assets/images/fan.jpg",
+  "common_settings": {
+    "seed": 42,
+    "low_vram": true,
+    "resolution": 1024,
+    "max_num_tokens": 49152,
+    "mesh_decimation_target": 150000,
+    "texture_size": 1024
+  },
+  "timing_method": "PIXAL_TIMING synchronizes HIP before and after measured segments. It adds a small amount of instrumentation overhead; all comparable variants used the same timing mode.",
+  "runs": {
+    "fp16_12step_profile": {
+      "log": "pixal_profile_12.log",
+      "glb": "pixal_profile_12.glb",
+      "steps": 12,
+      "total_seconds": 183.86,
+      "pipeline_seconds": 110.31,
+      "glb_seconds": 9.51,
+      "peak_allocated_gib": 13.02,
+      "timings_seconds": {
+        "pixal_model_init": 53.401,
+        "image_preprocess": 2.800,
+        "moge_model_load": 4.834,
+        "moge_camera_estimate": 2.546,
+        "condition_sparse_structure": 1.629,
+        "sample_sparse_structure": 13.892,
+        "condition_shape_lr": 2.920,
+        "sample_shape_lr": 6.838,
+        "upsample_shape_coords": 1.433,
+        "condition_shape_hr": 5.789,
+        "sample_shape_hr": 39.505,
+        "condition_texture": 11.998,
+        "sample_texture": 23.293,
+        "decode_latents": 2.979
+      }
+    },
+    "fp16_10step": {
+      "log": "pixal_steps_10.log",
+      "glb": "pixal_steps_10.glb",
+      "steps": 10,
+      "total_seconds": 171.41,
+      "pipeline_seconds": 96.75,
+      "glb_seconds": 10.02,
+      "peak_allocated_gib": 13.02
+    },
+    "fp16_8step": {
+      "log": "pixal_steps_8.log",
+      "glb": "pixal_steps_8.glb",
+      "steps": 8,
+      "total_seconds": 159.25,
+      "pipeline_seconds": 85.04,
+      "glb_seconds": 9.43,
+      "peak_allocated_gib": 13.02
+    },
+    "bf16_naf_12step": {
+      "log": "pixal_bf16_12.log",
+      "glb": "pixal_bf16_12.glb",
+      "steps": 12,
+      "total_seconds": 228.17,
+      "pipeline_seconds": 151.22,
+      "glb_seconds": 13.31,
+      "peak_allocated_gib": 13.02,
+      "naf_conditioning_seconds": {
+        "shape_lr": 13.027,
+        "shape_hr": 34.008
+      }
+    },
+    "fp16_12step_conditioners_resident": {
+      "log": "pixal_keep_cond_12.log",
+      "glb": "pixal_keep_cond_12.glb",
+      "steps": 12,
+      "total_seconds": 184.52,
+      "pipeline_seconds": 108.45,
+      "glb_seconds": 9.28,
+      "peak_allocated_gib": 13.03
+    },
+    "fp16_12step_manual_fov": {
+      "log": "pixal_manual_fov_12.log",
+      "glb": "pixal_manual_fov_12.glb",
+      "steps": 12,
+      "manual_fov_radians": 0.8217,
+      "total_seconds": 177.98,
+      "pipeline_seconds": 112.15,
+      "glb_seconds": 8.39,
+      "peak_allocated_gib": 13.02,
+      "moge_skipped": true
+    }
+  },
+  "failed_experiment": {
+    "name": "skip_empty_cache",
+    "log": "pixal_skip_cache_12.log",
+    "result": "CuMesh out-of-memory during GLB simplification/remeshing; no completed GLB or end-to-end time. Keep cache clearing enabled."
+  },
+  "interpretation": [
+    "The 1024 cascade breaks out of the max_num_tokens resolution loop at 1024, so changing max_num_tokens does not alter this pipeline's resolution or token count.",
+    "Each run is a single measurement. Timing differences of a few seconds may be normal run-to-run variation.",
+    "The inspection renders show the 10-step silhouette close to 12 steps, but with a visible texture/color artifact on the base; 8 steps has more visibly incoherent details. These are not broad quality evaluations.",
+    "A 50,000-point bidirectional surface comparison against the 12-step mesh gives mean nearest-surface distances of 0.004786 model units (10 steps) and 0.004918 (8 steps). This measures only geometric proximity, not topology, texture quality, or correctness against ground truth.",
+    "BF16 NAF is substantially slower than the FP16 baseline on this test."
+  ],
+  "surface_comparison": {
+    "method": "50,000 deterministic area-weighted surface samples per mesh; symmetric nearest-surface distance",
+    "against_12step_mean_distance_model_units": {
+      "10_steps": 0.004786,
+      "8_steps": 0.004918
+    },
+    "limitation": "Relative mesh comparison only; not ground-truth accuracy and not sensitive to all topology or appearance defects."
+  }
+}

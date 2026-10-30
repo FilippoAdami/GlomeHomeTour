@@ -71,6 +71,18 @@ def _component_orientation_penalties(reference, labels, areas, normals, u, v, co
     return costs[torch.as_tensor(component,device=device)]
 
 
+def corroborated_faces(labels: np.ndarray, priors: csr_matrix, source_ids: np.ndarray) -> np.ndarray:
+    """Require the final owner, not a competing source, to have multi-view support."""
+    if priors.shape != (len(labels), len(source_ids)):
+        raise ValueError('evidence dimensions must match face labels and source IDs')
+    if not len(source_ids):
+        return np.zeros(len(labels), dtype=bool)
+    mass = np.asarray(priors.sum(axis=1)).ravel()
+    best = np.asarray(priors.max(axis=1).toarray()).ravel()
+    winner = np.asarray(priors.argmax(axis=1)).ravel()
+    return (source_ids[winner] == labels) & (best >= 3) & (best / np.maximum(mass, 1e-12) >= .75)
+
+
 def correct_confident_faces(
     initial_labels: np.ndarray,
     priors: csr_matrix,
@@ -384,8 +396,6 @@ def refine_graph_labels(
         energies.append(current)
         changes.append(changed)
         iteration_seconds.append(time.perf_counter()-started)
-        if device.startswith('cuda'):
-            time.sleep(.01)  # Let the desktop compositor run between synchronized rounds.
     result = initial_labels.copy()
     result[known_geometry] = vocabulary[labels.cpu().numpy()[known_geometry]]
     return result, {'converged': converged, 'energies': energies, 'changes': changes,

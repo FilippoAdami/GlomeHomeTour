@@ -170,7 +170,9 @@ def beam_surface(normal, offset, inward, transverse, period, width, depth, phase
 
 def close_slab(bottom_vertices, bottom_faces, floor_equation):
     """Use the actual relief boundary for the skirt and a conforming projected top."""
-    bottom = trimesh.Trimesh(vertices=bottom_vertices, faces=bottom_faces, process=True)
+    # Match PLY's float32 coordinates before topology construction so export cannot collapse seams later.
+    bottom = trimesh.Trimesh(vertices=np.asarray(bottom_vertices, dtype=np.float32),
+                             faces=bottom_faces, process=True)
     top = bottom.vertices.copy()
     peq = np.array(floor_equation, dtype=float, copy=True)
     top[:, 1] = -(peq[0]*top[:, 0] + peq[2]*top[:, 2] + peq[3])/peq[1]
@@ -203,7 +205,8 @@ def close_slab(bottom_vertices, bottom_faces, floor_equation):
         side_vertices.extend(xyz)
         side_faces.extend(triangles+start)
     faces = np.vstack([bottom.faces, bottom.faces[:, ::-1]+n, np.asarray(side_faces)])
-    mesh = trimesh.Trimesh(vertices=np.vstack([bottom.vertices, top, side_vertices]), faces=faces, process=True)
+    vertices = np.vstack([bottom.vertices, top, side_vertices]).astype(np.float32)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=True)
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals()

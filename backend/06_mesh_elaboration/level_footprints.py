@@ -10,7 +10,8 @@ from shapely.geometry import Polygon, mapping
 from shapely.ops import unary_union
 from shapely import contains_xy
 from surface_footprints import (clean_footprint, observed_footprint, polygons,
-                                frame_footprint, snap_footprint_to_walls, constrain_footprint, wall_regions)
+                                frame_footprint, snap_footprint_to_walls, constrain_footprint,
+                                regularize_orthogonal_footprint, wall_regions)
 
 
 def sample_ring(ring, spacing=.01):
@@ -65,10 +66,18 @@ def fit_distance_footprint(initial, contour, min_edge=.10):
     outputs, records = [], []
     for poly in polygons(initial):
         source = max(polygons(contour), key=lambda p: p.intersection(poly).area)
-        source_rings = [source.exterior, *source.interiors]
+        source_holes = list(source.interiors)
         fitted_rings = []
-        for ring in [poly.exterior, *poly.interiors]:
-            evidence = min(source_rings, key=lambda r: r.hausdorff_distance(ring))
+        for index, ring in enumerate([poly.exterior, *poly.interiors]):
+            if index == 0:
+                evidence = source.exterior
+            elif source_holes:
+                candidate = min(source_holes, key=lambda r: r.hausdorff_distance(ring))
+                # Clipping by a floor or room boundary can introduce a valid hole
+                # absent from the ceiling's own support contour. Keep that hole.
+                evidence = candidate if candidate.hausdorff_distance(ring) <= .15 else ring
+            else:
+                evidence = ring
             samples = sample_ring(evidence)
             current = np.array(ring.coords[:-1])
             before = float(np.mean(squared_distances(samples, current)))
@@ -114,7 +123,7 @@ def plane_y(equation, points):
     return -(points[:,0]*equation[0]+points[:,2]*equation[2]+equation[3])/equation[1]
 
 
-def collapse_level(vertices, faces, normals, centers, floor, ceilings, floors=()):
+def collapse_level(vertices, faces, centers, floor, ceilings, floors=()):
     """Select a scene height band; semantic surfaces define heights, never its contour."""
     floor_y = plane_y(floor['equation'],centers)
     lower = floor_y-.03
@@ -132,7 +141,7 @@ def collapse_level(vertices, faces, normals, centers, floor, ceilings, floors=()
         heights = plane_y(other['equation'],centers)
         above = heights>floor_y+.15
         upper[above] = np.minimum(upper[above],heights[above]-.12)
-    keep = ((centers[:,1]>=lower) & (centers[:,1]<=upper) & (np.abs(normals[:,1])>.5))
+    keep = (centers[:,1]>=lower) & (centers[:,1]<=upper)
     if not np.any(keep):
         raise ValueError(f"No source scene support in level band for {floor['name']}")
     return faces[keep]
@@ -152,7 +161,7 @@ def restore_level_footprints(units, scene_path, a, b, wall_planes, output_dir):
                   'objective':'mean squared Euclidean distance to uniformly sampled cleaned contour',
                   'sample_spacing_m':.01,'minimum_segment_m':.10,'levels':[]}
     for floor in floors:
-        selected = collapse_level(vertices,faces,normals,centers,floor,ceilings,floors)
+        selected = collapse_level(vertices,faces,centers,floor,ceilings,floors)
         initial,contour = observed_footprint(vertices,selected,a,b,return_contour=True)
         # Keep the measured connected level region associated with this floor instance.
         local_source = frame_footprint(floor['footprint'],a,b,inverse=True)
@@ -163,7 +172,7 @@ def restore_level_footprints(units, scene_path, a, b, wall_planes, output_dir):
         fitted,scores = fit_distance_footprint(initial,contour)
         fitted = snap_footprint_to_walls(fitted,wall_planes,a,b)
         fitted = constrain_footprint(fitted,wall_regions(wall_planes,a,b,floor['elevation']))
-        fitted = clean_footprint(fitted)
+        fitted = regularize_orthogonal_footprint(clean_footprint(fitted))
         final_scores = []
         for poly in polygons(fitted):
             evidence = max(polygons(contour),key=lambda p:p.intersection(poly).area)
@@ -207,12 +216,16 @@ def restore_level_footprints(units, scene_path, a, b, wall_planes, output_dir):
                 fitted,_ = fit_distance_footprint(clean_footprint(local),contour)
                 fitted = snap_footprint_to_walls(fitted,wall_planes,a,b)
                 fitted = constrain_footprint(fitted,wall_regions(wall_planes,a,b,ceiling['elevation']))
-                ceiling['footprint'] = frame_footprint(clean_footprint(fitted),a,b)
+                ceiling['footprint'] = frame_footprint(
+                    regularize_orthogonal_footprint(clean_footprint(fitted)),a,b
+                )
             else:
                 # Ceiling-only partial scan: collapse the source geometry below this plane.
                 keep = (centers[:,1]<=plane_y(ceiling['equation'],centers)+.15)&(np.abs(normals[:,1])>.5)
                 initial,contour = observed_footprint(vertices,faces[keep],a,b,return_contour=True)
                 fitted,_ = fit_distance_footprint(clean_footprint(initial),contour)
-                ceiling['footprint'] = frame_footprint(fitted,a,b)
+                ceiling['footprint'] = frame_footprint(
+                    regularize_orthogonal_footprint(fitted),a,b
+                )
         ceiling['footprint_source'] = 'full_scene_per_level_height_collapse'
     (Path(output_dir)/'level_footprints_manifest.json').write_text(json.dumps(provenance,indent=2)+'\n')

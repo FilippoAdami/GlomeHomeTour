@@ -85,6 +85,29 @@ def test_wall_regions_close_only_small_endpoint_gaps_and_keep_recesses_and_rooms
     assert not any(room.covers(Point(3.5, 2)) for room in regions)
 
 
+def test_wall_regions_use_the_trimmed_span_at_the_requested_elevation():
+    x0 = x_wall(0, 0, 4)
+    x4 = x_wall(4, 0, 4)
+    for wall in (x0, x4):
+        wall['bounds_y'] = [-1., 4.]
+        wall['trim_regions'] = [
+            {'span_m': [0., 4.], 'bounds_y': [-1., .7]},
+            {'span_m': [0., 3.], 'bounds_y': [.7, 4.]},
+        ]
+    lower = [x0, x4, z_wall(0, 0, 4), z_wall(4, 0, 4)]
+    lower[2]['bounds_y'] = lower[3]['bounds_y'] = [-1., .7]
+    upper = [x0, x4, z_wall(0, 0, 4), z_wall(3, 0, 4)]
+    upper[2]['bounds_y'] = upper[3]['bounds_y'] = [.7, 4.]
+
+    lower_regions = wall_regions(lower, A, B, elevation=0.)
+    upper_regions = wall_regions(upper, A, B, elevation=2.)
+
+    assert len(lower_regions) == len(upper_regions) == 1
+    assert lower_regions[0].area == 16.
+    assert upper_regions[0].area == 12.
+    assert not upper_regions[0].covers(Point(2., 3.5))
+
+
 def test_constrain_footprint_trims_thin_slivers_but_keeps_broad_supported_patio():
     room = Polygon([(0, 0), (3, 0), (3, 3), (0, 3)])
     sliver = Polygon([(3, 1), (3.08, 1), (3.08, 2), (3, 2)])

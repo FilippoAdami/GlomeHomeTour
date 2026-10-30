@@ -83,13 +83,16 @@ class StepContext:
     ``workspace`` is where the shared ``pipeline_stats.json`` lives (always the
     scene root). ``artifacts_dir`` is where this step's own ``<name>_log.txt``
     and ``<name>_stats.json`` are written -- its per-stage subfolder, if it has
-    one, else the same as ``workspace``.
+    one, else the same as ``workspace``. Set ``write_artifacts=False`` to keep
+    only the shared stats update and console output.
     """
 
-    def __init__(self, name: str, workspace: Path | str, artifacts_dir: Path | str | None = None):
+    def __init__(self, name: str, workspace: Path | str, artifacts_dir: Path | str | None = None,
+                 write_artifacts: bool = True):
         self.name = name
         self.workspace = Path(workspace)
         self.artifacts_dir = Path(artifacts_dir) if artifacts_dir is not None else self.workspace
+        self.write_artifacts = write_artifacts
         self.metrics: dict[str, Any] = {}
         self.timings: dict[str, float] = {}
         self._started = 0.0
@@ -121,9 +124,11 @@ class StepContext:
 
     def __enter__(self) -> "StepContext":
         self.workspace.mkdir(parents=True, exist_ok=True)
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        if self.write_artifacts:
+            self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._started = time.time()
-        self._log = open(self.artifacts_dir / f"{self.name}_log.txt", "w", encoding="utf-8")
+        if self.write_artifacts:
+            self._log = open(self.artifacts_dir / f"{self.name}_log.txt", "w", encoding="utf-8")
         self.note("=" * 70)
         self.note(f"  STEP: {self.name}   started {_now()}")
         self.note("=" * 70)
@@ -166,8 +171,9 @@ class StepContext:
             self.note(f"OK in {elapsed:.1f}s")
             update_pipeline_stats(self.workspace, self.name, elapsed, frames_processed, t_per_frame)
 
-        (self.artifacts_dir / f"{self.name}_stats.json").write_text(
-            json.dumps(self.metrics, indent=2, default=str), encoding="utf-8")
+        if self.write_artifacts:
+            (self.artifacts_dir / f"{self.name}_stats.json").write_text(
+                json.dumps(self.metrics, indent=2, default=str), encoding="utf-8")
         if self._log is not None:
             self._log.close()
             self._log = None

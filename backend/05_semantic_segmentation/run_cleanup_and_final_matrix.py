@@ -20,6 +20,7 @@ Logic:
    - Updated per-frame NPZ archives and JSON summaries.
 """
 
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, numpy as np
@@ -27,6 +28,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 MAX_AVG_GAP_ALLOWED = 5.0
 RARE_APPEARANCE_THRESHOLD = 2
@@ -206,10 +208,14 @@ def create_final_triangular_matrix(classes_dict: dict, out_path: Path):
     plt.close(fig)
 
 def main():
-    root = Path(__file__).resolve().parent.parent
-    in_dir = root / "current_scene" / "06c_semantic_segmentation" / "first50_memory_consolidated"
-    img_dir = root / "current_scene" / "06c_semantic_segmentation" / "inputs" / "images"
-    out_dir = root / "current_scene" / "06c_semantic_segmentation" / "first50_final_cleaned"
+    parser = argparse.ArgumentParser(description="Clean consolidated semantic classes and render final diagnostics.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
+    workspace = stage_directory(args.workspace)
+    in_dir = workspace / "first50_memory_consolidated"
+    image_paths = registered_images(args.workspace)
+    img_dir = image_paths[0].parent
+    out_dir = workspace / "first50_final_cleaned"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     npz_files = sorted(in_dir.glob("frame_*_consolidated.npz"))

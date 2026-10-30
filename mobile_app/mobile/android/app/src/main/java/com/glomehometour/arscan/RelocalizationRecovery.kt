@@ -215,7 +215,7 @@ object RelocalizationRecovery {
         var bestTransform: RigidTransform? = null
         var maxInliers = 0
         val maxIterations = 60
-        val inlierDistSqThreshold = 0.0064f // 8cm residual threshold
+        val inlierDistSqThreshold = 0.0036f // 6cm residual threshold
 
         val pSrc = Array(3) { FloatArray(3) }
         val pDst = Array(3) { FloatArray(3) }
@@ -276,6 +276,11 @@ object RelocalizationRecovery {
 
             val candidateT = solve3PointRigid(pSrc, pDst) ?: continue
 
+            // Sanity check: translation distance <= 2.0 meters, vertical drift <= 0.6 meters,
+            // and upright orientation (r11 > 0.85) since gravity is known by phone sensors
+            val transDistSq = candidateT.tx * candidateT.tx + candidateT.ty * candidateT.ty + candidateT.tz * candidateT.tz
+            if (transDistSq > 4.0f || abs(candidateT.ty) > 0.6f || candidateT.r11 < 0.85f) continue
+
             // Evaluate inliers across all near landmarks
             var inliers = 0
             var residualSum = 0f
@@ -297,8 +302,8 @@ object RelocalizationRecovery {
                 }
             }
 
-            // Require high consensus: at least 6 points and mean residual < 6cm
-            if (inliers > maxInliers && inliers >= 6 && (residualSum / inliers) < 0.06f) {
+            // Require high consensus: at least 6 points and mean residual < 5cm
+            if (inliers > maxInliers && inliers >= 6 && (residualSum / inliers) < 0.05f) {
                 maxInliers = inliers
                 bestTransform = candidateT.copy(
                     inliers = inliers,

@@ -1,0 +1,16 @@
+[
+  {
+    "image": "bench.jpg",
+    "seed": 34,
+    "distance_scale": 0.9,
+    "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/camera_sweep/pixal3d_bench_distance_0.9.glb",
+    "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/camera_sweep/bench_distance_0.9.log",
+    "wall_seconds": 234.49674488299934,
+    "camera_params": "{'camera_angle_x': 0.5814443883287566, 'distance': 1.5040134072303772, 'mesh_scale': 1.0}",
+    "glb_bytes": 6556788,
+    "total_seconds": 234.36,
+    "pipeline_seconds": 153.13,
+    "glb_export_seconds": 10.92,
+    "peak_vram_gib": 13.02
+  }
+]

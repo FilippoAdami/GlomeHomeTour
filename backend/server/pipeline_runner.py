@@ -24,8 +24,14 @@ def optimize_3d_assets(workspace: Path, property_id: str) -> tuple[str, str]:
     prop_out_dir = OUTPUTS_DIR / property_id
     prop_out_dir.mkdir(parents=True, exist_ok=True)
 
+    # A single captured scan is stored under scan_N; accept legacy flat workspaces too.
+    scene = workspace
+    scan_dirs = sorted(workspace.glob("scan_*"))
+    if not (scene / "mesh.ply").is_file() and len(scan_dirs) == 1:
+        scene = scan_dirs[0]
+
     # 1. Process mesh
-    sealed_mesh_ply = workspace / "06c_semantic_segmentation" / "step1_cleaned_mesh" / "mesh_sealed_colored.ply"
+    sealed_mesh_ply = scene / "mesh.ply"
     target_obj = prop_out_dir / "mesh_web.obj"
     mesh_url = f"/static/outputs/{property_id}/mesh_web.obj"
 
@@ -52,13 +58,15 @@ def optimize_3d_assets(workspace: Path, property_id: str) -> tuple[str, str]:
     else:
         raise FileNotFoundError(f"No cleaned sealed mesh found at {sealed_mesh_ply}")
 
-    # Keep the Gaussian attributes intact; RGB-only point clouds cannot render as splats.
-    splat_dir = workspace / "03_FastGS_DNSplatter"
-    iterations = sorted(
-        splat_dir.glob("point_cloud/iteration_*/point_cloud.ply"),
-        key=lambda path: int(path.parent.name.removeprefix("iteration_")),
-    )
-    raw_splat_ply = iterations[-1] if iterations else splat_dir / "point_cloud_INRIA.ply"
+    # The mesh manifest selects the stage 04 derivative without modifying stage 03.
+    raw_splat_ply = scene / "gaussian_splat" / "gaussian_splat.ply"
+    mesh_manifest = sealed_mesh_ply.parent / "mesh.json"
+    if mesh_manifest.is_file():
+        mesh_info = json.loads(mesh_manifest.read_text(encoding="utf-8"))
+        if mesh_info.get("gsplat_sealing"):
+            raw_splat_ply = Path(mesh_info["gsplat_sealing"]["ply_path"])
+    if not raw_splat_ply.is_file():
+        raise FileNotFoundError(f"No trained Gaussian PLY found at {raw_splat_ply}")
     target_splat = prop_out_dir / "splat.ply"
     splat_url = f"/static/outputs/{property_id}/splat.ply"
 
@@ -82,7 +90,7 @@ def optimize_3d_assets(workspace: Path, property_id: str) -> tuple[str, str]:
         shutil.copy2(raw_splat_ply, temp_splat)
         os.replace(temp_splat, target_splat)
     else:
-        raise FileNotFoundError(f"No trained Gaussian PLY found under {splat_dir}")
+        raise FileNotFoundError(f"No trained Gaussian PLY found at {raw_splat_ply}")
 
     return mesh_url, splat_url
 
@@ -100,8 +108,7 @@ def execute_pipeline(property_id: str, archive_path: str):
         {"name": "colmap", "displayName": "COLMAP Pose Refinement & Alignment", "status": "queued"},
         {"name": "depth", "displayName": "DA3 Monocular Metric Depth & Normals", "status": "queued"},
         {"name": "train", "displayName": "FastGS + DN-Splatter Radiance Training", "status": "queued"},
-        {"name": "mesh", "displayName": "TSDF Metric Mesh Reconstruction", "status": "queued"},
-        {"name": "mesh_cleanup", "displayName": "Floater Removal & Mesh Sealing", "status": "queued"},
+        {"name": "mesh", "displayName": "Mesh Reconstruction, Gaussian Infill & Color Refinement", "status": "queued"},
     ]
 
     job_id = str(uuid.uuid4())
@@ -113,7 +120,7 @@ def execute_pipeline(property_id: str, archive_path: str):
     conn.commit()
     conn.close()
 
-    step_sequence = ["extract", "colmap", "depth", "train", "mesh", "mesh_cleanup"]
+    step_sequence = [stage["name"] for stage in stages]
 
     try:
         for idx, step_name in enumerate(step_sequence):

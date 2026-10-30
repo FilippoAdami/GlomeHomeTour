@@ -1,0 +1,52 @@
+{
+  "schema_version": "1.0.0",
+  "producer": {
+    "name": "com.glomehometour.arscan",
+    "version": "0.1"
+  },
+  "policy_version": "1.0.0",
+  "completed_stages": [
+    "quality_gate",
+    "keyframe_selection",
+    "orientation_normalization",
+    "manifest_consolidation"
+  ],
+  "orientation_state": {
+    "raw_width": 1920,
+    "raw_height": 1080,
+    "raw_orientation": "landscape",
+    "is_already_portrait": false,
+    "processed_width": 1080,
+    "processed_height": 1920,
+    "processed_orientation": "portrait",
+    "rotation_applied_deg": 90,
+    "pose_rolled": true
+  },
+  "keyframe_density_settings": {
+    "keyframe_filter_enabled": true,
+    "keyframes_per_m2_lo": 8.0,
+    "keyframes_per_m2_hi": 11.0,
+    "base_keyframes": 50.0,
+    "standoff_m": 0.8,
+    "min_room_area_m2": 9.0,
+    "min_translation_m": 0.08,
+    "min_rotation_deg": 4.0,
+    "quality_gate_blur_threshold": 0.35,
+    "decimation_stride": 8
+  },
+  "frames": {
+    "total_input_frames": 100,
+    "retained_frames_count": 2,
+    "discarded_frames_count": 98
+  },
+  "manifest_hashes": {
+    "transforms.json": "aa4aa52055d620eca7fe79048a8da321b9dd5c1c5d3509891f6804a8d276aa12",
+    "trajectory.csv": "6939bb19812cf07c64e2770aad72309268d2661f26112b406a3e97ec259f71b6",
+    "coverage_summary.json": "c0b3b5a06bb7fa707ed4775a69b4a688bfe57ef57bb09a5b15a064d0357a7fdd",
+    "focus_metadata.json": "b1275c63878943d7984481f6e10aad7b0d322471fdf430280f6798e1ea6cefde"
+  },
+  "image_hashes": {
+    "images/frame_00000.jpg": "bb37555926d211a1e7af184f3838771f5815d9fdb97abc806a8744adda7d962f",
+    "images/frame_00001.jpg": "d03c8ccadbb2e3e478bd0f9fc35e7e0eb61ec27efc110e841b4b824bedc53dbb"
+  }
+}

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 backend_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(backend_dir / "06c_semantic_segmentation"))
+sys.path.insert(0, str(backend_dir / "05_semantic_segmentation"))
 
 from refine_class_boundaries import (
     align_structural_planes,
@@ -367,8 +367,8 @@ def test_absorb_enclosed_subparts_texture_protection():
     assert cleaned_plain[4] == 5 and cleaned_plain[5] == 5
 
 
-def test_align_structural_planes_ceiling_non_vertical():
-    """Verifies that vertical surfaces misclassified as ceiling are reassigned to their boundary wall neighbor."""
+def test_align_structural_planes_preserves_overhead_vertical_ceiling_sides():
+    """A ceiling assembly can contain vertical beam faces beside a real wall."""
     # Ceiling quad (Y=2.0, pointing down: normal [0, -1, 0]) + Vertical wall quad (Y=1.0 to 2.0, normal [0, 0, 1])
     verts = np.array([
         [0.0, 2.0, 0.0],  # 0
@@ -406,10 +406,10 @@ def test_align_structural_planes_ceiling_non_vertical():
     # T0, T1 remain Ceiling #1 (downward facing)
     assert cleaned[0] == 1
     assert cleaned[1] == 1
-    # T2 (vertical leakage with horizontal normal) CANNOT be ceiling and must be reassigned to Wall #5!
-    assert cleaned[2] == 5
+    # The observed ceiling side keeps its owner across the normal crease.
+    assert cleaned[2] == 1
     assert cleaned[3] == 5
-    assert stats.get("ceiling_leakages_reassigned", 0) == 1
+    assert stats.get("ceiling_leakages_reassigned", 0) == 0
 
 
 def test_align_structural_planes_floor_45_degree_tilt():

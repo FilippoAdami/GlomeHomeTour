@@ -1,0 +1,38 @@
+{
+  "image": "/home/monday/Desktop/3DGen/images/radiator.jpg",
+  "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/radiator_geometry_tests/trellis_shape_pixal_texture_radiator.glb",
+  "seed": 34,
+  "shape_source": "microsoft/TRELLIS.2-4B shape_slat_flow_model_512+1024",
+  "texture_source": "TencentARC/Pixal3D tex_slat_flow_model_1024 with projection conditioning",
+  "resolution": 1024,
+  "camera_params": {
+    "camera_angle_x": 0.7156876947840787,
+    "distance": 1.3371014595031738,
+    "mesh_scale": 1.0
+  },
+  "max_num_tokens": 49152,
+  "texture_steps": 12,
+  "decimation_target": 150000,
+  "texture_size": 1024,
+  "low_vram": true,
+  "timings_seconds": {
+    "trellis_model_load": 69.48719188500036,
+    "trellis_preprocess": 2.811489898002037,
+    "trellis_condition_512": 2.5375808579992736,
+    "trellis_condition_1024": 3.3304505800006154,
+    "trellis_sparse_structure": 14.637426302000677,
+    "trellis_shape_cascade": 43.03293766199931,
+    "pixal_model_load": 103.99172759200155,
+    "pixal_preprocess": 2.2097808979997353,
+    "moge_model_load": 5.876286971000809,
+    "moge_camera_estimate": 0.5350265140004922,
+    "pixal_texture_condition": 13.446503374001622,
+    "pixal_texture_sampling": 18.061641074000363,
+    "pixal_decode_shared_shape_and_texture": 3.2022538170022017,
+    "allocated_gib_before_export": 0.3679847717285156,
+    "glb_postprocess_export": 10.226727402001416,
+    "total_seconds": 294.5231184410004
+  },
+  "peak_allocated_gib": 13.017558097839355,
+  "glb_bytes": 5985076
+}

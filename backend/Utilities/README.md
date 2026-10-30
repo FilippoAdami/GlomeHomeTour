@@ -11,7 +11,8 @@
 | [`pipeline_paths.py`](pipeline_paths.py) | **Import Bootstrapper**: Injects all numbered pipeline stage directories (`00_ingestion`, `01_poses_refinment`, etc.) onto `sys.path` so modules can import across stages using flat names without package namespace syntax conflicts. |
 | [`pipeline_step.py`](pipeline_step.py) | **Execution Context (`StepContext`)**: Standardizes step execution, timing blocks (`ctx.timer`), JSON metrics recording (`ctx.metric`), step logging (`ctx.note`), and idempotent completion tracking (`is_done`). |
 | [`scene_io.py`](scene_io.py) | **Scene Metadata Loader (`load_scene`)**: Unified dataset reader that parses `transforms.json`, images, and camera intrinsics into typed data structures. |
-| [`step_extract.py`](step_extract.py) | Utility to unpack and extract mobile captures into standard scene workspaces. |
+| [`scene_alignment.py`](scene_alignment.py) | Shared wall-orientation estimation and horizontal point rotation used by COLMAP refinement and depth-stage scene diagnostics. |
+| [`step_extract.py`](step_extract.py) | Legacy CLI alias for the standalone `00_ingestion/step_ingest.py` phase; later-phase routing must read `ingestion_results.json`. |
 | [`run_full_benchmark.py`](run_full_benchmark.py) | End-to-end benchmark suite executing and timing all stages on sample scenes with GPU profiling. |
 | [`worker/`](worker/) | **Asynchronous Job Worker**: Redis / RQ task consumer (`tasks.py`) running GPU reconstruction jobs in headless background worker daemons. |
 | [`third_party/`](third_party/) | Vendored external dependencies, including Depth Anything v3 streaming modules. |
@@ -46,7 +47,10 @@ with StepContext("depth", workspace) as ctx:
     ctx.metric("surfels", 500000)
     ctx.note("Completed depth estimation")
 ```
-This writes `<workspace>/depth_log.txt` and `<workspace>/depth_metrics.json` automatically.
+By default this writes `<workspace>/depth_log.txt` and
+`<workspace>/depth_stats.json`. A step can pass `write_artifacts=False` to
+write only the shared `<workspace>/pipeline_stats.json` entry while keeping
+messages on stdout; depth estimation uses this mode.
 
 ---
 

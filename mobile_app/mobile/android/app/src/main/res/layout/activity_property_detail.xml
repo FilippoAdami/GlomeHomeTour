@@ -81,6 +81,67 @@
         android:paddingHorizontal="16dp"
         android:paddingBottom="24dp">
 
+        <LinearLayout
+            android:id="@+id/propertyActionLayout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
+
+            <Button
+                android:id="@+id/processPropertyButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/btn_pill"
+                android:backgroundTint="@color/action"
+                android:stateListAnimator="@null"
+                android:text="Process Property"
+                android:textAllCaps="false"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
+            <Button
+                android:id="@+id/sharePropertyButton"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:layout_marginStart="6dp"
+                android:background="@drawable/btn_pill"
+                android:backgroundTint="@color/card"
+                android:stateListAnimator="@null"
+                android:text="Share Property"
+                android:textAllCaps="false"
+                android:textColor="@color/text_secondary"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/propertyBatchProgressLayout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="8dp"
+            android:visibility="gone">
+
+            <ProgressBar
+                android:id="@+id/propertyBatchProgress"
+                style="?android:attr/progressBarStyleHorizontal"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100" />
+
+            <TextView
+                android:id="@+id/propertyBatchProgressText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/text_faint"
+                android:textSize="12sp" />
+        </LinearLayout>
+
         <Button
             android:id="@+id/uploadPropertyButton"
             android:layout_width="match_parent"

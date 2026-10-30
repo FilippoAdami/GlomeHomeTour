@@ -434,34 +434,43 @@ def test_perimeter_alignment_preserves_measured_beam_dimensions():
     assert max(abs(v @ axis) for axis in axes) == pytest.approx(1., abs=1e-12)
 
 
-def test_wall_small_end_misalignment_uses_local_roof_height():
+def test_wall_height_uses_global_limits_without_local_roof_trimming():
     from recognize_and_regularize_patterns import wall_mesh
     a, b = np.array([1.,0.,0.]), np.array([0.,0.,1.])
-    faces = np.array([[0,1,2],[0,2,3]])
-    floor = np.array([[0.,0.,0.],[2.,0.,0.],[2.,0.,2.],[0.,0.,2.]])
-    roof = floor.copy(); roof[:,1] = 2.+roof[:,2]*.2
     wall = {'axis':'Dir A','offset_m':0.,'span_w_m':[-.05,2.05],
             'bounds_y':[0.,3.5],'normal_unit':a.tolist()}
-    vertices, _ = wall_mesh(wall, {'a':a,'b':b,'surfaces':[
-        {'role':'floor','generated':(floor,faces)}, {'role':'ceiling','generated':(roof,faces)}]})
-    assert vertices[:,1].max() < 2.42
+    vertices, _ = wall_mesh(wall, a, b, (0., 3.))
+    assert vertices[:,1].max() == pytest.approx(3.)
     assert vertices[:,1].min() == pytest.approx(0.)
 
 
-def test_tall_wall_small_horizontal_overshoot_is_trimmed_but_large_extension_survives():
+def test_wall_keeps_fitted_span_while_clipping_only_height():
     from recognize_and_regularize_patterns import wall_mesh
     a, b = np.array([1.,0.,0.]), np.array([0.,0.,1.])
-    faces = np.array([[0,1,2],[0,2,3]])
-    floor = np.array([[0.,0.,0.],[2.,0.,0.],[2.,0.,2.],[0.,0.,2.]])
-    roof = floor.copy(); roof[:,1] = 3.
-    units = {'a':a,'b':b,'surfaces':[
-        {'role':'floor','generated':(floor,faces)}, {'role':'ceiling','generated':(roof,faces)}]}
     wall = {'axis':'Dir A','offset_m':0.,'span_w_m':[-.08,2.08],
             'bounds_y':[0.,3.],'normal_unit':a.tolist()}
-    vertices,_ = wall_mesh(wall,units)
-    assert vertices[:,2].min() == pytest.approx(0.)
-    assert vertices[:,2].max() == pytest.approx(2.)
+    vertices,_ = wall_mesh(wall, a, b, (0., 3.))
+    assert vertices[:,2].min() == pytest.approx(-.08)
+    assert vertices[:,2].max() == pytest.approx(2.08)
     wall['span_w_m'] = [-.5,2.5]
-    vertices,_ = wall_mesh(wall,units)
+    vertices,_ = wall_mesh(wall, a, b, (0., 3.))
     assert vertices[:,2].min() == pytest.approx(-.5)
     assert vertices[:,2].max() == pytest.approx(2.5)
+
+def test_regularized_wall_mesh_preserves_partial_height_trim_regions():
+    from recognize_and_regularize_patterns import wall_mesh
+    a, b = np.array([1., 0., 0.]), np.array([0., 0., 1.])
+    wall = {
+        'axis': 'Dir A', 'offset_m': 0., 'span_w_m': [0., 4.],
+        'bounds_y': [0., 3.], 'normal_unit': a.tolist(),
+        'trim_regions': [
+            {'span_m': [0., 4.], 'bounds_y': [0., 1.]},
+            {'span_m': [0., 3.], 'bounds_y': [1., 3.]},
+        ],
+    }
+
+    vertices, _ = wall_mesh(wall, a, b, (0., 2.5))
+
+    upper = vertices[:, 1] > 1. + 1e-8
+    assert vertices[upper, 2].min() == pytest.approx(0.)
+    assert vertices[upper, 2].max() == pytest.approx(3.)

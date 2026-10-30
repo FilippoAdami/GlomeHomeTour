@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '06c_semantic_segmentation'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / '05_semantic_segmentation'))
 from mesh_prior_refinement import correct_confident_faces, refine_graph_labels, _sum_block_unaries
 
 

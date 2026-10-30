@@ -1,0 +1,40 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "../images/person.jpg",
+  "output": "../artifacts/trellis2_optimization_2026-10-08/batch_8/person.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "steps": 8,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "inference_seconds": 66.00218651500109,
+  "glb_export_seconds": 10.180057841000234,
+  "peak_allocated_gib": 4.80588960647583,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.104405301000952
+    ],
+    "get_cond": [
+      0.6884811839991016,
+      2.9218270749988733
+    ],
+    "sample_sparse_structure": [
+      8.678958222000801
+    ],
+    "sample_shape_slat_cascade": [
+      32.99390775899883
+    ],
+    "sample_tex_slat": [
+      16.146912866999628
+    ],
+    "decode_latent": [
+      2.4650827769983152
+    ]
+  },
+  "glb_bytes": 4736012,
+  "model_load_seconds": 0.0,
+  "gpu_resident_setup_seconds": 0.0,
+  "total_seconds": 76.18224435600132
+}

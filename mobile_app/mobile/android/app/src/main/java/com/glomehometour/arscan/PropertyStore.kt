@@ -33,6 +33,7 @@ class PropertyStore(context: Context) {
         var serverPropertyId: String? = null,
         val createdAtMs: Long = System.currentTimeMillis(),
         var uploadStatus: UploadStatus = UploadStatus.LOCAL_ONLY,
+        var isProcessed: Boolean = false,
     )
 
     data class RoomScan(
@@ -57,6 +58,18 @@ class PropertyStore(context: Context) {
 
     /** Session name -> room, for the gallery's file-first listing to look rows up against. */
     fun roomsBySession(): Map<String, RoomScan> = read().second.associateBy { it.sessionName }
+
+    fun isPropertyProcessed(context: Context, propertyId: String): Boolean {
+        val property = property(propertyId) ?: return false
+        val rList = rooms(propertyId)
+        if (rList.isEmpty()) return false
+        val allProcessed = rList.all { ScanProcessor.isProcessed(context, it.sessionName) }
+        if (allProcessed && !property.isProcessed) {
+            property.isProcessed = true
+            updateProperty(property)
+        }
+        return allProcessed
+    }
 
     fun addProperty(address: String, note: String?): Property {
         val property = Property(address = address, agentNote = note?.takeIf { it.isNotBlank() })
@@ -123,6 +136,7 @@ class PropertyStore(context: Context) {
                     serverPropertyId = o.optString("server_property_id").takeIf { it.isNotEmpty() },
                     createdAtMs = o.optLong("created_at_ms"),
                     uploadStatus = enumOr(o.optString("upload_status"), UploadStatus.LOCAL_ONLY),
+                    isProcessed = o.optBoolean("is_processed", false),
                 )
             }
             val rooms = root.optJSONArray("rooms").mapObjects { o ->
@@ -156,6 +170,7 @@ class PropertyStore(context: Context) {
                 put("server_property_id", p.serverPropertyId ?: "")
                 put("created_at_ms", p.createdAtMs)
                 put("upload_status", p.uploadStatus.name)
+                put("is_processed", p.isProcessed)
             })
         })
         root.put("rooms", JSONArray().apply {

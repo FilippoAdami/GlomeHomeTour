@@ -1,0 +1,39 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "/home/monday/Desktop/3DGen/images/bench.jpg",
+  "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_bench.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "model_load_seconds": 68.3739316329993,
+  "gpu_resident_setup_seconds": 0.0,
+  "inference_seconds": 134.7833932450012,
+  "glb_export_seconds": 11.834537486000045,
+  "total_seconds": 215.00765752299958,
+  "peak_allocated_gib": 4.762181282043457,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.774306565999723
+    ],
+    "get_cond": [
+      1.5451146879986482,
+      3.3043537070007005
+    ],
+    "sample_sparse_structure": [
+      14.748594249000234
+    ],
+    "sample_shape_slat_cascade": [
+      48.60110550900026
+    ],
+    "sample_tex_slat": [
+      27.58875871500095
+    ],
+    "decode_latent": [
+      36.21611087399833
+    ]
+  },
+  "glb_bytes": 5111024
+}

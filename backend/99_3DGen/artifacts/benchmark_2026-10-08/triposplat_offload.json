@@ -1,0 +1,35 @@
+{
+  "model_load_seconds": 7.833833657000014,
+  "end_to_end_seconds": 55.947455782999896,
+  "peak_allocated_gib": 4.753656387329102,
+  "device": "AMD Radeon RX 9060 XT",
+  "torch": "2.10.0+rocm7.0",
+  "hip": "7.0.51831",
+  "steps": 20,
+  "guidance_scale": 3.0,
+  "num_gaussians": 262144,
+  "attention_backend": "AOTriton SDPA",
+  "placement": "CPU offload per stage",
+  "stages": [
+    {
+      "stage": "preprocess",
+      "seconds": 1.9259181500001432,
+      "peak_allocated_gib": 2.4218225479125977
+    },
+    {
+      "stage": "encode",
+      "seconds": 2.1786986560000514,
+      "peak_allocated_gib": 4.753656387329102
+    },
+    {
+      "stage": "sample",
+      "seconds": 41.38713598999993,
+      "peak_allocated_gib": 1.149548053741455
+    },
+    {
+      "stage": "decode",
+      "seconds": 0.8684728090001954,
+      "peak_allocated_gib": 0.8363680839538574
+    }
+  ]
+}

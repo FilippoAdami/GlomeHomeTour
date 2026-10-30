@@ -23,7 +23,7 @@ def link(source, destination):
 
 
 def main():
-    stage = WORKSPACE / "06c_semantic_segmentation"
+    stage = WORKSPACE / "05_semantic_segmentation"
     run_dir = stage / RUN
     if WORKSPACE.exists() or run_dir.exists():
         raise FileExistsError(f"Refusing to overwrite candidate workspace: {WORKSPACE}")

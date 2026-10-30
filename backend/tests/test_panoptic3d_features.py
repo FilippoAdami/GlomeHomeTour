@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / '06c_semantic_segmentation'))
+sys.path.insert(0, str(ROOT / '05_semantic_segmentation'))
 from panoptic3d_features import load_colmap_tracks
 
 

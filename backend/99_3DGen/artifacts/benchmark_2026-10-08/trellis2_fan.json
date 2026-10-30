@@ -1,0 +1,39 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "assets/images/fan.jpg",
+  "output": "../artifacts/benchmark_2026-10-08/trellis2_fan.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 42,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "model_load_seconds": 69.62179324399949,
+  "inference_seconds": 144.60390899400045,
+  "glb_export_seconds": 10.445940087000054,
+  "total_seconds": 224.68874174600023,
+  "peak_allocated_gib": 4.883225440979004,
+  "steps_seconds": {
+    "preprocess_image": [
+      3.0428562219985906
+    ],
+    "get_cond": [
+      2.5335787770000024,
+      3.3603026880009566
+    ],
+    "sample_sparse_structure": [
+      15.013812279999911
+    ],
+    "sample_shape_slat_cascade": [
+      79.45449060099963
+    ],
+    "sample_tex_slat": [
+      37.796044136999626
+    ],
+    "decode_latent": [
+      3.400115062000623
+    ]
+  },
+  "glb_bytes": 5406900,
+  "cold_model_load_seconds": 2325.766,
+  "cold_model_load_note": "First load including original checkpoint download; output metrics below are from the cached rerun."
+}

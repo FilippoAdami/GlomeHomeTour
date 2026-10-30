@@ -252,6 +252,31 @@
         </LinearLayout>
     </LinearLayout>
 
+    <!-- Ghost frame overlay for multi-room visual alignment -->
+    <FrameLayout
+        android:id="@+id/alignmentOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone">
+
+        <!-- Central cutout viewfinder container -->
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:layout_gravity="center"
+            android:paddingHorizontal="44dp"
+            android:paddingVertical="130dp">
+
+            <ImageView
+                android:id="@+id/alignmentGhostImage"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="centerCrop"
+                android:alpha="0.55"
+                android:background="@drawable/alignment_border" />
+        </FrameLayout>
+    </FrameLayout>
+
     <!-- ============ bottom column: what to do next ============ -->
     <LinearLayout
         android:id="@+id/bottomColumn"

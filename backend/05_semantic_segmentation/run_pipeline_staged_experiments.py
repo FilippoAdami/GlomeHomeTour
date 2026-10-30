@@ -1,3 +1,4 @@
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, torch, numpy as np
@@ -11,6 +12,7 @@ import matplotlib.patches as patches
 # Ensure fast_sam2_generator can be imported
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fast_sam2_generator import FastSAM2Generator
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -552,9 +554,11 @@ def run_experiment(exp_name: str, grid_size: int, fill_gaps: bool, out_dir: Path
     return summary
 
 def main():
-    workspace = Path("backend/current_scene/06c_semantic_segmentation")
-    img_dir = workspace / "inputs" / "images"
-    image_paths = sorted(img_dir.glob("*.jpg"))[:50]
+    parser = argparse.ArgumentParser(description="Compare staged semantic-segmentation experiments.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
+    workspace = stage_directory(args.workspace)
+    image_paths = registered_images(args.workspace)[:50]
     print(f"Total test images: {len(image_paths)}")
 
     # 1. Config A: 8x8 Grid with Reprompting (fill_gaps=True)

@@ -7,14 +7,16 @@ Every step is also a standalone script; this only sequences them and summarises.
 Steps run **in-process** (imported and called), so a failure raises here with a
 real traceback instead of an exit code.
 
-Nothing is deleted mid-pipeline. Frames a step rejects are *moved* into that
-step's own discard folder together with their camera entry, so any step can be
-inspected, re-run or resumed in isolation. ``current_scene/`` is removed only
-after a fully successful run, and ``--keep-workspace`` keeps even that.
+Most steps move rejected frames into a discard folder. The COLMAP phase removes
+unregistered and low-feature images in place and prunes each scan's model to
+match; those images are not restored by ``--force``. Other stage outputs remain
+available for resume. ``current_scene/`` is removed only after a fully
+successful run, and ``--keep-workspace`` keeps even that.
 
 Resuming is the default: each step records itself in ``pipeline_stats.json`` and
-skips if its outputs are already present. ``--force`` re-runs a step, first
-restoring the frames it previously discarded so it sees its original input.
+skips if its outputs are already present. ``--force`` re-runs a step; stages
+with discard folders restore their saved frames first, while COLMAP reruns from
+the images currently present in each scan.
 
     --from-step colmap      start there, skip everything earlier
     --only-step depth       run exactly one step
@@ -53,9 +55,8 @@ STEPS: tuple[tuple[str, str], ...] = (
     ("depth", "02_depth_estimation/step_depth.py"),
     ("train", "03_FastGS_DNSplatter/step_train.py"),
     ("mesh", "04_3DGS_to_mesh/step_mesh.py"),
-    ("mesh_cleanup", "06c_semantic_segmentation/step1_remove_mesh_floaters.py"),
     ("floorplan", "05_floor_plan/step_floorplan.py"),
-    ("segmentation", "06_semantic_segmentation/step_segmentation.py"),
+    ("segmentation", "05_semantic_segmentation/step_segmentation.py"),
 )
 STEP_NAMES = [name for name, _ in STEPS]
 
@@ -127,8 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         rc = _load(module_path).main(step_args)
         if rc != 0:
             print(f"\nStep '{name}' returned {rc}; stopping. "
-                  f"The workspace is intact at {workspace} -- inspect "
-                  f"{name}_log.txt, then re-run to resume from here.")
+                  f"The workspace is intact at {workspace} -- inspect the console error, "
+                  f"pipeline_stats.json, and the affected scan outputs, then re-run to resume.")
             print_stats_summary(workspace, selected)
             return rc
 

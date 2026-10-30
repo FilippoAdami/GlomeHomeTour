@@ -115,16 +115,32 @@ def native_depth_points(camera, y, x, depth, transform):
 
 
 def load_depth_context(workspace, cameras):
-    root = workspace / '02_depth_estimation/depth'
-    metadata = root / 'poses_da3.npz'
-    if not metadata.exists():
+    root = workspace / 'depth'
+    if not root.is_dir():
+        root = workspace / '02_depth_estimation/depth'
+    aligned_metadata = workspace / 'phase04_alignment/depth/poses_da3.npz'
+    try:
+        poses_in_place = json.loads((workspace / 'mesh.json').read_text()).get(
+            'mesh_alignment', {}).get('poses_written_in_place', False)
+    except (OSError, ValueError):
+        poses_in_place = False
+    metadata_paths = ((root / 'poses_da3.npz', aligned_metadata) if poses_in_place
+                      else (aligned_metadata, root / 'poses_da3.npz'))
+    candidates = [path for path in metadata_paths if path.is_file()]
+    if not candidates:
         return None, set(), 'cached camera metadata unavailable; depth disabled'
-    with np.load(metadata) as z:
-        mapping = {Path(str(n)).stem: i for i, n in enumerate(z['names'])}
-        for c in cameras:
-            i = mapping.get(c['image_path'].stem)
-            if i is None or not np.allclose(c['K'], z['K'][i], atol=.01) or not np.allclose(c['viewmat'], z['w2c'][i], atol=1e-4):
-                return None, set(), 'cached cameras differ; depth disabled'
+    matching_metadata = None
+    for metadata in candidates:
+        with np.load(metadata) as z:
+            mapping = {Path(str(n)).stem: i for i, n in enumerate(z['names'])}
+            if all((i := mapping.get(c['image_path'].stem)) is not None
+                   and np.allclose(c['K'], z['K'][i], atol=.01)
+                   and np.allclose(c['viewmat'], z['w2c'][i], atol=1e-4)
+                   for c in cameras):
+                matching_metadata = metadata
+                break
+    if matching_metadata is None:
+        return None, set(), 'cached cameras differ; depth disabled'
     alignment = json.loads((root / 'depth_alignment.json').read_text())
     unreliable = {Path(n).stem for key in ('unreliable', 'unalignable', 'scale_outliers')
                   for n in alignment.get(key, [])}
@@ -229,7 +245,7 @@ def anchored_regions(mask, source, frame, mask_index, templates, scene, camera):
 
 
 def collect(workspace, out, stride, review_file=None):
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     inputs, frozen = stage / 'inputs', stage / 'full362_final_pipeline/npz_data'
     review = read_scene_review(stage, review_file)
     write_json(out / 'observation_policy.json', dict(distinct_masks=review.get('distinct_masks', [])))
@@ -452,7 +468,7 @@ def reviewed_object_bounds(workspace, review, observations, observation_instance
     specs = review.get('object_extents', [])
     if not specs:
         return []
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     cameras = load_cameras(stage / 'inputs')
     by_frame = {c['image_path'].stem: c for c in cameras}
     depth_root, unreliable, _ = load_depth_context(workspace, cameras)
@@ -528,7 +544,7 @@ def component_depth_evidence(workspace, out, vertices, triangles, labels, graph)
     free, agree = np.zeros(len(triangles), np.uint16), np.zeros(len(triangles), np.uint16)
     if not len(candidates):
         return free, agree
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     inputs = stage / 'inputs'
     cameras = sorted(load_cameras(inputs), key=lambda c: c['image_path'].name)
     root, unreliable, _ = load_depth_context(workspace, cameras)
@@ -583,7 +599,7 @@ def component_depth_evidence(workspace, out, vertices, triangles, labels, graph)
 
 def solve(workspace, out, strength, review_file=None, area_balance=0):
     verify_inputs(out)
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     observations = json.loads((out / 'observations.json').read_text())
     support = sparse.load_npz(out / 'observation_support.npz')
     cannot = json.loads((out / 'cannot_link.json').read_text())
@@ -831,7 +847,7 @@ def evaluate(workspace, out, stride):
     from scipy.sparse.csgraph import connected_components
     from panoptic3d_baseline import recover_baseline_labels
 
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     inputs = stage / 'inputs'
     cameras = sorted(load_cameras(inputs), key=lambda c: c['image_path'].name)
     observations = json.loads((out / 'observations.json').read_text())
@@ -1119,7 +1135,7 @@ def main():
     if args.stride < 2 or not np.isfinite(args.smoothness) or args.smoothness < 0 or not 0 <= args.area_balance <= 1:
         parser.error('stride must be >=2, smoothness nonnegative, and area balance between 0 and 1')
     workspace = args.workspace.resolve()
-    stage = workspace / '06c_semantic_segmentation'
+    stage = workspace / '05_semantic_segmentation'
     out = output_directory(stage, args.run_name)
     if args.phase in ('all', 'evidence'):
         out.mkdir(exist_ok=False)

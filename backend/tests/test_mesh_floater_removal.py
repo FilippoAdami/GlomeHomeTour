@@ -5,28 +5,36 @@ from pathlib import Path
 import tempfile
 import sys
 import trimesh
+import torch
 
 backend_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(backend_dir / "06c_semantic_segmentation"))
-from step1_remove_mesh_floaters import profile_component_geometry, clean_mesh_floaters
+sys.path.insert(0, str(backend_dir / "04_3DGS_to_mesh"))
+from mesh_cleanup import profile_component_geometry, clean_mesh_floaters
+from Utilities.pipeline_paths import bootstrap
+
+bootstrap()
+import gsplat_train
 
 
-def test_pipeline_orders_cleanup_before_web_export(tmp_path, monkeypatch):
+def test_mesh_stage_includes_cleanup_before_web_export(tmp_path, monkeypatch):
     import run_pipeline
     from server import pipeline_runner
 
     names = [name for name, _ in run_pipeline.STEPS]
-    assert names.index("mesh") + 1 == names.index("mesh_cleanup")
+    assert "mesh_cleanup" not in names
+    assert "mesh_rgb" not in names
     workspace = tmp_path / "scene"
-    raw_dir = workspace / "04_3DGS_to_mesh"
-    clean_dir = workspace / "06c_semantic_segmentation/step1_cleaned_mesh"
-    splat_dir = workspace / "03_FastGS_DNSplatter"
-    for directory in (raw_dir, clean_dir, splat_dir):
-        directory.mkdir(parents=True)
-    o3d.io.write_triangle_mesh(str(raw_dir / "mesh.ply"), create_flat_sheet())
-    o3d.io.write_triangle_mesh(str(clean_dir / "mesh_sealed_colored.ply"), o3d.geometry.TriangleMesh.create_box())
+    scan = workspace / "scan_0"
+    raw_dir = scan
+    clean_dir = raw_dir
+    splat_dir = scan / "gaussian_splat"
+    for directory in (raw_dir, splat_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    o3d.io.write_triangle_mesh(str(raw_dir / "mesh_initial.ply"), create_flat_sheet())
+    o3d.io.write_triangle_mesh(str(clean_dir / "mesh.ply"), o3d.geometry.TriangleMesh.create_box())
     cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.array([[0., 0., 0.], [1., 1., 1.]])))
-    o3d.io.write_point_cloud(str(splat_dir / "point_cloud_INRIA.ply"), cloud)
+    splat_ply = splat_dir / "gaussian_splat.ply"
+    o3d.io.write_point_cloud(str(splat_ply), cloud)
     monkeypatch.setattr(pipeline_runner, "OUTPUTS_DIR", tmp_path / "exports")
 
     mesh_url, _ = pipeline_runner.optimize_3d_assets(workspace, "test")
@@ -114,11 +122,16 @@ def test_clean_mesh_floaters_synthetic():
         input_ply = tmp_path / "synthetic_input.ply"
         out_dir = tmp_path / "cleaned_output"
         o3d.io.write_triangle_mesh(str(input_ply), combined)
+        xyz = np.eye(4, 3, dtype=np.float32)
+        splats = gsplat_train._make_splats(xyz, np.full_like(xyz, .5), torch.device("cpu"))
+        model = tmp_path / "gaussian_splat"
+        gsplat_train._write_model(model, splats, 3, 1)
 
         # Run floater removal with lowered triangle count for the test
         summary = clean_mesh_floaters(
             input_mesh_path=input_ply,
             output_dir=out_dir,
+            gsplat_model_path=model,
             min_triangles=50,
             min_area=0.05,
             min_thickness=0.04,
@@ -127,17 +140,21 @@ def test_clean_mesh_floaters_synthetic():
             enable_sor=False,
         )
 
-        assert (out_dir / "mesh_cleaned.ply").is_file()
-        assert (out_dir / "mesh_sealed_colored.ply").is_file()
-        assert (out_dir / "mesh_sealed_red.ply").is_file()
-        assert (out_dir / "mesh_floater_removal_stats.json").is_file()
-        raw = o3d.io.read_triangle_mesh(str(out_dir / "mesh_cleaned.ply"))
-        sealed = o3d.io.read_triangle_mesh(str(out_dir / "mesh_sealed_colored.ply"))
-        red = o3d.io.read_triangle_mesh(str(out_dir / "mesh_sealed_red.ply"))
+        assert (out_dir / "mesh.ply").is_file()
+        assert sorted(p.name for p in out_dir.iterdir()) == ["mesh.ply"]
+        raw = o3d.io.read_triangle_mesh(str(input_ply))
+        sealed = o3d.io.read_triangle_mesh(str(out_dir / "mesh.ply"))
         assert not raw.is_edge_manifold(allow_boundary_edges=False)
         assert sealed.is_edge_manifold(allow_boundary_edges=False)
-        assert len(red.triangles) == len(sealed.triangles)
-        assert np.any(np.all(np.asarray(red.vertex_colors) == [1, 0, 0], axis=1))
+
+        from fill_mesh_holes import read_ply_face_flags
+        flags = read_ply_face_flags(out_dir / "mesh.ply", "is_hole_fill")
+        assert flags is not None
+        assert len(flags) == len(sealed.triangles)
+        assert summary["original_triangles_count"] == summary["clean_triangles"]
+        assert summary["filled_triangles_count"] == len(sealed.triangles) - summary["clean_triangles"]
+        assert np.all(flags[:summary["original_triangles_count"]] == 0)
+        assert np.all(flags[summary["original_triangles_count"]:] == 1)
 
         # Kept components should be exactly 2: primary sphere + solid cylinder
         assert summary["kept_components_count"] == 2

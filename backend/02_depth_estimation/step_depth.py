@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Step 2 -- DA3 depth priors, normal estimation, edge snapping, TSDF fusion, and surfel initialization.
+"""Step 2 -- metric depth, normals, cleanup, and per-scan surfel initialization.
 
-In:  ``<workspace>/images/`` + ``transforms.json`` + ``sparse/0/``.
-Out: ``02_depth_estimation/depth/depth_maps/*.npy``, ``02_depth_estimation/depth/normal_maps/*.npy``,
-     ``02_depth_estimation/depth/poses_da3.npz``, ``02_depth_estimation/depth/points3D_depth.ply``,
-     ``02_depth_estimation/depth/depth_images/*.jpg``, ``02_depth_estimation/depth/normal_images/*.jpg``,
-     ``02_depth_estimation/depth/preview/*.png``.
+Input: one scene or independent ``scan_N/`` folders, each with ``images/``,
+``transforms.json``, and ``sparse/0/``. Output: each scene gets
+``depth/`` alongside its inputs, containing depth/normal maps, validated poses,
+alignment state, and ``points3D_depth.ply``. Visual inspection artifacts are
+opt-in with ``--debug-output``.
 
 Two coordinate conventions meet here, in opposite directions, and both are
 load-bearing:
@@ -31,11 +31,15 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import json
+import os
 import sys
 import threading
 import time
 from collections.abc import Sequence as SequenceABC
 from pathlib import Path
+
+# PyTorch caches this flag at the first attention call, before the normals pass.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 import cv2
 import numpy as np
@@ -51,6 +55,7 @@ bootstrap()
 
 from Utilities.pipeline_step import StepContext, is_done, update_pipeline_stats
 from Utilities.scene_io import load_scene
+from step_colmap import discover_scenes
 from colmap_diagnostics import parse_images_txt, parse_points3D_txt
 from colmap_poses_to_da3 import build_da3_poses, validate_poses
 from depth_priors import (
@@ -69,7 +74,6 @@ from regularize_planes import planes_of, diagnose_planes_quads
 from tsdf_fusion import TSDFVolume
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
-STAGE_DIRNAME = "02_depth_estimation"
 MANIFEST_DIRNAME = "00_ingestion"
 
 # interior walls the whole frame sits low. 0.5 throws away most of a bedroom;
@@ -170,6 +174,68 @@ def _get_vram_info() -> dict[str, float]:
     return {}
 
 
+def _scene_manifest(workspace: Path):
+    """Load a scan-local manifest, retaining the older single-scene layout."""
+    if (workspace / "transforms.json").is_file():
+        return load_scene(workspace, images_root=workspace)
+    return load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
+
+
+def _discover_scene_workspaces(workspace: Path) -> list[Path]:
+    """Return ingestion scans, or one legacy scene workspace."""
+    try:
+        return [scene_dir for scene_dir, _ in discover_scenes(workspace)]
+    except FileNotFoundError:
+        if ((workspace / "transforms.json").is_file()
+                or (workspace / MANIFEST_DIRNAME / "transforms.json").is_file()):
+            return [workspace]
+        raise
+
+
+def _scene_outputs(scene: Path, substep: str) -> list[Path]:
+    depth_dir = scene / "depth"
+    outputs = [depth_dir / "poses_da3.npz", depth_dir / "depth_maps", depth_dir / "normal_maps"]
+    if substep in ("all", "surfels", "tsdf"):
+        outputs.append(depth_dir / "points3D_depth.ply")
+    return outputs
+
+
+def _write_scene_metric_metadata(scene: Path) -> dict | None:
+    depth_dir = scene / "depth"
+    if not (depth_dir / "points3D_depth.ply").is_file() or not (depth_dir / "poses_da3.npz").is_file():
+        return None
+    from scene_extent import write_scene_extent_outputs
+
+    return write_scene_extent_outputs(scene)
+
+
+def _clean_debug_outputs(depth_dir: Path) -> None:
+    """Remove only known inspection artifacts from this stage's output folder."""
+    import shutil
+
+    for name in ("depth_images", "normal_images", "preview"):
+        shutil.rmtree(depth_dir / name, ignore_errors=True)
+    for name in (
+        "depth_inference_summary.md", "surfel_init_summary.md", "tsdf_summary.md",
+        "points3D_depth_planes_colored.ply", "points3D_depth_planes_quads.ply",
+        "points3D_tsdf.ply",
+        "planes_legend.md", "points3D_depth_legend.md", "roof_data.json",
+        "planes_quad_inspection.md", "points3D_depth_report.json",
+    ):
+        (depth_dir / name).unlink(missing_ok=True)
+    stage_dir = depth_dir.parent
+    (stage_dir / "planes_quad_inspection.md").unlink(missing_ok=True)
+    for path in stage_dir.glob("plane_*_quad.png"):
+        path.unlink(missing_ok=True)
+
+
+def _clear_inference_cache(depth_dir: Path) -> None:
+    """Drop temporary model intermediates after the requested stage succeeds."""
+    import shutil
+
+    shutil.rmtree(depth_dir / "da3_cache", ignore_errors=True)
+
+
 def run_depth_estimation_substep(
     workspace: Path,
     ctx: StepContext,
@@ -185,12 +251,13 @@ def run_depth_estimation_substep(
     enable_global_depth_graph: bool = False,
     normal_model: str = "stablenormal",
     normal_res: int = 768,
+    debug_output: bool = False,
 ) -> tuple[list[np.ndarray], list[str], np.ndarray, np.ndarray]:
     """Substep 1/2: Multi-View DA3 sliding window depth estimation & guided filtering."""
-    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
+    scene = _scene_manifest(workspace)
     names = scene.names
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / STAGE_DIRNAME / "depth"
+    depth_dir = workspace / "depth"
     depth_dir.mkdir(parents=True, exist_ok=True)
     maps_dir = depth_dir / "depth_maps"
     maps_dir.mkdir(exist_ok=True)
@@ -208,8 +275,8 @@ def run_depth_estimation_substep(
         np.savez(depth_dir / "poses_da3.npz", w2c=w2c, K=k_mats, names=np.array(pose_names))
     ctx.metric("pose_validation", {k: round(v, 6) for k, v in stats.items()})
     ctx.note(f"Poses: {len(pose_names)} world-to-camera, orthonormality err "
-             f"{stats['max_ortho_err']:.2e}, centres within "
-             f"{stats['centre_offset_median_m'] * 100:.1f} cm (median) of ARCore")
+             f"{stats['max_ortho_err']:.2e}, median camera-centre mismatch "
+             f"{stats['centre_offset_median_m']:.6g} scene units against transforms.json")
 
     images = _LazyImages([workspace / "images" / n for n in pose_names])
     vram_substeps: dict[str, dict[str, float]] = {}
@@ -363,21 +430,22 @@ def run_depth_estimation_substep(
     normals_dir = depth_dir / "normal_maps"
     normals_dir.mkdir(exist_ok=True)
     normal_images_dir = depth_dir / "normal_images"
-    normal_images_dir.mkdir(exist_ok=True)
+    if debug_output:
+        normal_images_dir.mkdir(exist_ok=True)
     normal_maps: list[np.ndarray] = [None] * len(pose_names)
 
     with ctx.timer("extract_and_polish_normals"):
         def _save_normal_disk(idx: int, stem: str, norm_map: np.ndarray, orig_rgb: np.ndarray, dmap: np.ndarray):
             normal_maps[idx] = norm_map
             np.save(normals_dir / f"{stem}.npy", norm_map.astype(np.float16))
-            # Fast OpenCV colorization and side-by-side diagnostic JPEG write (releases GIL)
-            norm_rgb = colorize_normals(norm_map, valid_mask=(dmap > 0.2))
-            if norm_rgb.shape[:2] != orig_rgb.shape[:2]:
-                norm_rgb = cv2.resize(norm_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
-                                      interpolation=cv2.INTER_NEAREST)
-            composite_norm = np.hstack([orig_rgb, norm_rgb])
-            comp_bgr = cv2.cvtColor(composite_norm, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(normal_images_dir / f"{stem}.jpg"), comp_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if debug_output:
+                norm_rgb = colorize_normals(norm_map, valid_mask=(dmap > 0.2))
+                if norm_rgb.shape[:2] != orig_rgb.shape[:2]:
+                    norm_rgb = cv2.resize(norm_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
+                                          interpolation=cv2.INTER_NEAREST)
+                composite_norm = np.hstack([orig_rgb, norm_rgb])
+                comp_bgr = cv2.cvtColor(composite_norm, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(normal_images_dir / f"{stem}.jpg"), comp_bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
         if normal_model == "stablenormal":
             from stable_normal import StableNormalEstimator
@@ -406,7 +474,7 @@ def run_depth_estimation_substep(
                     save_pool.submit(_save_normal_disk, i, stem, norm_map, orig_rgb, dmap)
 
     vram_substeps["extract_and_polish_normals"] = _get_vram_info()
-    ctx.note(f"Estimated surface normals using {normal_model}, saved diagnostic views to {normal_images_dir}")
+    ctx.note(f"Estimated surface normals using {normal_model}")
 
     # --- depth post-processing: clean flying edges, saturation bloom, grazing angles & free-space phantoms ------
     with ctx.timer("clean_depth_maps"):
@@ -457,27 +525,25 @@ def run_depth_estimation_substep(
         "p95": round(depth_p95, 3),
     })
 
-    # RGB | depth side-by-side composite images
-    depth_images_dir = depth_dir / "depth_images"
-    depth_images_dir.mkdir(exist_ok=True)
+    if debug_output:
+        depth_images_dir = depth_dir / "depth_images"
+        depth_images_dir.mkdir(exist_ok=True)
 
-    with ctx.timer("write_depth_images"):
-        def _save_depth_image(i):
-            name = pose_names[i]
-            dmap = depth_maps[i]
-            orig_rgb = images[i]
-            depth_rgb = _colorize_depth(dmap, depth_p05, depth_p95)
-            if depth_rgb.shape[:2] != orig_rgb.shape[:2]:
-                depth_rgb = cv2.resize(depth_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
-                                        interpolation=cv2.INTER_NEAREST)
-            composite = np.hstack([orig_rgb, depth_rgb])
-            comp_img = Image.fromarray(composite)
-            stem = Path(name).stem
-            comp_img.save(depth_images_dir / f"{stem}.jpg", quality=90)
+        with ctx.timer("write_depth_images"):
+            def _save_depth_image(i):
+                name = pose_names[i]
+                dmap = depth_maps[i]
+                orig_rgb = images[i]
+                depth_rgb = _colorize_depth(dmap, depth_p05, depth_p95)
+                if depth_rgb.shape[:2] != orig_rgb.shape[:2]:
+                    depth_rgb = cv2.resize(depth_rgb, (orig_rgb.shape[1], orig_rgb.shape[0]),
+                                            interpolation=cv2.INTER_NEAREST)
+                composite = np.hstack([orig_rgb, depth_rgb])
+                Image.fromarray(composite).save(depth_images_dir / f"{Path(name).stem}.jpg", quality=90)
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            list(executor.map(_save_depth_image, range(len(pose_names))))
-    vram_substeps["write_depth_images"] = _get_vram_info()
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(_save_depth_image, range(len(pose_names))))
+        vram_substeps["write_depth_images"] = _get_vram_info()
 
     # --- record machine-readable substep metrics to pipeline_stats.json -------
     n_frames = len(pose_names)
@@ -491,44 +557,44 @@ def run_depth_estimation_substep(
     if "extract_and_polish_normals" in ctx.timings:
         update_pipeline_stats(workspace, "surface_normal_polishing", ctx.timings["extract_and_polish_normals"], n_frames)
 
-    # Diagnostic markdown summary
-    summary_md = [
-        "# Multi-View Depth & Surface Normal Estimation Summary (Step 2)",
-        "",
-        f"**Workspace:** `{workspace}`  ",
-        f"**Model:** `DA3-Base` (Test Resolution: `{process_res}px`, Window: `N={chunk_size}, K={overlap}`)  ",
-        f"**Device:** `{device}`  ",
-        f"**Total Frames Processed:** `{len(pose_names)}`  ",
-        "",
-        "## Depth Distribution",
-        "",
-        f"- **Median Depth:** `{np.median(finite):.2f} m`",
-        f"- **5th Percentile (p05):** `{depth_p05:.2f} m`",
-        f"- **95th Percentile (p95):** `{depth_p95:.2f} m`",
-        "",
-        "## Diagnostic Artifacts",
-        "",
-        f"- **Side-by-Side RGB | Depth Images:** [`{depth_images_dir}`](file://{depth_images_dir})",
-        f"- **Side-by-Side RGB | Normal Images:** [`{normal_images_dir}`](file://{normal_images_dir})",
-        f"- **Dense Float32 Metric Depth Maps:** [`{maps_dir}`](file://{maps_dir})",
-        f"- **Dense Float32 Unit Normal Maps:** [`{normals_dir}`](file://{normals_dir})",
-        f"- **Camera Extrinsics & Intrinsics:** [`{depth_dir / 'poses_da3.npz'}`](file://{depth_dir / 'poses_da3.npz'})",
-        "",
-        "## Execution Time & VRAM Profile",
-        "",
-        "| Substep | Time (s) | VRAM Alloc (GB) | VRAM Reserved (GB) | VRAM Peak (GB) |",
-        "| :--- | :--- | :--- | :--- | :--- |",
-    ]
-    for step_name, t_val in ctx.timings.items():
-        vr = vram_substeps.get(step_name, {})
-        alloc = f"{vr.get('alloc_gb', 0.0):.2f}" if vr else "-"
-        res = f"{vr.get('reserved_gb', 0.0):.2f}" if vr else "-"
-        peak = f"{vr.get('peak_gb', 0.0):.2f}" if vr else "-"
-        summary_md.append(f"| `{step_name}` | **{t_val:.1f}s** | {alloc} | {res} | {peak} |")
+    if debug_output:
+        # Human-readable inspection report is opt-in for deployment runs.
+        summary_md = [
+            "# Multi-View Depth & Surface Normal Estimation Summary (Step 2)",
+            "",
+            f"**Workspace:** `{workspace}`  ",
+            f"**Model:** `DA3-Base` (Test Resolution: `{process_res}px`, Window: `N={chunk_size}, K={overlap}`)  ",
+            f"**Device:** `{device}`  ",
+            f"**Total Frames Processed:** `{len(pose_names)}`  ",
+            "",
+            "## Depth Distribution",
+            "",
+            f"- **Median Depth:** `{np.median(finite):.2f} m`",
+            f"- **5th Percentile (p05):** `{depth_p05:.2f} m`",
+            f"- **95th Percentile (p95):** `{depth_p95:.2f} m`",
+            "",
+            "## Diagnostic Artifacts",
+            "",
+            f"- **Side-by-Side RGB | Depth Images:** [`{depth_images_dir}`](file://{depth_images_dir})",
+            f"- **Side-by-Side RGB | Normal Images:** [`{normal_images_dir}`](file://{normal_images_dir})",
+            f"- **Dense Float32 Metric Depth Maps:** [`{maps_dir}`](file://{maps_dir})",
+            f"- **Dense Float32 Unit Normal Maps:** [`{normals_dir}`](file://{normals_dir})",
+            f"- **Camera Extrinsics & Intrinsics:** [`{depth_dir / 'poses_da3.npz'}`](file://{depth_dir / 'poses_da3.npz'})",
+            "",
+            "## Execution Time & VRAM Profile",
+            "",
+            "| Substep | Time (s) | VRAM Alloc (GB) | VRAM Reserved (GB) | VRAM Peak (GB) |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for step_name, t_val in ctx.timings.items():
+            vr = vram_substeps.get(step_name, {})
+            alloc = f"{vr.get('alloc_gb', 0.0):.2f}" if vr else "-"
+            res = f"{vr.get('reserved_gb', 0.0):.2f}" if vr else "-"
+            peak = f"{vr.get('peak_gb', 0.0):.2f}" if vr else "-"
+            summary_md.append(f"| `{step_name}` | **{t_val:.1f}s** | {alloc} | {res} | {peak} |")
 
-    summary_md_path = depth_dir / "depth_inference_summary.md"
-    summary_md_path.write_text("\n".join(summary_md), encoding="utf-8")
-    ctx.note(f"Human-inspectable depth estimation summary written to {summary_md_path}")
+        summary_md_path = depth_dir / "depth_inference_summary.md"
+        summary_md_path.write_text("\n".join(summary_md), encoding="utf-8")
 
     return depth_maps, pose_names, w2c, k_mats
 
@@ -539,11 +605,12 @@ def run_tsdf_substep(
     voxel_size: float = VOXEL_DOWNSAMPLE_M,
     min_weight: float = 2.0,
     max_surfels: int = 500_000,
+    debug_output: bool = False,
 ) -> None:
     """Substep 4d: Volumetric TSDF Fusion & Multi-Scale Zero-Crossing Surfel Extraction."""
-    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
+    scene = _scene_manifest(workspace)
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / STAGE_DIRNAME / "depth"
+    depth_dir = workspace / "depth"
     maps_dir = depth_dir / "depth_maps"
     poses_path = depth_dir / "poses_da3.npz"
 
@@ -623,77 +690,71 @@ def run_tsdf_substep(
     ply_path = depth_dir / "points3D_depth.ply"
     cloud.to_ply(ply_path)
 
-    # Also save a dedicated TSDF copy
-    cloud.to_ply(depth_dir / "points3D_tsdf.ply")
-
-
-    # Geometry statistics
-    pos = cloud.positions
-    rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
-    min_b = np.min(pos, axis=0)
-    max_b = np.max(pos, axis=0)
-    dims = max_b - min_b
-    mean_scale = float(np.mean(cloud.scales_2d))
-
-    # Diagnostic preview renders
-    preview_dir = depth_dir / "preview"
-    preview_dir.mkdir(exist_ok=True)
-    try:
-        from preview_cloud import render as render_preview, intrinsics as colmap_intrinsics
-        from scene.colmap_loader import qvec2rotmat, read_extrinsics_binary, read_intrinsics_binary
-        extr = read_extrinsics_binary(sparse_dir / "images.bin")
-        intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
-        im_list = sorted(extr.values(), key=lambda im: im.name)
-        step = max(1, len(im_list) // 8)
-        for im in im_list[::step][:8]:
-            cam = intr[im.camera_id]
-            fx, fy, cx, cy = colmap_intrinsics(cam)
-            prev_img = render_preview(pos.astype(np.float64), rgb_u8,
-                                      qvec2rotmat(im.qvec), im.tvec,
-                                      fx, fy, cx, cy, cam.width, cam.height)
-            prev_img.save(preview_dir / f"{Path(im.name).stem}.png")
-        ctx.note(f"Rendered diagnostic camera previews to {preview_dir}")
-    except Exception as e:
-        ctx.note(f"Preview rendering notice: {e}")
+    if debug_output:
+        pos = cloud.positions
+        rgb_u8 = np.clip(cloud.colors_rgb * 255.0, 0, 255).astype(np.uint8)
+        min_b, max_b = np.min(pos, axis=0), np.max(pos, axis=0)
+        dims = max_b - min_b
+        mean_scale = float(np.mean(cloud.scales_2d))
+        preview_dir = depth_dir / "preview"
+        preview_dir.mkdir(exist_ok=True)
+        try:
+            from preview_cloud import render as render_preview, intrinsics as colmap_intrinsics
+            from scene.colmap_loader import qvec2rotmat, read_extrinsics_binary, read_intrinsics_binary
+            extr = read_extrinsics_binary(sparse_dir / "images.bin")
+            intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
+            im_list = sorted(extr.values(), key=lambda im: im.name)
+            step = max(1, len(im_list) // 8)
+            for im in im_list[::step][:8]:
+                cam = intr[im.camera_id]
+                fx, fy, cx, cy = colmap_intrinsics(cam)
+                prev_img = render_preview(pos.astype(np.float64), rgb_u8,
+                                          qvec2rotmat(im.qvec), im.tvec,
+                                          fx, fy, cx, cy, cam.width, cam.height)
+                prev_img.save(preview_dir / f"{Path(im.name).stem}.png")
+            ctx.note(f"Rendered diagnostic camera previews to {preview_dir}")
+        except Exception as e:
+            ctx.note(f"Preview rendering notice: {e}")
 
     # Write Markdown Summary Report
     t_tsdf = ctx.timings.get("tsdf_integration", 0.0) + ctx.timings.get("tsdf_multiscale_extraction", 0.0)
     ctx.metric("frames_processed", len(pose_names))
     update_pipeline_stats(workspace, "tsdf_volumetric_fusion", t_tsdf, len(pose_names))
 
-    tsdf_summary_md = [
-        "# Volumetric TSDF Fusion & Multi-Scale Surfel Extraction (Step 2 - TSDF)",
-        "",
-        f"**Workspace:** `{workspace}`  ",
-        f"**Output PLY:** [`{ply_path}`](file://{ply_path})  ",
-        f"**Extracted Surfels:** **`{len(cloud):,}`** (Single-manifold shell, 0 multi-layer slab thickness)  ",
-        f"**Bounding Box:** `{dims[0]:.2f}m` (W) × `{dims[1]:.2f}m` (L) × `{dims[2]:.2f}m` (H)  ",
-        rf"**Mean Surfel Scale ($\sigma$):** `{mean_scale * 100:.2f} cm`  ",
-        f"**Total Execution Time:** `{elapsed_total:.1f}s`  ",
-        "",
-        "## TSDF Grid & Multi-Scale Parameters",
-        "",
-        f"- **Base Voxel Resolution:** `{voxel_size * 100:.1f} cm` ({volume.nx} × {volume.ny} × {volume.nz} voxels)",
-        f"- **Minimum Integration Weight Floor:** `{min_weight}`",
-        "- **Hierarchical Multi-Scale Decimation:**",
-        r"  - **Tier 0 (Corners / Edges):** Full 1.5 cm density, $\sigma = 1.1\text{cm}$",
-        r"  - **Tier 1 (Curved Geometry):** 3.0 cm stride, $\sigma = 2.2\text{cm}$",
-        r"  - **Tier 2 (Planar Walls / Floor):** 6.0 cm stride, $\sigma = 4.5\text{cm}$",
-        "",
-        "## VRAM & Runtime Breakdown",
-        "",
-        f"- **Grid Allocation VRAM:** `{vram_init.get('alloc_gb', 0.0):.2f} GB` (Reserved: `{vram_init.get('reserved_gb', 0.0):.2f} GB`)",
-        f"- **Peak Integration VRAM:** `{vram_integrated.get('peak_gb', 0.0):.2f} GB`",
-        f"- **Post-Extraction VRAM:** `{vram_extracted.get('alloc_gb', 0.0):.2f} GB`",
-        "",
-        "## Diagnostic Artifacts",
-        "",
-        f"- **Camera Projections Preview:** [`{preview_dir}`](file://{preview_dir})",
-        f"- **Extracted Surfel Cloud:** [`{ply_path}`](file://{ply_path})",
-    ]
-    summary_file = depth_dir / "tsdf_summary.md"
-    summary_file.write_text("\n".join(tsdf_summary_md), encoding="utf-8")
-    ctx.note(f"TSDF fusion complete ({len(cloud):,} surfels). Report written to {summary_file}")
+    if debug_output:
+        tsdf_summary_md = [
+            "# Volumetric TSDF Fusion & Multi-Scale Surfel Extraction (Step 2 - TSDF)",
+            "",
+            f"**Workspace:** `{workspace}`  ",
+            f"**Output PLY:** [`{ply_path}`](file://{ply_path})  ",
+            f"**Extracted Surfels:** **`{len(cloud):,}`** (Single-manifold shell, 0 multi-layer slab thickness)  ",
+            f"**Bounding Box:** `{dims[0]:.2f}m` (W) × `{dims[1]:.2f}m` (L) × `{dims[2]:.2f}m` (H)  ",
+            rf"**Mean Surfel Scale ($\sigma$):** `{mean_scale * 100:.2f} cm`  ",
+            f"**Total Execution Time:** `{elapsed_total:.1f}s`  ",
+            "",
+            "## TSDF Grid & Multi-Scale Parameters",
+            "",
+            f"- **Base Voxel Resolution:** `{voxel_size * 100:.1f} cm` ({volume.nx} × {volume.ny} × {volume.nz} voxels)",
+            f"- **Minimum Integration Weight Floor:** `{min_weight}`",
+            "- **Hierarchical Multi-Scale Decimation:**",
+            r"  - **Tier 0 (Corners / Edges):** Full 1.5 cm density, $\sigma = 1.1\text{cm}$",
+            r"  - **Tier 1 (Curved Geometry):** 3.0 cm stride, $\sigma = 2.2\text{cm}$",
+            r"  - **Tier 2 (Planar Walls / Floor):** 6.0 cm stride, $\sigma = 4.5\text{cm}$",
+            "",
+            "## VRAM & Runtime Breakdown",
+            "",
+            f"- **Grid Allocation VRAM:** `{vram_init.get('alloc_gb', 0.0):.2f} GB` (Reserved: `{vram_init.get('reserved_gb', 0.0):.2f} GB`)",
+            f"- **Peak Integration VRAM:** `{vram_integrated.get('peak_gb', 0.0):.2f} GB`",
+            f"- **Post-Extraction VRAM:** `{vram_extracted.get('alloc_gb', 0.0):.2f} GB`",
+            "",
+            "## Diagnostic Artifacts",
+            "",
+            f"- **Camera Projections Preview:** [`{preview_dir}`](file://{preview_dir})",
+            f"- **Extracted Surfel Cloud:** [`{ply_path}`](file://{ply_path})",
+        ]
+        summary_file = depth_dir / "tsdf_summary.md"
+        summary_file.write_text("\n".join(tsdf_summary_md), encoding="utf-8")
+    ctx.note(f"TSDF fusion complete ({len(cloud):,} surfels)")
 
 
 def run_surfels_substep(
@@ -718,16 +779,17 @@ def run_surfels_substep(
     enable_hybrid_sampling: bool = True,
     hybrid_energy_threshold: float = 0.08,
     hybrid_coarse_stride: int = 3,
-    enable_plane_diagnostics: bool = True,
     enable_plane_regularization: bool = True,
     plane_fill_spacing: float = 0.05,
     plane_fill_min_dist: float = 0.03,
     enable_storeys: bool = False,
+    enable_plane_diagnostics: bool = False,
+    debug_output: bool = False,
 ) -> None:
     """Substep 2b: Standard unprojection surfel initializer with geometric filtering."""
-    scene = load_scene(workspace / MANIFEST_DIRNAME, images_root=workspace)
+    scene = _scene_manifest(workspace)
     sparse_dir = workspace / "sparse" / "0"
-    depth_dir = workspace / STAGE_DIRNAME / "depth"
+    depth_dir = workspace / "depth"
     maps_dir = depth_dir / "depth_maps"
     normals_dir = depth_dir / "normal_maps"
     poses_path = depth_dir / "poses_da3.npz"
@@ -848,13 +910,14 @@ def run_surfels_substep(
                     fill_max_hole=1.5,
                     no_storeys=not enable_storeys,
                 )
-                reg_report = regularize(depth_ply_path, depth_ply_path, reg_args)
+                reg_report = regularize(depth_ply_path, depth_ply_path, reg_args,
+                                        write_diagnostics=debug_output)
                 ctx.note(
                     f"Plane Regularization applied: {len(reg_report['groups'])} groups, "
                     f"{len(reg_report.get('fill', []))} surfaces regularized into {plane_fill_spacing*100:.1f}cm lattices. "
                     f"Output: {depth_ply_path}"
                 )
-                if "roof_data" in reg_report:
+                if debug_output and "roof_data" in reg_report:
                     rd = reg_report["roof_data"]
                     ctx.note(f"Roof data saved to {reg_report.get('roof_data_file')}: type={rd.get('roof_type')}, formula: {rd.get('equation') or rd.get('height')}")
             except Exception as e:
@@ -907,61 +970,62 @@ def run_surfels_substep(
     max_b = np.max(pos, axis=0)
     dims = max_b - min_b
 
-    preview_dir = depth_dir / "preview"
-    preview_dir.mkdir(exist_ok=True)
-    try:
-        from preview_cloud import render as render_preview, intrinsics as colmap_intrinsics
-        from scene.colmap_loader import qvec2rotmat, read_extrinsics_binary, read_intrinsics_binary
-        extr = read_extrinsics_binary(sparse_dir / "images.bin")
-        intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
-        im_list = sorted(extr.values(), key=lambda im: im.name)
-        step = max(1, len(im_list) // 8)
-        for im in im_list[::step][:8]:
-            cam = intr[im.camera_id]
-            fx, fy, cx, cy = colmap_intrinsics(cam)
-            prev_img = render_preview(pos.astype(np.float64), rgb_u8,
-                                      qvec2rotmat(im.qvec), im.tvec,
-                                      fx, fy, cx, cy, cam.width, cam.height)
-            prev_img.save(preview_dir / f"{Path(im.name).stem}.png")
-        ctx.note(f"Rendered diagnostic camera previews to {preview_dir}")
-    except Exception as e:
-        ctx.note(f"Camera preview rendering notice: {e}")
+    if debug_output:
+        preview_dir = depth_dir / "preview"
+        preview_dir.mkdir(exist_ok=True)
+        try:
+            from preview_cloud import render as render_preview, intrinsics as colmap_intrinsics
+            from scene.colmap_loader import qvec2rotmat, read_extrinsics_binary, read_intrinsics_binary
+            extr = read_extrinsics_binary(sparse_dir / "images.bin")
+            intr = read_intrinsics_binary(sparse_dir / "cameras.bin")
+            im_list = sorted(extr.values(), key=lambda im: im.name)
+            step = max(1, len(im_list) // 8)
+            for im in im_list[::step][:8]:
+                cam = intr[im.camera_id]
+                fx, fy, cx, cy = colmap_intrinsics(cam)
+                prev_img = render_preview(pos.astype(np.float64), rgb_u8,
+                                          qvec2rotmat(im.qvec), im.tvec,
+                                          fx, fy, cx, cy, cam.width, cam.height)
+                prev_img.save(preview_dir / f"{Path(im.name).stem}.png")
+            ctx.note(f"Rendered diagnostic camera previews to {preview_dir}")
+        except Exception as e:
+            ctx.note(f"Camera preview rendering notice: {e}")
 
-    surfel_summary_md = [
-        "# Surfel Cloud Initialization Summary (Step 2)",
-        "",
-        f"**Workspace:** `{workspace}`  ",
-        f"**Output PLY:** [`{depth_ply_path}`](file://{depth_ply_path})  ",
-        f"**Total Surfels:** **`{n_surfels:,}`**  ",
-        f"**Bounding Box:** `{dims[0]:.2f}m` (W) × `{dims[1]:.2f}m` (L) × `{dims[2]:.2f}m` (H)  ",
-        rf"**Mean Surfel Scale ($\sigma$):** `{mean_scale * 100:.2f} cm`  ",
-        "",
-        "## Geometric Filtering & Processing Flags",
-        "",
-        f"- **Hybrid Dual-Guided Adaptive Sampling:** `{'Enabled' if enable_hybrid_sampling else 'Disabled'}` (threshold={hybrid_energy_threshold}, coarse_stride={hybrid_coarse_stride})",
-        f"- **Normal Tube Collapse:** `{'Enabled' if enable_tube_collapse else 'Disabled'}` (radius={tube_radius_m*100:.1f}cm, length={tube_length_m*100:.1f}cm)",
-        f"- **Multi-Scale Surfel Pyramids:** `{'Enabled' if enable_multiscale_pyramid else 'Disabled'}`",
-        f"- **Voxel Grid Size:** `{voxel_downsample_m * 100:.1f} cm` (applied: `{getattr(cloud, 'applied_voxel_size_m', voxel_downsample_m) * 100:.1f} cm`)",
-        f"- **Dynamic Saturation / Bloom Masking:** `{'Enabled' if enable_saturation_mask else 'Disabled'}`",
-        f"- **Cross-View Free-Space Carving:** `{'Enabled' if enable_freespace_filter else 'Disabled'}`",
-        f"- **Multi-View Normal Consensus Regularization:** `{'Enabled' if enable_normal_consensus else 'Disabled'}`",
-        f"- **Depth Discontinuity Gradient Filter:** `max_grad = {MAX_DEPTH_GRADIENT}`",
-        f"- **Plane Regularization & Snapping:** `{'Enabled' if reg_report else 'Disabled'}`"
-        + (f" ({len(reg_report['groups'])} groups, {len(reg_report.get('fill', []))} lattices resampled at {plane_fill_spacing*100:.1f}cm)" if reg_report else ""),
-        f"- **Plane Non-Orthogonal MEQ Diagnostics:** `{'Enabled' if plane_report else 'Disabled'}`"
-        + (f" ({len(plane_report['planes'])} planes detected with 4-vertex enclosures)" if plane_report else ""),
-        f"- **Grazing Angle Filter:** `max_angle = {MAX_GRAZING_ANGLE_DEG}°`",
-        "",
-        "## Diagnostic Artifacts",
-        "",
-        f"- **Camera Projections Preview:** [`{preview_dir}`](file://{preview_dir})",
-        f"- **Surfel Binary PLY (snapped & regularized):** [`{depth_ply_path}`](file://{depth_ply_path})",
-        f"- **Colored Diagnostic PLY:** [`{depth_dir / 'points3D_depth_planes_colored.ply'}`](file://{depth_dir / 'points3D_depth_planes_colored.ply'})",
-        f"- **Planes Legend:** [`{depth_dir / 'planes_legend.md'}`](file://{depth_dir / 'planes_legend.md'})",
-    ]
-    summary_file = depth_dir / "surfel_init_summary.md"
-    summary_file.write_text("\n".join(surfel_summary_md), encoding="utf-8")
-    ctx.note(f"Human-inspectable surfel summary written to {summary_file}")
+    if debug_output:
+        surfel_summary_md = [
+            "# Surfel Cloud Initialization Summary (Step 2)",
+            "",
+            f"**Workspace:** `{workspace}`  ",
+            f"**Output PLY:** [`{depth_ply_path}`](file://{depth_ply_path})  ",
+            f"**Total Surfels:** **`{n_surfels:,}`**  ",
+            f"**Bounding Box:** `{dims[0]:.2f}m` (W) × `{dims[1]:.2f}m` (L) × `{dims[2]:.2f}m` (H)  ",
+            rf"**Mean Surfel Scale ($\sigma$):** `{mean_scale * 100:.2f} cm`  ",
+            "",
+            "## Geometric Filtering & Processing Flags",
+            "",
+            f"- **Hybrid Dual-Guided Adaptive Sampling:** `{'Enabled' if enable_hybrid_sampling else 'Disabled'}` (threshold={hybrid_energy_threshold}, coarse_stride={hybrid_coarse_stride})",
+            f"- **Normal Tube Collapse:** `{'Enabled' if enable_tube_collapse else 'Disabled'}` (radius={tube_radius_m*100:.1f}cm, length={tube_length_m*100:.1f}cm)",
+            f"- **Multi-Scale Surfel Pyramids:** `{'Enabled' if enable_multiscale_pyramid else 'Disabled'}`",
+            f"- **Voxel Grid Size:** `{voxel_downsample_m * 100:.1f} cm` (applied: `{getattr(cloud, 'applied_voxel_size_m', voxel_downsample_m) * 100:.1f} cm`)",
+            f"- **Dynamic Saturation / Bloom Masking:** `{'Enabled' if enable_saturation_mask else 'Disabled'}`",
+            f"- **Cross-View Free-Space Carving:** `{'Enabled' if enable_freespace_filter else 'Disabled'}`",
+            f"- **Multi-View Normal Consensus Regularization:** `{'Enabled' if enable_normal_consensus else 'Disabled'}`",
+            f"- **Depth Discontinuity Gradient Filter:** `max_grad = {MAX_DEPTH_GRADIENT}`",
+            f"- **Plane Regularization & Snapping:** `{'Enabled' if reg_report else 'Disabled'}`"
+            + (f" ({len(reg_report['groups'])} groups, {len(reg_report.get('fill', []))} lattices resampled at {plane_fill_spacing*100:.1f}cm)" if reg_report else ""),
+            f"- **Plane Non-Orthogonal MEQ Diagnostics:** `{'Enabled' if plane_report else 'Disabled'}`"
+            + (f" ({len(plane_report['planes'])} planes detected with 4-vertex enclosures)" if plane_report else ""),
+            f"- **Grazing Angle Filter:** `max_angle = {MAX_GRAZING_ANGLE_DEG}°`",
+            "",
+            "## Diagnostic Artifacts",
+            "",
+            f"- **Camera Projections Preview:** [`{preview_dir}`](file://{preview_dir})",
+            f"- **Surfel Binary PLY (snapped & regularized):** [`{depth_ply_path}`](file://{depth_ply_path})",
+            f"- **Colored Diagnostic PLY:** [`{depth_dir / 'points3D_depth_planes_colored.ply'}`](file://{depth_dir / 'points3D_depth_planes_colored.ply'})",
+            f"- **Planes Legend:** [`{depth_dir / 'planes_legend.md'}`](file://{depth_dir / 'planes_legend.md'})",
+        ]
+        summary_file = depth_dir / "surfel_init_summary.md"
+        summary_file.write_text("\n".join(surfel_summary_md), encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -995,9 +1059,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Disable cross-view surface normal consensus regularization")
     parser.add_argument("--no-saturation-mask", action="store_true",
                         help="Disable dynamic saturation/bloom masking before unprojection")
-    parser.add_argument("--no-plane-diagnostics", action="store_false",
-                        dest="enable_plane_diagnostics", default=True,
-                        help="Skip diagnostic 4-vertex MEQ plane extraction and visualization")
+    parser.add_argument("--no-plane-diagnostics", action="store_true",
+                        help="Skip MEQ plane diagnostics even with --debug-output")
+    parser.add_argument("--debug-output", action="store_true",
+                        help="Write depth/normal previews, summaries, and colored plane diagnostics")
     parser.add_argument("--no-tube-collapse", action="store_false", dest="enable_tube_collapse",
                         help="Disable normal tube collapse projection")
     parser.add_argument("--enable-tube-collapse", action="store_true", dest="enable_tube_collapse", default=False,
@@ -1048,84 +1113,144 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="Re-run even if already complete")
     args = parser.parse_args(argv)
 
-    workspace = Path(args.workspace)
+    workspace = Path(args.workspace).resolve()
     substep = args.substep
     if args.only_depth:
         substep = "depth"
     elif args.only_surfels:
         substep = "surfels"
 
-    outputs = [workspace / STAGE_DIRNAME / "depth" / "poses_da3.npz"]
-    if substep in ("all", "surfels", "tsdf"):
-        outputs.append(workspace / STAGE_DIRNAME / "depth" / "points3D_depth.ply")
+    scene_workspaces = _discover_scene_workspaces(workspace)
+    if not args.debug_output:
+        for scene_workspace in scene_workspaces:
+            _clean_debug_outputs(scene_workspace / "depth")
 
+    outputs = [output for scene in scene_workspaces for output in _scene_outputs(scene, substep)]
     if not args.force and substep == "all" and is_done(workspace, "depth", outputs):
+        for scene_workspace in scene_workspaces:
+            _write_scene_metric_metadata(scene_workspace)
         print("[depth] already done, skipping (use --force to re-run)")
         return 0
 
-    with StepContext("depth", workspace, artifacts_dir=workspace / STAGE_DIRNAME) as ctx:
-        if substep in ("enclosure", "diagnostics"):
-            depth_dir = workspace / STAGE_DIRNAME / "depth"
-            depth_ply_path = depth_dir / "points3D_depth.ply"
-            if not depth_ply_path.exists():
-                raise FileNotFoundError(f"Cannot run enclosure diagnostics: {depth_ply_path} does not exist.")
-            artifact_dir = ctx.artifacts_dir if (ctx.artifacts_dir and ctx.artifacts_dir.is_dir()) else None
-            plane_report = diagnose_planes_quads(
-                depth_ply_path=depth_ply_path,
-                output_dir=depth_dir,
-                artifact_dir=artifact_dir,
-                min_area=2.0,
-                max_vertices=5,
-            )
-            ctx.note(
-                f"Plane polygon enclosure diagnostic: extracted {len(plane_report['planes'])} planes with up to 5-vertex enclosures. "
-                f"Artifact report: {plane_report['report_path']}"
-            )
-            return 0
+    failures = []
+    scan_stats = []
+    total_frames = 0
+    with StepContext("depth", workspace, write_artifacts=False) as ctx:
+        for scene_workspace in scene_workspaces:
+            scene_outputs = _scene_outputs(scene_workspace, substep)
+            if (not args.force and substep == "all"
+                    and is_done(scene_workspace, "depth", scene_outputs)):
+                _write_scene_metric_metadata(scene_workspace)
+                ctx.note(f"{scene_workspace.name}: depth outputs already exist, skipping")
+                frames = len(_scene_manifest(scene_workspace).names)
+                total_frames += frames
+                scan_stats.append({"scan": scene_workspace.name, "status": "skipped", "frames": frames})
+                continue
 
-        if substep in ("all", "depth"):
-            run_depth_estimation_substep(
-                workspace=workspace,
-                ctx=ctx,
-                chunk_size=args.chunk_size,
-                overlap=args.overlap,
-                process_res=args.process_res,
-                enable_guided_filter=args.enable_guided_filter,
-                enable_sparse_anchor=args.enable_sparse_anchor,
-                normal_model=args.normal_model,
-                normal_res=args.normal_res,
-            )
+            try:
+                with StepContext("depth", scene_workspace, write_artifacts=False) as scan_ctx:
+                    if substep in ("enclosure", "diagnostics"):
+                        depth_dir = scene_workspace / "depth"
+                        depth_ply_path = depth_dir / "points3D_depth.ply"
+                        if not depth_ply_path.exists():
+                            raise FileNotFoundError(f"Cannot run enclosure diagnostics: {depth_ply_path} does not exist.")
+                        plane_report = diagnose_planes_quads(
+                            depth_ply_path=depth_ply_path,
+                            output_dir=depth_dir,
+                            artifact_dir=scan_ctx.artifacts_dir,
+                            min_area=2.0,
+                            max_vertices=5,
+                        )
+                        scan_ctx.note(f"Plane polygon enclosure diagnostic wrote {plane_report['report_path']}")
+                        scan_stats.append({"scan": scene_workspace.name, "status": "diagnosed"})
+                        continue
 
-        if substep == "tsdf" or (substep == "all" and args.enable_tsdf):
-            run_tsdf_substep(
-                workspace=workspace,
-                ctx=ctx,
-                voxel_size=VOXEL_DOWNSAMPLE_M,
-            )
-        elif substep == "surfels" or (substep == "all" and not args.enable_tsdf):
-            run_surfels_substep(
-                workspace=workspace,
-                ctx=ctx,
-                voxel_downsample_m=VOXEL_DOWNSAMPLE_M,
-                min_consensus=args.min_consensus,
-                max_grazing_angle_deg=args.max_grazing_angle,
-                enable_normal_consensus=not args.no_normal_consensus,
-                enable_saturation_mask=not args.no_saturation_mask,
-                enable_freespace_filter=args.enable_freespace_filter and not args.no_freespace_filter,
-                max_freespace_violations=args.max_freespace_violations,
-                enable_tube_collapse=args.enable_tube_collapse,
-                tube_radius_m=args.tube_radius,
-                tube_length_m=args.tube_length,
-                enable_multiscale_pyramid=args.enable_multiscale_pyramid,
-                enable_hybrid_sampling=args.enable_hybrid_sampling,
-                hybrid_energy_threshold=args.hybrid_energy_threshold,
-                hybrid_coarse_stride=args.hybrid_coarse_stride,
-                enable_plane_diagnostics=args.enable_plane_diagnostics,
-                enable_plane_regularization=args.enable_plane_regularization,
-                plane_fill_spacing=args.plane_fill_spacing,
-                plane_fill_min_dist=args.fill_min_dist,
-                enable_storeys=args.enable_storeys,
-            )
+                    if substep in ("all", "depth"):
+                        run_depth_estimation_substep(
+                            workspace=scene_workspace,
+                            ctx=scan_ctx,
+                            chunk_size=args.chunk_size,
+                            overlap=args.overlap,
+                            process_res=args.process_res,
+                            enable_guided_filter=args.enable_guided_filter,
+                            enable_sparse_anchor=args.enable_sparse_anchor,
+                            normal_model=args.normal_model,
+                            normal_res=args.normal_res,
+                            debug_output=args.debug_output,
+                        )
+
+                    if substep == "tsdf" or (substep == "all" and args.enable_tsdf):
+                        run_tsdf_substep(scene_workspace, scan_ctx,
+                                         voxel_size=VOXEL_DOWNSAMPLE_M,
+                                         debug_output=args.debug_output)
+                    elif substep == "surfels" or (substep == "all" and not args.enable_tsdf):
+                        run_surfels_substep(
+                            workspace=scene_workspace,
+                            ctx=scan_ctx,
+                            voxel_downsample_m=VOXEL_DOWNSAMPLE_M,
+                            min_consensus=args.min_consensus,
+                            max_grazing_angle_deg=args.max_grazing_angle,
+                            enable_normal_consensus=not args.no_normal_consensus,
+                            enable_saturation_mask=not args.no_saturation_mask,
+                            enable_freespace_filter=args.enable_freespace_filter and not args.no_freespace_filter,
+                            max_freespace_violations=args.max_freespace_violations,
+                            enable_tube_collapse=args.enable_tube_collapse,
+                            tube_radius_m=args.tube_radius,
+                            tube_length_m=args.tube_length,
+                            enable_multiscale_pyramid=args.enable_multiscale_pyramid,
+                            enable_hybrid_sampling=args.enable_hybrid_sampling,
+                            hybrid_energy_threshold=args.hybrid_energy_threshold,
+                            hybrid_coarse_stride=args.hybrid_coarse_stride,
+                            enable_plane_diagnostics=args.debug_output and not args.no_plane_diagnostics,
+                            enable_plane_regularization=args.enable_plane_regularization,
+                            plane_fill_spacing=args.plane_fill_spacing,
+                            plane_fill_min_dist=args.fill_min_dist,
+                            enable_storeys=args.enable_storeys,
+                            debug_output=args.debug_output,
+                        )
+                    if substep in ("all", "surfels", "tsdf"):
+                        with scan_ctx.timer("scene_size_and_floor_count"):
+                            extent = _write_scene_metric_metadata(scene_workspace)
+                        if extent is not None:
+                            dimensions = extent["aligned"]["point_cloud"]["size"]
+                            floors = extent.get("floors")
+                            scan_ctx.metric("scene_geometry", {
+                                "size": dimensions,
+                                "units": extent["coordinate_units"],
+                                "floor_count": floors,
+                            })
+                            floor_label = str(floors) if floors is not None else "unavailable (metric scale unavailable)"
+                            if extent["metric_scale_available"]:
+                                scan_ctx.note(
+                                    f"Metric extent {dimensions[0]:.2f} × {dimensions[1]:.2f} × {dimensions[2]:.2f} m; "
+                                    f"estimated floors: {floor_label}; "
+                                    f"scale {extent['metric_calibration']['meters_per_colmap_unit']:.5f} m/COLMAP unit "
+                                    f"from {extent['metric_calibration']['steps_used']} consistent early steps "
+                                    f"({len(extent['metric_calibration']['steps_rejected'])} split transitions)"
+                                )
+                            else:
+                                scan_ctx.note(
+                                    f"Scene extent {dimensions[0]:.2f} × {dimensions[1]:.2f} × "
+                                    f"{dimensions[2]:.2f} in COLMAP units; floor count unavailable: "
+                                    f"{extent['metric_calibration']['reason']}"
+                                )
+                    if substep in ("all", "depth"):
+                        _clear_inference_cache(scene_workspace / "depth")
+                    if not args.debug_output:
+                        _clean_debug_outputs(scene_workspace / "depth")
+                    frames = scan_ctx.metrics.get("frames_processed", len(_scene_manifest(scene_workspace).names))
+                    total_frames += int(frames)
+                    scan_stats.append({"scan": scene_workspace.name, "status": "complete", "frames": int(frames)})
+                    ctx.note(f"{scene_workspace.name}: completed depth stage for {frames} frames")
+            except Exception as exc:
+                failures.append((scene_workspace.name, exc))
+                scan_stats.append({"scan": scene_workspace.name, "status": "failed", "error": str(exc)})
+                ctx.note(f"{scene_workspace.name}: depth stage failed: {type(exc).__name__}: {exc}")
+
+        ctx.metric("scans", scan_stats)
+        ctx.metric("frames_processed", total_frames)
+        if failures:
+            raise RuntimeError("Depth estimation failed for: " + ", ".join(name for name, _ in failures)) from failures[0][1]
 
     return 0
 

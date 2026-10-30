@@ -2,7 +2,7 @@
 """
 Full-Scene End-to-End Panoptic Semantic Segmentation & Memory Consolidation Pipeline.
 
-Runs on all 362 frames in 'inputs/images/':
+Runs on the registered photographs of one upstream scan:
 - Stage 1: SAM 2.1 Hiera-Small (12x12 uniform grid, letterbox resize, compile_model=True).
 - Stage 2: GPU Tensor Overlap Carving & Two-Tier Regularization (floater & ribbon pruning).
 - Stage 3: DINOv2 Spatial Token Extraction & Bilinear Mask Region Pooling.
@@ -20,7 +20,7 @@ Runs on all 362 frames in 'inputs/images/':
 Records precise execution times for every atomic substep and grand total.
 """
 
-import os, sys, json, time
+import os, sys, json, time, argparse
 import concurrent.futures
 from pathlib import Path
 import cv2, torch, numpy as np
@@ -33,6 +33,8 @@ import matplotlib.patches as patches
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fast_sam2_generator import FastSAM2Generator
+from scene_inputs import (DEFAULT_WORKSPACE, resolve_scene, load_scene_cameras,
+                          resolve_sparse_dir, colmap_point_counts, dino_grid)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -105,6 +107,38 @@ def clean_carved_mask(m: np.ndarray, min_chunk_area: int, min_thickness: float =
     if chunky_m.sum() >= min_chunk_area:
         return chunky_m
     return np.zeros_like(m)
+
+
+def carve_overlapping_masks(masks: torch.Tensor, min_pixels: int) -> tuple[np.ndarray, np.ndarray]:
+    """Carve masks by confidence order, synchronizing with the host only after the batch."""
+    if masks.ndim != 3 or min_pixels < 0:
+        raise ValueError("expected [N, H, W] masks and a nonnegative pixel threshold")
+    if not len(masks):
+        return np.zeros((0, *masks.shape[1:]), dtype=np.uint8), np.zeros(0, dtype=bool)
+
+    occupied = torch.zeros(masks.shape[1:], dtype=torch.bool, device=masks.device)
+    output_batches, keep_batches = [], []
+    # Bound full-resolution GPU intermediates while replacing per-mask syncs with per-batch syncs.
+    for start in range(0, len(masks), 16):
+        carved, keep = [], []
+        for mask in masks[start:start + 16]:
+            remaining = mask & ~occupied
+            accepted = remaining.sum() >= min_pixels
+            carved.append(remaining)
+            keep.append(accepted)
+            occupied |= remaining & accepted
+
+        keep_np = torch.stack(keep).cpu().numpy()
+        keep_batches.append(keep_np)
+        accepted_masks = [mask for mask, accepted in zip(carved, keep_np) if accepted]
+        if accepted_masks:
+            output_batches.append(torch.stack(accepted_masks).to(torch.uint8).cpu().numpy())
+
+    keep_np = np.concatenate(keep_batches)
+    output = (np.concatenate(output_batches) if output_batches
+              else np.zeros((0, *masks.shape[1:]), dtype=np.uint8))
+    return output, keep_np
+
 
 def get_class_color(mid: int):
     k = mid - 1
@@ -364,41 +398,42 @@ class GlobalMemoryBank:
             new_assignments[j] = mid
         return new_assignments
 
-def main():
-    root = Path(__file__).resolve().parent.parent
-    workspace = root / "current_scene" / "06c_semantic_segmentation"
-    img_dir = workspace / "inputs" / "images"
-    raw_image_paths = sorted(img_dir.glob("*.jpg"))
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workspace', type=Path, default=DEFAULT_WORKSPACE, help='Path to workspace or scan directory')
+    parser.add_argument('--output-dir', type=Path, default=None, help='Output directory for panoptic artifacts')
+    parser.add_argument('--max-frames', type=int, default=None, help='Limit number of frames to process')
+    parser.add_argument('--colmap-threshold', type=int, default=100, help='Minimum triangulated points per registered frame')
+    args = parser.parse_args(argv)
+    scan = resolve_scene(args.workspace)
+    workspace = scan / 'segmentation'
+    cameras = load_scene_cameras(scan)
+    colmap_pts_map = colmap_point_counts(resolve_sparse_dir(scan) / 'images.txt')
+    image_paths = sorted(c['image_path'] for c in cameras
+                         if colmap_pts_map[c['image_path'].relative_to(scan / 'images').as_posix()] >= args.colmap_threshold)
+    if not image_paths:
+        raise ValueError(f'No registered frames meet the {args.colmap_threshold}-point COLMAP threshold')
 
-    images_txt = workspace / "inputs" / "sparse" / "0" / "images.txt"
-    colmap_pts_map = {}
-    if images_txt.exists():
-        with open(images_txt) as f:
-            lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        for i in range(0, len(lines), 2):
-            parts = lines[i].split()
-            name = parts[-1]
-            pts = [p for p in lines[i+1].split()[2::3] if p != '-1']
-            colmap_pts_map[name] = len(pts)
-
-    if colmap_pts_map:
-        image_paths = [p for p in raw_image_paths if colmap_pts_map.get(p.name, 0) >= 100]
-        skipped_cnt = len(raw_image_paths) - len(image_paths)
-        print(f"COLMAP Point Gating: Excluded {skipped_cnt} low-support frames (< 100 points) from 2D inference.")
-    else:
-        image_paths = raw_image_paths
+    if args.max_frames is not None and args.max_frames > 0:
+        image_paths = image_paths[:args.max_frames]
 
     num_frames = len(image_paths)
 
-    out_dir = workspace / "full362_final_pipeline"
+    if args.output_dir:
+        out_dir = args.output_dir if args.output_dir.name == "panoptic_data" else (args.output_dir / "panoptic_data")
+    else:
+        legacy_dir = workspace / "full362_final_pipeline"
+        out_dir = legacy_dir if legacy_dir.is_dir() else (workspace / "panoptic_data")
+
     out_dir.mkdir(parents=True, exist_ok=True)
     overlays_dir = out_dir / "overlays"
     overlays_dir.mkdir(parents=True, exist_ok=True)
     npz_dir = out_dir / "npz_data"
     npz_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / 'full_pipeline_benchmark_summary.json').unlink(missing_ok=True)
 
     print("=================================================================")
-    print(f"FULL SCENE PANOPTIC SEGMENTATION PIPELINE ON {num_frames} FRAMES (Filtered >= 100 COLMAP points)")
+    print(f"FULL SCENE PANOPTIC SEGMENTATION PIPELINE ON {num_frames} FRAMES (Filtered >= {args.colmap_threshold} COLMAP points)")
     print(f"Output Directory: {out_dir}")
     print("=================================================================\n")
 
@@ -425,8 +460,8 @@ def main():
     std = torch.tensor([0.229, 0.224, 0.225], device=device)[None, :, None, None]
     MAX_SIDE = 896
     PATCH = 14
-    grid = (36, 64)
-    dino_w, dino_h = 896, 504
+    grid = dino_grid(*warm_rgb.shape[:2])
+    dino_h, dino_w = (size * PATCH for size in grid)
     
     # Warmup DINOv2 compiled graph
     with torch.inference_mode(), torch.autocast('cuda', dtype=torch.float16):
@@ -441,7 +476,7 @@ def main():
     stage1_sam_meta = []
     
     stage2_ref_masks = []
-    stage4_cache_file = workspace / "stage4_merged_cache.pkl"
+    stage4_cache_file = out_dir / "stage4_merged_cache.pkl"
     stage4_merged_data = []
 
     t_stage1_total = 0.0
@@ -449,16 +484,16 @@ def main():
     t_stage3_total = 0.0
     t_stage4_total = 0.0
 
-    H, W = warm_rgb.shape[:2]
-    total_pixels = H * W
-    min_pixels = int(0.005 * total_pixels)
-
     # ================= STAGES 1 TO 4 STREAMING =================
     print(f"=== EXECUTING STAGES 1-4 ACROSS ALL {num_frames} FRAMES ===")
     for idx, p in enumerate(image_paths):
         stem = p.stem
         bgr = cv2.imread(str(p))
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        H, W = rgb.shape[:2]
+        min_pixels = max(1, int(0.005 * H * W))
+        grid = dino_grid(H, W)
+        dino_h, dino_w = (size * PATCH for size in grid)
 
         # Stage 1: SAM2
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -485,15 +520,8 @@ def main():
             masks_sorted = masks_t[order]
             meta_sorted = [meta_filt[i] for i in order.cpu().numpy()]
 
-            occupied = torch.zeros((H, W), dtype=torch.bool, device=device)
-            carved_masks = []
-            carved_meta = []
-            for k in range(len(masks_sorted)):
-                m_k = masks_sorted[k] & ~occupied
-                if m_k.sum() >= min_pixels:
-                    carved_masks.append(m_k.to(torch.uint8).cpu().numpy())
-                    carved_meta.append(meta_sorted[k])
-                    occupied |= m_k
+            carved_masks, keep = carve_overlapping_masks(masks_sorted, min_pixels)
+            carved_meta = [item for item, accepted in zip(meta_sorted, keep) if accepted]
 
             clean_masks = []
             clean_meta = []
@@ -667,7 +695,7 @@ def main():
             for j_k, _ in claims:
                 next_ids[j_k] = mid
 
-        bank.update_matches(claims_by_mid, next_masks, next_embeddings, f_next['stem'], current_frame_idx, H, W)
+        bank.update_matches(claims_by_mid, next_masks, next_embeddings, f_next['stem'], current_frame_idx, *next_masks.shape[1:])
         unclaimed_j = [j_k for j_k in range(N_next) if next_ids[j_k] is None]
         new_assignments = bank.register_new_classes(unclaimed_j, next_masks, next_embeddings, f_next['stem'], current_frame_idx)
         for j_k, new_mid in new_assignments.items():
@@ -831,7 +859,7 @@ def main():
         masks = item['masks']
         c_ids = item['cleaned_ids']
 
-        labels = np.zeros((H, W), dtype=np.int32)
+        labels = np.zeros(masks.shape[1:], dtype=np.int32)
         for nid, m in zip(c_ids, masks):
             if nid > 0: labels[m > 0] = nid
 
@@ -851,8 +879,17 @@ def main():
     t_grand_total = time.perf_counter() - t_grand_start
 
     # Grand Summary JSON
+    selected_stems = {p.stem for p in image_paths}
+    for path in npz_dir.glob('*_final.npz'):
+        if path.name.removesuffix('_final.npz') not in selected_stems:
+            path.unlink()
+    for path in overlays_dir.glob('*_overlay.png'):
+        if path.name.removesuffix('_overlay.png') not in selected_stems:
+            path.unlink()
     summary = {
         'num_frames': num_frames,
+        'image_names': [p.relative_to(scan / 'images').as_posix() for p in image_paths],
+        'colmap_threshold': args.colmap_threshold,
         'final_classes_count': len(persistent_ids_s7),
         'final_classes': persistent_ids_s7,
         'timing_seconds': {
@@ -880,7 +917,7 @@ def main():
         json.dump(summary, f, indent=2)
 
     print("\n=================================================================")
-    print("PIPELINE EXECUTION COMPLETE ON ALL 362 FRAMES!")
+    print(f"PIPELINE EXECUTION COMPLETE ON ALL {num_frames} FRAMES!")
     print(f"Grand Total Elapsed: {t_grand_total:.2f}s ({t_grand_total/60:.2f} min) | Average Throughput: {num_frames / t_grand_total:.2f} FPS")
     print(f"Total Physical Classes Discovered: {len(persistent_ids_s7)}")
     print(f"Summary JSON: {out_dir / 'full_pipeline_benchmark_summary.json'}")

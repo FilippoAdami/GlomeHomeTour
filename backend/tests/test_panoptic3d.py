@@ -8,7 +8,7 @@ import pytest
 from scipy import sparse
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / '06c_semantic_segmentation'))
+sys.path.insert(0, str(ROOT / '05_semantic_segmentation'))
 from panoptic3d import (assign_faces, balance_votes, boundary_distance, boundary_edges, dual_graph,
                        object_metrics, object_source_aliases, observation_components, physical_ids, resolve_tracks, safe_removal, view_groups)
 import run_panoptic3d as pipeline
@@ -363,7 +363,7 @@ def test_3d_only_end_to_end_preserves_frozen_files_and_catalog(tmp_path, monkeyp
     import torch
     # Fail if any loaded neural model is called; no downloading or prediction is needed.
     monkeypatch.setattr(torch.nn.Module, '__call__', lambda *a, **k: pytest.fail('prohibited model call'))
-    stage = tmp_path / '06c_semantic_segmentation'
+    stage = tmp_path / '05_semantic_segmentation'
     inputs = stage / 'inputs'
     (inputs / 'images').mkdir(parents=True)
     (inputs / 'sparse/0').mkdir(parents=True)

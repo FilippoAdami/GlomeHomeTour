@@ -52,7 +52,11 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun buildRow(property: PropertyStore.Property): LinearLayout {
-        val roomCount = store.rooms(property.id).size
+        val rooms = store.rooms(property.id)
+        val roomCount = rooms.size
+        val unprocessedRooms = rooms.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
+        val hasCheckpointAny = unprocessedRooms.any { ScanProcessor.hasCheckpoint(this, it.sessionName) }
+
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -79,12 +83,34 @@ class HomeActivity : AppCompatActivity() {
             textSize = 15f
         })
         info.addView(TextView(this).apply {
-            val rooms = if (roomCount == 1) "1 room" else "$roomCount rooms"
-            text = "$rooms · ${SimpleDateFormat("yyyy-MM-dd", Locale.US).format(property.createdAtMs)}"
-            setTextColor(color(R.color.text_faint))
+            val roomsStr = if (roomCount == 1) "1 room" else "$roomCount rooms"
+            val statusStr = if (unprocessedRooms.isNotEmpty()) {
+                if (hasCheckpointAny) " · Resume processing" else " · Ready to process"
+            } else if (roomCount > 0) {
+                " · Processed"
+            } else ""
+            text = "$roomsStr$statusStr · ${SimpleDateFormat("yyyy-MM-dd", Locale.US).format(property.createdAtMs)}"
+            setTextColor(color(if (unprocessedRooms.isNotEmpty()) R.color.action else R.color.text_faint))
             textSize = 12f
         })
         row.addView(info)
+
+        if (unprocessedRooms.isNotEmpty()) {
+            row.addView(TextView(this).apply {
+                text = if (hasCheckpointAny) "Resume" else "Process"
+                setTextColor(color(R.color.action))
+                textSize = 13f
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { rightMargin = dp(14) }
+                setOnClickListener {
+                    startActivity(
+                        Intent(this@HomeActivity, PropertyDetailActivity::class.java)
+                            .putExtra(PropertyStore.EXTRA_PROPERTY_ID, property.id)
+                    )
+                }
+            })
+        }
 
         row.addView(TextView(this).apply {
             text = "Delete"

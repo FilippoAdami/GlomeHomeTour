@@ -111,6 +111,9 @@ def prune_model(sparse_dir, names):
         f.write("\n".join(sorted(model_names)) + "\n")
         list_path = f.name
     try:
+        from Utilities.pipeline_paths import subprocess_env
+        env = subprocess_env()
+        env["QT_QPA_PLATFORM"] = "xcb"
         for cmd in (["colmap", "image_deleter",
                      "--input_path", sparse_dir, "--output_path", sparse_dir,
                      "--image_names_path", list_path],
@@ -118,9 +121,8 @@ def prune_model(sparse_dir, names):
                     ["colmap", "model_converter",
                      "--input_path", sparse_dir, "--output_path", sparse_dir,
                      "--output_type", "TXT"]):
-            from Utilities.pipeline_paths import subprocess_env
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                           env=subprocess_env({"QT_QPA_PLATFORM": "xcb"}))
+                           env=env)
     finally:
         os.unlink(list_path)
     print(f"  pruned {len(model_names)} image(s) from {sparse_dir}")

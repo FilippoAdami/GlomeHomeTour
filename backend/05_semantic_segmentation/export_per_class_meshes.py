@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
+import scene_inputs
 from detect_structural_classes import get_class_color, export_colored_ply
 
 
@@ -162,35 +163,36 @@ print("Done! You can now toggle visibility of any class in the Blender Outliner.
     print(f"Generated README summary: {readme_path.name}")
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Export per-class isolated 3D meshes")
-    parser.add_argument(
-        "--mesh-path",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply"),
+    parser.add_argument("--workspace", type=Path, default=scene_inputs.DEFAULT_WORKSPACE)
+    parser.add_argument("--mesh-path", type=Path, default=None)
+    parser.add_argument("--structural-json", type=Path, default=None)
+    parser.add_argument("--instances-csv", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    args = parser.parse_args(argv)
+
+    scan = scene_inputs.resolve_scene(args.workspace)
+    stage_out = scene_inputs.resolve_stage_output(scan)
+
+    mesh_path = args.mesh_path or scene_inputs.resolve_mesh(scan)
+    structural_json = args.structural_json or (
+        stage_out / "structural_classes.json"
+        if (stage_out / "structural_classes.json").is_file()
+        else stage_out / "step3_structural_detection/structural_classes.json"
     )
-    parser.add_argument(
-        "--structural-json",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/structural_classes.json"),
+    instances_csv = args.instances_csv or (
+        stage_out / "instances_summary.csv"
+        if (stage_out / "instances_summary.csv").is_file()
+        else stage_out / "step3_structural_detection/instances_summary.csv"
     )
-    parser.add_argument(
-        "--instances-csv",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/instances_summary.csv"),
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("backend/current_scene/06c_semantic_segmentation/per_class_meshes"),
-    )
-    args = parser.parse_args()
+    output_dir = args.output_dir or (stage_out / "per_class_meshes")
 
     export_per_class_meshes(
-        mesh_path=args.mesh_path,
-        structural_json_path=args.structural_json,
-        instances_csv_path=args.instances_csv,
-        output_dir=args.output_dir,
+        mesh_path=mesh_path,
+        structural_json_path=structural_json,
+        instances_csv_path=instances_csv,
+        output_dir=output_dir,
     )
 
 

@@ -1,0 +1,82 @@
+{
+  "$id": "https://glomehometour.dev/schemas/ingestion_results.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GlomeHomeTour ingestion results",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "status": { "type": "string", "const": "ready" },
+    "source_format": { "enum": ["arcore", "arcore_app_certified", "colmap"], "description": "Format received by ingestion; retained when a later stage replaces the pose model." },
+    "processing_status": {
+      "enum": ["processed", "validated_no_filter_needed", "skipped_certified", "skipped_colmap"]
+    },
+    "poses_format": { "enum": ["arcore", "colmap"], "description": "Current pose model format; step 01 may replace ARCore poses with image-only COLMAP poses." },
+    "images_path": { "type": "string", "minLength": 1, "description": "Path to refined images, relative to the folder containing this result file." },
+    "metadata_path": { "type": "string", "minLength": 1, "description": "Path to refined metadata, relative to the folder containing this result file." },
+    "transforms_path": { "type": ["string", "null"], "description": "Path to transforms.json, relative to the folder containing this result file." },
+    "colmap_model_path": { "type": ["string", "null"], "description": "Path to the COLMAP model, relative to the folder containing this result file." },
+    "scene_dimensions": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "width_m": { "type": "number", "minimum": 0 },
+            "depth_m": { "type": "number", "minimum": 0 },
+            "height_m": { "type": "number", "minimum": 0 },
+            "floor_area_m2": { "type": "number", "minimum": 0 },
+            "floor_count": { "type": ["integer", "null"], "minimum": 1 },
+            "method": { "type": "string" }
+          },
+          "required": ["width_m", "depth_m", "height_m", "floor_area_m2", "floor_count", "method"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "keyframe_budget": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "properties": {
+            "base_keyframes": { "type": "integer", "const": 50 },
+            "keyframes_per_m2_min": { "type": "integer", "const": 8 },
+            "keyframes_per_m2_max": { "type": "integer", "const": 11 },
+            "minimum": { "type": "integer", "minimum": 0 },
+            "maximum": { "type": "integer", "minimum": 0 },
+            "target": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["base_keyframes", "keyframes_per_m2_min", "keyframes_per_m2_max", "minimum", "maximum", "target"],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "input_images_count": { "type": "integer", "minimum": 0 },
+    "quality_rejected_count": { "type": "integer", "minimum": 0 },
+    "selection_removed_count": { "type": "integer", "minimum": 0 },
+    "retained_images_count": { "type": "integer", "minimum": 0 },
+    "app_discarded_count": { "type": "integer", "minimum": 0 },
+    "orientation": {
+      "type": "object",
+      "properties": {
+        "rotation_applied_deg": { "type": "integer", "enum": [0, 90, 180, 270] },
+        "status": { "type": "string" }
+      },
+      "required": ["rotation_applied_deg", "status"],
+      "additionalProperties": false
+    },
+    "lidar_data_path": { "type": ["string", "null"], "description": "Path to preserved LIDAR/depth assets, relative to the folder containing this result file." },
+    "lidar_status": { "enum": ["not_detected", "in_development"] },
+    "lidar_assets": { "type": "array", "items": { "type": "string" } },
+    "elapsed_ms": { "type": "integer", "minimum": 0 },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": [
+    "schema_version", "status", "source_format", "processing_status", "poses_format",
+    "images_path", "metadata_path", "transforms_path", "colmap_model_path", "scene_dimensions",
+    "keyframe_budget", "input_images_count", "quality_rejected_count", "selection_removed_count",
+    "retained_images_count", "app_discarded_count", "orientation", "lidar_data_path",
+    "lidar_status", "lidar_assets", "elapsed_ms", "warnings"
+  ],
+  "additionalProperties": false
+}

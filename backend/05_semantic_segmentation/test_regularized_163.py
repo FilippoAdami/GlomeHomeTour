@@ -1,7 +1,7 @@
-import numpy as np, cv2
-
-npz_163 = np.load('backend/current_scene/06c_semantic_segmentation/first50_streamlined_grid12_merge069/frame_00163_merged.npz')
-lbls = npz_163['labels']
+import os
+import pytest
+import cv2
+import numpy as np
 
 def regularize_carved_mask(m: np.ndarray, min_chunk_area: int = 10368, min_thickness: float = 12.0) -> np.ndarray:
     """
@@ -62,9 +62,15 @@ def regularize_carved_mask(m: np.ndarray, min_chunk_area: int = 10368, min_thick
         return chunky_m
     return np.zeros_like(m)
 
-for target in [9, 15]:
-    m = (lbls == target).astype(np.uint8)
-    reg = regularize_carved_mask(m)
-    nb_before = cv2.connectedComponentsWithStats(m, 8)[0] - 1
-    nb_after = cv2.connectedComponentsWithStats(reg, 8)[0] - 1
-    print(f"Mask #{target}: {nb_before} components -> {nb_after} component(s)! (Area: {m.sum()} -> {reg.sum()})")
+def test_regularized_163():
+    npz_path = 'backend/current_scene/05_semantic_segmentation/first50_streamlined_grid12_merge069/frame_00163_merged.npz'
+    if not os.path.exists(npz_path):
+        pytest.skip(f"Test fixture {npz_path} not found")
+    npz_163 = np.load(npz_path)
+    lbls = npz_163['labels']
+    for target in [9, 15]:
+        m = (lbls == target).astype(np.uint8)
+        reg = regularize_carved_mask(m)
+        nb_before = cv2.connectedComponentsWithStats(m, 8)[0] - 1
+        nb_after = cv2.connectedComponentsWithStats(reg, 8)[0] - 1
+        assert reg.sum() <= m.sum()

@@ -63,7 +63,7 @@ def test_slab_is_closed_and_floor_never_cuts_beams(floor_y):
     assert -equation[3] >= vertices[:, 1].max()
     assert lift == pytest.approx(max(0, vertices[:, 1].max()-floor_y), abs=2e-5)
     # The underside was retained exactly, including beam flanks.
-    assert np.all(trimesh.proximity.closest_point_naive(solid, vertices)[1] < 1e-8)
+    assert np.all(trimesh.proximity.closest_point_naive(solid, vertices)[1] < 2e-7)
 
 
 def test_slab_clearance_accounts_for_slope_at_lowest_floor_corner():
@@ -72,6 +72,26 @@ def test_slab_clearance_accounts_for_slope_at_lowest_floor_corner():
     y_top = -(vertices[:, 0]*equation[0]+equation[3])/equation[1]
     assert y_top.min() >= vertices[:, 1].max()-1e-9
     assert solid.is_watertight
+
+
+def test_slab_closes_seams_at_ply_float32_precision():
+    vertices = np.array([
+        [-2., 2.27, 1.], [-1., 2.27, 1.], [-1., 2.27, 2.],
+        [-2. + 2e-7, 2.27, 1.], [-1. + 2e-7, 2.27, 2. + 2e-7],
+        [-2., 2.27, 2.],
+    ])
+    faces = np.array([[0, 1, 2], [3, 4, 5]])
+
+    slab, _, _ = close_slab(vertices, faces, [0., 1., 0., -2.37])
+
+    roundtrip = trimesh.Trimesh(
+        vertices=slab.vertices[slab.faces].reshape(-1, 3).astype(np.float32),
+        faces=np.arange(len(slab.faces) * 3).reshape(-1, 3),
+        process=False,
+    )
+    roundtrip.merge_vertices()
+    assert roundtrip.is_watertight
+    assert roundtrip.volume > 0
 
 
 def test_small_misalignments_snap_both_ways_large_extensions_remain():

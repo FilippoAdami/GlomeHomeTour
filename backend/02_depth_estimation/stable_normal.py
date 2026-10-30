@@ -9,11 +9,12 @@ from __future__ import annotations
 import os
 os.environ.setdefault("MPLCONFIGDIR", "/tmp")
 os.environ.setdefault("MIOPEN_USER_DB_PATH", "/tmp/miopen")
+# RDNA attention otherwise falls back to the much slower SDPA math kernels.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 os.makedirs("/tmp/miopen", exist_ok=True)
 
 import gc
 import sys
-from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
@@ -50,6 +51,7 @@ class StableNormalEstimator:
         self.data_type = data_type
         self._predictor = None
 
+    @torch.inference_mode()
     def load(self) -> None:
         """Load StableNormal Turbo model onto device."""
         if self._predictor is not None:
@@ -92,12 +94,6 @@ class StableNormalEstimator:
             if hasattr(pipe, "tokenizer") and pipe.tokenizer is not None:
                 del pipe.tokenizer
                 pipe.tokenizer = None
-
-            # GPU Kernel Warm-up to pre-compile JIT graph
-            if self.device != "cpu":
-                dummy = Image.new("RGB", (self.resolution, self.resolution), (128, 128, 128))
-                with torch.inference_mode():
-                    _ = pipe(dummy, processing_resolution=self.resolution, match_input_resolution=False, output_type="pt")
 
             gc.collect()
             if torch.cuda.is_available():
@@ -150,33 +146,39 @@ class StableNormalEstimator:
         orig_w, orig_h = pil_img.size
         pipe = self._predictor.model
 
-        # StableNormal inference directly producing GPU float32 tensor
-        with torch.inference_mode():
-            pipe_out = pipe(
-                pil_img,
-                match_input_resolution=False,
-                processing_resolution=self.resolution,
-                output_type="pt",
-            )
-            normal_tensor = pipe_out.prediction  # Shape (1, 3, PH, PW) on GPU in [-1, 1]
-
-            # High-speed GPU bilinear upsampling to original frame resolution (if needed)
-            cur_h, cur_w = normal_tensor.shape[-2:]
-            if (cur_w, cur_h) != (orig_w, orig_h):
-                normal_tensor = torch.nn.functional.interpolate(
-                    normal_tensor,
-                    size=(orig_h, orig_w),
-                    mode="bilinear",
-                    align_corners=False,
+        # Exhaustive MIOpen convolution searches cost minutes for each new image shape.
+        benchmark = torch.backends.cudnn.benchmark
+        try:
+            if torch.version.hip:
+                torch.backends.cudnn.benchmark = False
+            with torch.inference_mode():
+                pipe_out = pipe(
+                    pil_img,
+                    match_input_resolution=False,
+                    processing_resolution=self.resolution,
+                    output_type="pt",
                 )
+                normal_tensor = pipe_out.prediction  # Shape (1, 3, PH, PW) on GPU in [-1, 1]
 
-            # Normalize to exact unit vectors on GPU
-            norm = torch.norm(normal_tensor, dim=1, keepdim=True).clamp(min=1e-8)
-            normal_tensor = normal_tensor / norm
+                # High-speed GPU bilinear upsampling to original frame resolution (if needed)
+                cur_h, cur_w = normal_tensor.shape[-2:]
+                if (cur_w, cur_h) != (orig_w, orig_h):
+                    normal_tensor = torch.nn.functional.interpolate(
+                        normal_tensor,
+                        size=(orig_h, orig_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
 
-            # Convert to numpy (H, W, 3) float32
-            normal_unit = (
-                normal_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
-            )
+                # Normalize to exact unit vectors on GPU
+                norm = torch.norm(normal_tensor, dim=1, keepdim=True).clamp(min=1e-8)
+                normal_tensor = normal_tensor / norm
+
+                # Convert to numpy (H, W, 3) float32
+                normal_unit = (
+                    normal_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy().astype(np.float32)
+                )
+        finally:
+            torch.backends.cudnn.benchmark = benchmark
 
         return normal_unit

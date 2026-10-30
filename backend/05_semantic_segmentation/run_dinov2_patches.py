@@ -16,7 +16,9 @@ from PIL import Image
 from transformers import AutoModel
 
 
-WORKSPACE = Path(__file__).resolve().parents[1] / "current_scene" / "06c_semantic_segmentation"
+from scene_inputs import DEFAULT_WORKSPACE, resolve_scene, registered_images
+
+WORKSPACE = DEFAULT_WORKSPACE
 MODEL = "facebook/dinov2-small"  # Official conversion of dinov2_vits14, without registers.
 PATCH = 14
 MAX_SIDE = 896
@@ -290,12 +292,13 @@ def main() -> None:
         parser.error("--min-region-patches and --pca-dims must be nonnegative")
     if args.pca_from and (not args.pca_from.is_file() or not args.pca_dims):
         parser.error("--pca-from requires an existing pca.npz and --pca-dims")
-    images = sorted((args.workspace / "inputs" / "images").glob("*.jpg"))
+    scan = resolve_scene(args.workspace)
+    images = registered_images(scan)
     if args.first_frames > 0:
         images = images[:args.first_frames]
     if not images:
-        parser.error("No input JPG images found")
-    output = args.workspace / "dinov2_patches" / args.run_name
+        parser.error("No registered input images found")
+    output = scan / "05_semantic_segmentation/dinov2_patches" / args.run_name
     if output.exists() and any(output.iterdir()):
         parser.error(f"Run directory already contains results: {output}")
     output.mkdir(parents=True, exist_ok=True)

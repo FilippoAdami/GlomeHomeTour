@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 backend_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(backend_dir / "06c_semantic_segmentation"))
+sys.path.insert(0, str(backend_dir / "05_semantic_segmentation"))
 
 from detect_structural_classes import (
     estimate_gravity_and_scene_bands,

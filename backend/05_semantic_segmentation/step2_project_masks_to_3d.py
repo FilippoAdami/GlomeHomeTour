@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -39,7 +40,8 @@ import torch
 
 backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(backend_dir / "03_FastGS_DNSplatter"))
-from gsplat_train import load_cameras
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import scene_inputs
 
 def get_class_color(mid: int) -> Tuple[Tuple[int, int, int], Tuple[float, float, float]]:
     """Deterministic RGB color matching the 2D panoptic segmentation palette."""
@@ -55,24 +57,82 @@ def get_class_color(mid: int) -> Tuple[Tuple[int, int, int], Tuple[float, float,
 
 
 def load_colmap_triangulated_points(images_txt_path: Path) -> Dict[str, int]:
-    """Parses COLMAP images.txt to get triangulated 3D point counts per image."""
-    frame_pts: Dict[str, int] = {}
-    if not images_txt_path.exists():
-        return frame_pts
-    with open(images_txt_path) as f:
-        lines = f.readlines()
-    for i in range(len(lines)):
-        line = lines[i].strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 10 and (parts[9].endswith(".jpg") or parts[9].endswith(".png")):
-            name = parts[9]
-            pts_parts = lines[i + 1].strip().split()
-            num_2d = len(pts_parts) // 3
-            num_3d = sum(1 for k in range(num_2d) if int(pts_parts[k * 3 + 2]) != -1)
-            frame_pts[name] = num_3d
-    return frame_pts
+    """Compatibility alias for the strict shared COLMAP parser."""
+    return scene_inputs.colmap_point_counts(images_txt_path)
+
+
+def normalized_incidence_cosines(hit_normals: np.ndarray, ray_directions: np.ndarray) -> np.ndarray:
+    """Return finite front-facing incidence cosines independent of ray length."""
+    normals = np.asarray(hit_normals, dtype=np.float32)
+    rays = np.asarray(ray_directions, dtype=np.float32)
+    with np.errstate(invalid="ignore", over="ignore"):
+        normal_length = np.linalg.norm(normals, axis=-1)
+        ray_length = np.linalg.norm(rays, axis=-1)
+        denominator = normal_length * ray_length
+        dot = -np.sum(normals * rays, axis=-1)
+    cosine = np.zeros_like(denominator, dtype=np.float32)
+    valid = np.isfinite(denominator) & (denominator > 1e-8)
+    cosine[valid] = dot[valid] / denominator[valid]
+    return np.clip(np.nan_to_num(cosine, nan=0.0, posinf=0.0, neginf=0.0), -1.0, 1.0)
+
+
+def reduce_view_face_votes(
+    triangle_ids: np.ndarray,
+    class_indices: np.ndarray,
+    quality_weights: np.ndarray,
+    num_triangles: int,
+    num_classes: int,
+    all_face_hit_ids: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sum per-class quality, normalized by all valid pixels on each face in one view."""
+    triangle_ids = np.asarray(triangle_ids, dtype=np.int64)
+    class_indices = np.asarray(class_indices, dtype=np.int64)
+    quality_weights = np.asarray(quality_weights, dtype=np.float32)
+    if num_triangles < 0 or num_classes < 1:
+        raise ValueError("num_triangles must be nonnegative and num_classes must be positive")
+    if not (triangle_ids.ndim == class_indices.ndim == quality_weights.ndim == 1):
+        raise ValueError("per-pixel vote inputs must be one-dimensional")
+    if not (len(triangle_ids) == len(class_indices) == len(quality_weights)):
+        raise ValueError("per-pixel vote inputs must have equal length")
+    if len(triangle_ids) == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+    if (triangle_ids < 0).any() or (triangle_ids >= num_triangles).any():
+        raise ValueError("triangle ids are outside the mesh")
+    if (class_indices < 0).any() or (class_indices >= num_classes).any():
+        raise ValueError("class indices are outside the active class set")
+
+    if all_face_hit_ids is None:
+        all_face_hit_ids = triangle_ids
+    else:
+        all_face_hit_ids = np.asarray(all_face_hit_ids, dtype=np.int64)
+        if all_face_hit_ids.ndim != 1 or (all_face_hit_ids < 0).any() or (all_face_hit_ids >= num_triangles).any():
+            raise ValueError("all face hit ids are outside the mesh")
+    hits_per_face = np.bincount(all_face_hit_ids, minlength=num_triangles).astype(np.float32)
+    flat = triangle_ids * num_classes + class_indices
+    unique_flat, inverse = np.unique(flat, return_inverse=True)
+    class_quality = np.zeros(len(unique_flat), dtype=np.float32)
+    np.add.at(class_quality, inverse, quality_weights)
+    return unique_flat, class_quality / hits_per_face[unique_flat // num_classes]
+
+
+def local_evidence_labels(face_class_votes: np.ndarray) -> np.ndarray:
+    """Choose each face's highest locally accumulated class, or -1 without evidence."""
+    votes = np.asarray(face_class_votes)
+    if votes.ndim != 2:
+        raise ValueError("face-class votes must be two-dimensional")
+    labels = np.full(votes.shape[0], -1, dtype=np.int64)
+    if votes.shape[1]:
+        voted = np.any(votes > 0, axis=1)
+        labels[voted] = votes[voted].argmax(axis=1)
+    return labels
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def compute_mask_distance_weights(labels: np.ndarray) -> np.ndarray:
@@ -443,6 +503,8 @@ def project_masks_to_3d(
     baseline_summary_csv: Path | None = None,
 ) -> Dict[str, Any]:
     t_start = time.perf_counter()
+    # A failed recomputation must not leave an old completion marker beside new evidence.
+    (output_dir / 'projection_stats.json').unlink(missing_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=================================================================")
@@ -457,8 +519,8 @@ def project_masks_to_3d(
     print("=================================================================")
 
     # 1. Parse COLMAP Triangulated Points
-    images_txt_path = workspace / "06c_semantic_segmentation/inputs/sparse/0/images.txt"
-    colmap_pts_map = load_colmap_triangulated_points(images_txt_path)
+    images_txt_path = scene_inputs.resolve_sparse_dir(workspace) / "images.txt"
+    colmap_pts_map = scene_inputs.colmap_point_counts(images_txt_path)
 
     print(f"Loaded COLMAP point counts for {len(colmap_pts_map)} frames.")
 
@@ -479,13 +541,29 @@ def project_masks_to_3d(
     print(f"BVH built in {time.perf_counter() - t0_bvh:.3f}s")
 
     # 3. Load Classes Manifest & Apply Optional Quality Filtering
-    summary_path = (
-        workspace
-        / "06c_semantic_segmentation/full362_final_pipeline/full_pipeline_benchmark_summary.json"
-    )
-    with open(summary_path) as f:
-        bench_summary = json.load(f)
-    initial_classes = sorted(bench_summary["final_classes"])
+    summary_candidates = [
+        npz_dir.parent / "full_pipeline_benchmark_summary.json",
+        output_dir / "panoptic_data/full_pipeline_benchmark_summary.json",
+        output_dir / "full_pipeline_benchmark_summary.json",
+        workspace / "05_semantic_segmentation/panoptic_data/full_pipeline_benchmark_summary.json",
+        workspace / "05_semantic_segmentation/full362_final_pipeline/full_pipeline_benchmark_summary.json",
+        workspace / "05_semantic_segmentation/full_pipeline_benchmark_summary.json",
+    ]
+    summary_path = next((p for p in summary_candidates if p.is_file()), None)
+    if summary_path is not None:
+        with open(summary_path) as f:
+            bench_summary = json.load(f)
+        initial_classes = sorted(bench_summary.get("final_classes", []))
+    else:
+        discovered = set()
+        for npz_file in npz_dir.glob("*_final.npz"):
+            with np.load(npz_file, allow_pickle=False) as data:
+                if "labels" in data:
+                    discovered.update(np.unique(data["labels"]))
+                elif "classes" in data:
+                    discovered.update(data["classes"])
+        discovered.discard(0)
+        initial_classes = sorted(int(cid) for cid in discovered if cid > 0)
     persistent_classes = initial_classes.copy()
 
     if min_viewed_ratio is not None and min_win_rate is not None:
@@ -535,9 +613,25 @@ def project_masks_to_3d(
     print(f"\nActive class set: {num_classes} classes configured for 3D projection.")
 
     # 4. Load Camera Parameters
-    all_cameras = load_cameras(workspace, resolution=1)
-    if max_frames:
+    registered_cameras = sorted(
+        scene_inputs.load_scene_cameras(workspace, resolution=1),
+        key=lambda camera: Path(camera["image_path"]).relative_to(workspace / "images").as_posix(),
+    )
+    all_cameras = [
+        camera for camera in registered_cameras
+        if colmap_pts_map[Path(camera["image_path"]).relative_to(workspace / "images").as_posix()] >= colmap_threshold
+    ]
+    skipped_low_colmap_frames = len(registered_cameras) - len(all_cameras)
+    if not all_cameras:
+        raise ValueError(f"No registered frames have at least {colmap_threshold} triangulated COLMAP points")
+    if max_frames is not None and max_frames > 0:
         all_cameras = all_cameras[:max_frames]
+    camera_selection_sha256 = hashlib.sha256(
+        "\n".join(
+            f"{Path(camera['image_path']).relative_to(workspace / 'images').as_posix()}:{colmap_pts_map[Path(camera['image_path']).relative_to(workspace / 'images').as_posix()]}"
+            for camera in all_cameras
+        ).encode("utf-8")
+    ).hexdigest()
     total_cameras = len(all_cameras)
     print(f"Loaded {total_cameras} camera frames.")
 
@@ -547,8 +641,8 @@ def project_masks_to_3d(
 
     # acc_weights: [num_triangles, num_classes] float32 (~1.01 GB)
     acc_weights = torch.zeros((num_triangles, num_classes), dtype=torch.float32, device=device)
-    # Class ID fast index lookup (support up to 65535 IDs safely)
-    max_cid = max(persistent_classes)
+    # Class ID fast index lookup (support up to 65535 IDs safely).
+    max_cid = max(persistent_classes, default=0)
     cid_map_tensor = torch.full((max(max_cid + 1, 65536),), -1, dtype=torch.long, device=device)
     class_rgb = np.asarray([
         [int(channel * 255) for channel in get_class_color(cid)[1]]
@@ -559,7 +653,6 @@ def project_masks_to_3d(
 
     # 6. Raycast & Accumulate Across Frames
     colmap_pose_frames = 0
-    skipped_low_colmap_frames = 0
     total_rays_cast = 0
     total_valid_hits = 0
 
@@ -567,22 +660,22 @@ def project_masks_to_3d(
     t0_ray = time.perf_counter()
 
     for f_idx, cam in enumerate(all_cameras):
-        img_name = Path(cam["image_path"]).name
-        stem = Path(cam["image_path"]).stem
+        image_path = Path(cam["image_path"])
+        img_name = image_path.relative_to(workspace / "images").as_posix()
+        stem = image_path.stem
         npz_file = npz_dir / f"{stem}_final.npz"
         if not npz_file.exists():
             continue
 
-        pts_3d = colmap_pts_map.get(img_name, 0)
-        if pts_3d < colmap_threshold:
-            skipped_low_colmap_frames += 1
-            continue
+        pts_3d = colmap_pts_map[img_name]
 
         viewmat = cam["viewmat"]
         colmap_pose_frames += 1
 
-        data = np.load(npz_file)
-        labels = data["labels"]  # [H, W] int32
+        with np.load(npz_file) as data:
+            if "labels" not in data:
+                raise ValueError(f"{npz_file} has no labels array")
+            labels = scene_inputs.validate_labels(data["labels"], cam, classes=initial_classes)
 
         # Pinhole rays
         rays = scene.create_rays_pinhole(
@@ -600,44 +693,49 @@ def project_masks_to_3d(
         # Mask distance transform weights
         w_edge = compute_mask_distance_weights(labels)
 
-        # Grazing angle cosine
-        cos_theta = -np.sum(hit_normals * ray_dirs, axis=-1)
-        valid_hits = (primitive_ids < num_triangles) & (labels > 0) & (cos_theta > 0.174)  # cos(80 deg)
+        # Grazing angle cosine must not vary with Open3D's ray-vector length.
+        cos_theta = normalized_incidence_cosines(hit_normals, ray_dirs)
+        surface_hits = (primitive_ids < num_triangles) & (cos_theta > 0.174)  # cos(80 deg)
+        valid_hits = surface_hits & (labels > 0)
 
         if not np.any(valid_hits):
             continue
 
         tri_indices = primitive_ids[valid_hits]
+        all_face_hit_ids = primitive_ids[surface_hits]
         hit_labels = labels[valid_hits]
         cos_vals = cos_theta[valid_hits]
         edge_vals = w_edge[valid_hits]
 
         weights = (cos_vals ** 1.5) * edge_vals
 
-        # Transfer to GPU
-        t_tri = torch.as_tensor(tri_indices, dtype=torch.long, device=device)
-        t_lbl = torch.as_tensor(hit_labels, dtype=torch.long, device=device)
-        t_w = torch.as_tensor(weights, dtype=torch.float32, device=device)
-
-        valid_lbl = (t_lbl >= 0) & (t_lbl < len(cid_map_tensor))
-        c_idx = torch.full_like(t_lbl, -1)
-        c_idx[valid_lbl] = cid_map_tensor[t_lbl[valid_lbl]]
-        valid_c = c_idx >= 0
-
-        t_tri = t_tri[valid_c]
-        c_idx = c_idx[valid_c]
-        t_w = t_w[valid_c]
-
-        flat_indices = t_tri * num_classes + c_idx
-        acc_weights.view(-1).index_add_(0, flat_indices, t_w)
+        # Normalize each face's evidence within this view.  A close-up cannot
+        # outweigh another view merely because it covers more pixels.
+        if num_classes:
+            class_indices = np.full(len(hit_labels), -1, dtype=np.int64)
+            in_lookup = (hit_labels >= 0) & (hit_labels < len(cid_map_tensor))
+            class_indices[in_lookup] = cid_map_tensor[
+                torch.as_tensor(hit_labels[in_lookup], dtype=torch.long, device=device)
+            ].cpu().numpy()
+            active = class_indices >= 0
+            if np.any(active):
+                flat_indices, view_votes = reduce_view_face_votes(
+                    tri_indices[active], class_indices[active], weights[active], num_triangles, num_classes,
+                    all_face_hit_ids=all_face_hit_ids,
+                )
+                acc_weights.view(-1).index_add_(
+                    0,
+                    torch.as_tensor(flat_indices, dtype=torch.long, device=device),
+                    torch.as_tensor(view_votes, dtype=torch.float32, device=device),
+                )
 
         total_rays_cast += cam["width"] * cam["height"]
-        total_valid_hits += len(t_tri)
+        total_valid_hits += len(tri_indices)
 
         if (f_idx + 1) % 50 == 0 or (f_idx + 1) == total_cameras:
             print(
                 f"  [{f_idx + 1:3d}/{total_cameras}] {stem}: "
-                f"{len(t_tri):,} valid ray hits (COLMAP, {pts_3d} 3D pts)"
+                f"{len(tri_indices):,} valid ray hits (COLMAP, {pts_3d} 3D pts)"
             )
 
     t_ray_elapsed = time.perf_counter() - t0_ray
@@ -647,8 +745,9 @@ def project_masks_to_3d(
         f"{skipped_low_colmap_frames} skipped below the {colmap_threshold}-point threshold."
     )
 
-    # 7. Contention Analysis, Underdog Edge Arbitration & Spatial Cleanup
-    print("\n--- Resolving Contention with Underdog Edge & Dual-Graph Spatial Cleanup ---")
+    # 7. Contention analysis.  Raw labels are the local evidence argmax; the
+    # downstream geometric pass owns all spatial regularization.
+    print("\n--- Resolving Local Projection Evidence ---")
     t0_resolve = time.perf_counter()
 
     # Transfer accumulators to CPU
@@ -670,68 +769,12 @@ def project_masks_to_3d(
     print(f"  Contended (> 1 Classes):     {num_contended:,} ({num_contended / num_triangles * 100:.2f}%)")
     print(f"  Unvoted (0 Classes):         {num_unvoted:,} ({num_unvoted / num_triangles * 100:.2f}%)")
 
-    # Preliminary win rate per class from dominant weights (for underdog edge comparison)
-    # Using baseline class statistics if available, else local dominant count
-    prelim_dom = acc_weights_cpu.argmax(axis=1)
-    prelim_viewed = (acc_weights_cpu > 0).sum(axis=0)
-    prelim_assigned = np.bincount(prelim_dom[~unvoted_mask], minlength=num_classes)
-    class_win_rates = np.zeros(num_classes, dtype=np.float32)
-    for c_i in range(num_classes):
-        class_win_rates[c_i] = (prelim_assigned[c_i] / prelim_viewed[c_i]) if prelim_viewed[c_i] > 0 else 0.0
-
-    print("Computed preliminary class win rates for underdog edge arbitration:")
-    for c_i, cid in enumerate(persistent_classes):
-        if c_i < 5 or c_i > num_classes - 3:
-            print(f"  Class #{cid:3d}: prelim win rate = {class_win_rates[c_i]*100:.2f}%")
-
-    # Phase 1: Underdog Edge Arbitration (< 25% Relative Margin)
-    # Fast top-2 extraction using torch.topk directly on GPU
-    top2_vals, top2_idxs = torch.topk(acc_weights, k=2, dim=1)
-    w1 = top2_vals[:, 0].cpu().numpy()
-    w2 = top2_vals[:, 1].cpu().numpy()
-    c1 = top2_idxs[:, 0].cpu().numpy()
-    c2 = top2_idxs[:, 1].cpu().numpy()
-
-    sum_w = w1 + w2
-    margin = np.where(sum_w > 0, (w1 - w2) / np.maximum(sum_w, 1e-6), 0.0)
-
-    # If margin < 0.25 (close call), favor the class with lower win rate
-    r1 = class_win_rates[c1]
-    r2 = class_win_rates[c2]
-    underdog_class = np.where(r1 <= r2, c1, c2)
-
-    is_close_call = contended_mask & (margin < 0.25)
-    underdog_flips = is_close_call & (c1 != underdog_class)
-    num_underdog_flips = int(np.count_nonzero(underdog_flips))
-    print(f"\nUnderdog Edge Arbitration (< 25% relative margin):")
-    print(f"  Close call triangles (< 25% margin): {int(np.count_nonzero(is_close_call)):,}")
-    print(f"  Triangles flipped to underdog class:   {num_underdog_flips:,}")
-
-    # Assigned label per triangle after underdog edge arbitration
-    assigned_labels = np.where(
-        unvoted_mask,
-        -1,
-        np.where(is_close_call, underdog_class, c1),
-    )
-
-    # Phase 2: Dual-Graph Spatial Island Absorption
-    print("\nBuilding dual mesh graph (shared vertex-vertex edges)...")
-    t0_graph = time.perf_counter()
-    adj_u, adj_v = build_dual_mesh_graph(triangles_np)
-    print(f"Dual graph built in {time.perf_counter() - t0_graph:.3f}s ({len(adj_u):,} directed edges)")
-
-    print("Absorbing isolated triangles and small islands (< 15 triangles)...")
-    t0_absorb = time.perf_counter()
-    cleaned_labels, num_isolated, num_island_tri = absorb_isolated_islands(
-        triangle_labels=assigned_labels,
-        adj_u=adj_u,
-        adj_v=adj_v,
-        num_classes=num_classes,
-        min_island_size=15,
-    )
-    print(f"Spatial Cleanup complete in {time.perf_counter() - t0_absorb:.3f}s:")
-    print(f"  Isolated single triangles absorbed: {num_isolated:,}")
-    print(f"  Total island triangles absorbed:    {num_island_tri:,}")
+    assigned_labels = local_evidence_labels(acc_weights_cpu)
+    local_class_indices = assigned_labels
+    cleaned_labels = assigned_labels
+    num_underdog_flips = 0
+    num_isolated = 0
+    num_island_tri = 0
 
     # Generate Colored Meshes:
     # 1. Contention mesh: uncontended -> class color, contended -> pure white [255, 255, 255]
@@ -744,7 +787,7 @@ def project_masks_to_3d(
         single_class_indices = acc_weights_cpu[single_tri_indices].argmax(axis=1)
         triangle_colors_contention[single_tri_indices] = class_rgb[single_class_indices]
 
-    # 2. Resolved mesh: all voted triangles colored by their arbitrated & cleaned class color!
+    # 2. Resolved mesh: all voted triangles colored by their local evidence winner.
     triangle_colors_resolved = np.zeros((num_triangles, 3), dtype=np.uint8)
     triangle_colors_resolved[unvoted_mask] = [128, 128, 128]
 
@@ -753,6 +796,23 @@ def project_masks_to_3d(
 
     t_resolve_elapsed = time.perf_counter() - t0_resolve
     print(f"Color assignment completed in {t_resolve_elapsed:.3f}s")
+
+    # Save raw triangle class IDs (-1 for unvoted) for downstream geometry.
+    persistent_classes_np = np.array(persistent_classes, dtype=np.int32)
+    raw_triangle_classes = np.full(num_triangles, -1, dtype=np.int32)
+    voted = assigned_labels >= 0
+    if np.any(voted):
+        raw_triangle_classes[voted] = persistent_classes_np[assigned_labels[voted]]
+    raw_labels_path = output_dir / "triangle_class_labels_raw.npy"
+    np.save(raw_labels_path, raw_triangle_classes)
+    print(f"Saved raw triangle class labels: {raw_labels_path}")
+
+    from scipy.sparse import csr_matrix, save_npz
+    votes_path = output_dir / "face_class_votes.npz"
+    source_ids_path = output_dir / "face_class_source_ids.npy"
+    save_npz(votes_path, csr_matrix(acc_weights_cpu))
+    np.save(source_ids_path, persistent_classes_np)
+    print(f"Saved sparse face-class evidence: {votes_path}")
 
     # 8. Export Colored 3D Meshes
     t0_exp = time.perf_counter()
@@ -773,14 +833,17 @@ def project_masks_to_3d(
     has_votes = (acc_weights_cpu > 0).astype(np.float32)  # [num_triangles, num_classes]
 
     # Sparse / Matrix multiplication on GPU for maximum speed: [num_classes, num_classes]
-    t_has_votes = torch.as_tensor(has_votes, device=device)
-    contention_tensor = torch.matmul(t_has_votes.T, t_has_votes).cpu().numpy().astype(np.int64)
+    if num_classes:
+        t_has_votes = torch.as_tensor(has_votes, device=device)
+        contention_tensor = torch.matmul(t_has_votes.T, t_has_votes).cpu().numpy().astype(np.int64)
+    else:
+        contention_tensor = np.zeros((0, 0), dtype=np.int64)
 
     # Diagonal: total triangles that class touched
     total_touched_per_class = np.diag(contention_tensor).copy()
 
     # Dominant winner per triangle (pre-arbitration argmax over accumulated weights)
-    dominant_class_idx = acc_weights_cpu.argmax(axis=1)  # [num_triangles]
+    dominant_class_idx = local_class_indices if num_classes else np.full(num_triangles, -1, dtype=np.int64)
     assigned_per_class = np.zeros(num_classes, dtype=np.int64)
     uncontended_per_class = np.zeros(num_classes, dtype=np.int64)
     arbitrated_assigned_per_class = np.zeros(num_classes, dtype=np.int64)
@@ -803,14 +866,15 @@ def project_masks_to_3d(
     # 10. Render Vector PDF & PNG Contention Matrix
     pdf_matrix_path = output_dir / "contention_matrix.pdf"
     png_matrix_path = output_dir / "contention_matrix.png"
-    render_vector_pdf_matrix(
-        pdf_path=pdf_matrix_path,
-        png_path=png_matrix_path,
-        class_ids=persistent_classes,
-        contention_counts=pair_contention_matrix,
-        uncontended_counts=uncontended_per_class,
-        total_assigned_counts=arbitrated_assigned_per_class,
-    )
+    if num_classes:
+        render_vector_pdf_matrix(
+            pdf_path=pdf_matrix_path,
+            png_path=png_matrix_path,
+            class_ids=persistent_classes,
+            contention_counts=pair_contention_matrix,
+            uncontended_counts=uncontended_per_class,
+            total_assigned_counts=arbitrated_assigned_per_class,
+        )
 
     # 11. Generate CSV Summary Table
     csv_path = output_dir / "class_contention_summary.csv"
@@ -856,14 +920,25 @@ def project_masks_to_3d(
     t_total = time.perf_counter() - t_start
     summary_data = {
         "mesh_path": str(mesh_path.resolve()),
+        "mesh_sha256": _sha256_file(mesh_path),
+        "input_hashes": {str(path): _sha256_file(path) for path in
+                         (mesh_path, images_txt_path.parent / 'cameras.txt', images_txt_path)},
+        "mask_files": {p.name: [p.stat().st_size, p.stat().st_mtime_ns]
+                       for p in sorted(npz_dir.glob('*_final.npz'))},
+        "colmap_threshold": colmap_threshold,
+        "max_frames": max_frames,
+        "camera_selection_sha256": camera_selection_sha256,
         "output_mesh_contention": str(output_mesh_contention_path.resolve()),
         "output_mesh_resolved": str(output_mesh_resolved_path.resolve()),
-        "pdf_matrix": str(pdf_matrix_path.resolve()),
-        "png_matrix": str(png_matrix_path.resolve()),
+        "pdf_matrix": str(pdf_matrix_path.resolve()) if num_classes else None,
+        "png_matrix": str(png_matrix_path.resolve()) if num_classes else None,
         "csv_summary": str(csv_path.resolve()),
         "min_viewed_ratio": min_viewed_ratio,
         "min_win_rate": min_win_rate,
-        "margin_threshold": 0.25,
+        "projection_version": "view-normalized-v2",
+        "face_class_votes": str(votes_path.resolve()),
+        "face_class_source_ids": str(source_ids_path.resolve()),
+        "margin_threshold": None,
         "underdog_flips": num_underdog_flips,
         "isolated_triangles_absorbed": num_isolated,
         "island_triangles_absorbed": num_island_tri,
@@ -889,8 +964,9 @@ def project_masks_to_3d(
     }
 
     stats_json_path = output_dir / "projection_stats.json"
-    with open(stats_json_path, "w") as f:
-        json.dump(summary_data, f, indent=2)
+    pending_stats = stats_json_path.with_suffix('.work.json')
+    pending_stats.write_text(json.dumps(summary_data, indent=2) + '\n')
+    pending_stats.replace(stats_json_path)
     print(f"Exported Projection Stats JSON: {stats_json_path}")
     print(f"\n=================================================================")
     print(f"STEP 2 MASK PROJECTION COMPLETED SUCCESSFULLY IN {t_total:.2f}s!")
@@ -910,19 +986,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mesh-path",
         type=Path,
-        default=backend_dir / "current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply",
-        help="Cleaned 3D mesh PLY",
+        default=None,
+        help="Sealed cleaned 3D mesh PLY",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=backend_dir / "current_scene/06c_semantic_segmentation/step2_mesh_projection",
+        default=None,
         help="Output directory",
     )
     parser.add_argument(
         "--npz-dir",
         type=Path,
-        default=backend_dir / "current_scene/06c_semantic_segmentation/full362_final_pipeline/npz_data",
+        default=None,
         help="Directory containing 2D panoptic segmentation NPZ archives",
     )
     parser.add_argument(
@@ -958,11 +1034,25 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
+    scan = scene_inputs.resolve_scene(args.workspace)
+    mesh_path = scene_inputs.resolve_mesh(scan, args.mesh_path)
+    stage_out = scene_inputs.resolve_stage_output(scan)
+    output_dir = args.output_dir or stage_out
+    if args.npz_dir is not None and args.npz_dir.is_dir():
+        npz_dir = args.npz_dir
+    else:
+        candidates = [
+            stage_out / "panoptic_data/npz_data",
+            scan / "05_semantic_segmentation/full362_final_pipeline/npz_data",
+            stage_out / "npz_data",
+        ]
+        npz_dir = next((p for p in candidates if p.is_dir() and any(p.glob("*.npz"))), stage_out / "panoptic_data/npz_data")
+
     project_masks_to_3d(
-        workspace=args.workspace,
-        mesh_path=args.mesh_path,
-        output_dir=args.output_dir,
-        npz_dir=args.npz_dir,
+        workspace=scan,
+        mesh_path=mesh_path,
+        output_dir=output_dir,
+        npz_dir=npz_dir,
         colmap_threshold=args.colmap_threshold,
         max_frames=args.max_frames,
         min_viewed_ratio=args.min_viewed_ratio,

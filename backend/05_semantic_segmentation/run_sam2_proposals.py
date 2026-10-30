@@ -12,10 +12,8 @@ import cv2
 import numpy as np
 
 from fast_sam2_generator import FastSAM2Generator
+from scene_inputs import DEFAULT_WORKSPACE, resolve_scene, registered_images
 import torch
-
-
-DEFAULT_WORKSPACE = Path(__file__).resolve().parents[1] / "current_scene" / "06c_semantic_segmentation"
 
 
 def guided_filter_rgb(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps: float = 1e-3) -> np.ndarray:
@@ -85,9 +83,10 @@ def main() -> None:
     parser.add_argument("--run-name", type=str)
     args = parser.parse_args()
 
-    images = sorted((args.workspace / "inputs" / "images").glob("*.jpg"))
+    scan = resolve_scene(args.workspace)
+    images = registered_images(scan)
     if not images:
-        parser.error("No input JPG images found")
+        parser.error("No registered input images found")
     if args.frames < 0 or args.grid < 1 or not 0 <= args.gap_stability <= 1 or not 0 < args.coverage_trigger <= 1 or (args.first_frames is not None and args.first_frames < 1):
         parser.error("--frames must be >= 0, --first-frames >= 1, and --grid >= 1")
     if args.frame_name:
@@ -102,7 +101,7 @@ def main() -> None:
     run_name = args.run_name or f"{args.model}_grid{args.grid}_{args.resize_mode}_{'eager' if args.no_compile else 'compiled'}{'_complete' if args.fill_gaps else ''}"
     if Path(run_name).name != run_name or run_name in {".", ".."}:
         parser.error("--run-name must be a single directory name")
-    output = args.workspace / "sam2_proposals" / run_name
+    output = scan / "05_semantic_segmentation/sam2_proposals" / run_name
     if output.exists() and any(output.iterdir()):
         parser.error(f"Run directory already contains results: {output}")
     output.mkdir(parents=True, exist_ok=True)

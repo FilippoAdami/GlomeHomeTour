@@ -1,0 +1,40 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "../images/worldmap.jpg",
+  "output": "../artifacts/trellis2_optimization_2026-10-08/batch_8/worldmap.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "steps": 8,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "inference_seconds": 30.49878235199867,
+  "glb_export_seconds": 15.618273991000024,
+  "peak_allocated_gib": 4.80588960647583,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.0660008680024475
+    ],
+    "get_cond": [
+      0.6944896969980618,
+      2.922489232998487
+    ],
+    "sample_sparse_structure": [
+      8.713507041997218
+    ],
+    "sample_shape_slat_cascade": [
+      10.062683449999895
+    ],
+    "sample_tex_slat": [
+      4.6197476999986975
+    ],
+    "decode_latent": [
+      1.4164422049980203
+    ]
+  },
+  "glb_bytes": 6077844,
+  "model_load_seconds": 0.0,
+  "gpu_resident_setup_seconds": 0.0,
+  "total_seconds": 46.117056342998694
+}

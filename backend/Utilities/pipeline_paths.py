@@ -20,7 +20,7 @@ _STAGE_DIRS = (
     "03_FastGS_DNSplatter",
     "04_3DGS_to_mesh",
     "05_floor_plan",
-    "06_semantic_segmentation",
+    "05_semantic_segmentation",
 )
 
 

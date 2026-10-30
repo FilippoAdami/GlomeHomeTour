@@ -33,11 +33,24 @@ def test_distance_fit_is_translation_invariant():
     assert shifted.symmetric_difference(translate(fitted,xoff=123,yoff=-57)).area < 1e-5
 
 
-def test_level_collapse_uses_all_scene_faces_and_rejects_other_storeys():
+def test_distance_fit_preserves_a_clipped_hole_without_source_hole_support():
+    floor=Polygon([(0,0),(4,0),(4,4),(0,4)],holes=[[(1,1),(3,1),(3,3),(1,3)]])
+    ceiling_support=Polygon([(-.02,-.02),(4.02,-.02),(4.02,4.02),(-.02,4.02)])
+
+    fitted,_=fit_distance_footprint(floor,ceiling_support)
+
+    assert fitted.is_valid
+    assert len(fitted.interiors)==1
+    assert not fitted.covers(Point(2,2))
+    assert Polygon(fitted.interiors[0]).symmetric_difference(
+        Polygon([(1,1),(3,1),(3,3),(1,3)])).area < .01
+
+
+def test_level_collapse_uses_all_face_orientations_and_rejects_other_storeys():
     vertices=np.array([[0,y,0] for y in [0.,3.,6.]])
     faces=np.array([[0,0,0],[1,1,1],[2,2,2]])
-    centers=vertices.copy();normals=np.array([[0.,1.,0.]]*3)
+    centers=vertices.copy()
     floor={'name':'upper','equation':np.array([0.,1.,0.,-3.])}
     ceiling={'equation':np.array([0.,-1.,0.,5.9]),'footprint':Polygon([(-1,-1),(1,-1),(1,1),(-1,1)])}
-    selected=collapse_level(vertices,faces,normals,centers,floor,[ceiling])
+    selected=collapse_level(vertices,faces,centers,floor,[ceiling])
     np.testing.assert_array_equal(selected,faces[1:2])

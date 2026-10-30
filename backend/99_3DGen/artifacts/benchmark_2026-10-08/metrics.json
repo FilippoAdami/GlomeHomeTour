@@ -1,0 +1,62 @@
+{
+  "test_image": "Pixal3D/assets/images/fan.jpg (same image copied to TripoSplat)",
+  "hardware": "AMD Radeon RX 9060 XT (gfx1200, 16 GiB)",
+  "software": {
+    "rocm": "7.1.1",
+    "torch": "2.10.0+rocm7.0",
+    "hip": "7.0.51831"
+  },
+  "pixal3d": {
+    "end_to_end_seconds": 209.44,
+    "pipeline_seconds": 112.88,
+    "asset_export_seconds": 10.74,
+    "peak_allocated_gib": 13.02,
+    "steps_per_stage": 12,
+    "resolution": 1024,
+    "max_num_tokens": 49152,
+    "decimation_target": 150000,
+    "texture_size": 1024,
+    "low_vram": true
+  },
+  "triposplat": {
+    "model_load_seconds": 7.88121713999999,
+    "pipeline_seconds": 47.51761943400015,
+    "end_to_end_seconds": 56.12403623399996,
+    "peak_allocated_gib": 4.753656387329102,
+    "device": "AMD Radeon RX 9060 XT",
+    "torch": "2.10.0+rocm7.0",
+    "hip": "7.0.51831",
+    "steps": 20,
+    "guidance_scale": 3.0,
+    "num_gaussians": 262144,
+    "attention_backend": "AOTriton SDPA",
+    "placement": "CPU stage offload",
+    "asset_export_seconds": 0.725
+  },
+  "comparison": {
+    "end_to_end_speedup_triposplat_vs_pixal3d": 3.73,
+    "allocated_memory_ratio_pixal3d_over_triposplat": 2.74,
+    "triposplat_stage_offload_vs_resident": {
+      "resident_seconds": 55.30125235499986,
+      "offloaded_seconds": 56.12403623399996,
+      "resident_peak_gib": 6.407400608062744,
+      "offloaded_peak_gib": 4.753656387329102,
+      "time_change_percent": 1.49,
+      "memory_reduction_percent": 25.81
+    }
+  },
+  "quality_checks": {
+    "triposplat_ply_vertices": 262144,
+    "ply_float_attributes": 17,
+    "ply_all_finite": true,
+    "same_seed_reproducible": true,
+    "aotriton_fp16_sdpa_max_abs_error": 0.0001220703125,
+    "aotriton_fp16_sdpa_mean_abs_error": 7.5101853125e-06
+  },
+  "notes": [
+    "End-to-end includes model loading, image preprocessing, inference, and output serialization; Python import time is excluded.",
+    "Peak is torch.cuda.max_memory_allocated() in GiB; on ROCm PyTorch exposes HIP through torch.cuda.",
+    "Pixal3D outputs a textured GLB; TripoSplat outputs Gaussian PLY. Runtime and memory are comparable, visual quality is not.",
+    "TripoSplat with AOTriton disabled failed allocating 9.01 GiB with 1.23 GiB free."
+  ]
+}

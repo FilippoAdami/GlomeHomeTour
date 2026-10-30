@@ -1,0 +1,40 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "../images/puzzle.jpg",
+  "output": "../artifacts/trellis2_optimization_2026-10-08/batch_8/puzzle.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "steps": 8,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "inference_seconds": 44.714906215001974,
+  "glb_export_seconds": 19.57225903899962,
+  "peak_allocated_gib": 4.80588960647583,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.10540651699921
+    ],
+    "get_cond": [
+      0.6620604980016651,
+      2.921746936001
+    ],
+    "sample_sparse_structure": [
+      8.720807040997897
+    ],
+    "sample_shape_slat_cascade": [
+      19.00930211100058
+    ],
+    "sample_tex_slat": [
+      9.50803910600007
+    ],
+    "decode_latent": [
+      1.785092316000373
+    ]
+  },
+  "glb_bytes": 5184028,
+  "model_load_seconds": 0.0,
+  "gpu_resident_setup_seconds": 0.0,
+  "total_seconds": 64.2871652540016
+}

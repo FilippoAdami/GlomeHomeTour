@@ -133,6 +133,16 @@ def test_completed_step_skips_and_failed_step_does_not():
         assert not is_done(ws, "boom", []), "failed step reported done"
 
 
+def test_step_can_update_shared_stats_without_step_artifacts():
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp) / "ws"
+        with StepContext("quiet", ws, write_artifacts=False) as ctx:
+            ctx.metric("frames_processed", 3)
+        assert "quiet" in read_pipeline_stats(ws)
+        assert not (ws / "quiet_log.txt").exists()
+        assert not (ws / "quiet_stats.json").exists()
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

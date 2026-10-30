@@ -1097,7 +1097,7 @@ def extract_and_save_roof_data(report: dict, out_dir: Path) -> dict:
     return roof_data
 
 
-def regularize(src: Path, dst: Path, args) -> dict:
+def regularize(src: Path, dst: Path, args, *, write_diagnostics: bool = True) -> dict:
     ply = PlyData.read(str(src))
     vert = ply["vertex"].data.copy()
     xyz = np.stack([vert["x"], vert["y"], vert["z"]], axis=1).astype(np.float64)
@@ -1141,33 +1141,10 @@ def regularize(src: Path, dst: Path, args) -> dict:
                                            min_infill_distance=min_infill_dist)
         report["points_out"] = int(len(vert))
 
-        # Build diagnostic colored cloud from regularized and filled vertices
-        colored_vert = _create_colored_vert(vert)
-        colored_vert["red"][:] = UNASSIGNED_COLOR["rgb"][0]
-        colored_vert["green"][:] = UNASSIGNED_COLOR["rgb"][1]
-        colored_vert["blue"][:] = UNASSIGNED_COLOR["rgb"][2]
-
-        # Color original member inliers
-        for gid, idx in enumerate(members):
-            if len(idx) == 0:
-                continue
-            color = PALETTE[gid % len(PALETTE)]["rgb"]
-            colored_vert["red"][idx] = color[0]
-            colored_vert["green"][idx] = color[1]
-            colored_vert["blue"][idx] = color[2]
-
-        # Color appended infill points
-        n_orig = len(xyz)
-        offset = n_orig
-        for s in report["fill"]:
-            gid = s["group"]
-            color = PALETTE[gid % len(PALETTE)]["rgb"]
-            colored_vert["red"][offset:offset + s["added"]] = color[0]
-            colored_vert["green"][offset:offset + s["added"]] = color[1]
-            colored_vert["blue"][offset:offset + s["added"]] = color[2]
-            offset += s["added"]
     else:
         report["points_out"] = int(len(vert))
+
+    if write_diagnostics:
         colored_vert = _create_colored_vert(vert)
         colored_vert["red"][:] = UNASSIGNED_COLOR["rgb"][0]
         colored_vert["green"][:] = UNASSIGNED_COLOR["rgb"][1]
@@ -1179,26 +1156,31 @@ def regularize(src: Path, dst: Path, args) -> dict:
             colored_vert["red"][idx] = color[0]
             colored_vert["green"][idx] = color[1]
             colored_vert["blue"][idx] = color[2]
+        if getattr(args, "fill", None):
+            offset = len(xyz)
+            for fill in report["fill"]:
+                color = PALETTE[fill["group"] % len(PALETTE)]["rgb"]
+                end = offset + fill["added"]
+                colored_vert["red"][offset:end] = color[0]
+                colored_vert["green"][offset:end] = color[1]
+                colored_vert["blue"][offset:end] = color[2]
+                offset = end
 
     # Save regularized point cloud (realistic RGB intact)
     PlyData([PlyElement.describe(vert, "vertex")], text=False).write(str(dst))
 
-    # Save colored diagnostic point cloud (each plane surface has a distinct palette color)
-    colored_ply_path = dst.with_name(dst.stem + "_planes_colored.ply")
-    PlyData([PlyElement.describe(colored_vert, "vertex")], text=False).write(str(colored_ply_path))
-    report["colored_ply"] = str(colored_ply_path)
-
-    # Save companion markdown legend
-    legend_md = build_legend_markdown(report)
-    legend_path = dst.with_name("planes_legend.md")
-    legend_path.write_text(legend_md)
-    if dst.stem != "planes":
-        dst.with_name(dst.stem + "_legend.md").write_text(legend_md)
-    report["legend_file"] = str(legend_path)
-    report["legend_md"] = legend_md
-
-    # Extract and save roof data (ceiling height and/or tilted roof plane)
-    extract_and_save_roof_data(report, dst.parent)
+    if write_diagnostics:
+        colored_ply_path = dst.with_name(dst.stem + "_planes_colored.ply")
+        PlyData([PlyElement.describe(colored_vert, "vertex")], text=False).write(str(colored_ply_path))
+        report["colored_ply"] = str(colored_ply_path)
+        legend_md = build_legend_markdown(report)
+        legend_path = dst.with_name("planes_legend.md")
+        legend_path.write_text(legend_md)
+        if dst.stem != "planes":
+            dst.with_name(dst.stem + "_legend.md").write_text(legend_md)
+        report["legend_file"] = str(legend_path)
+        report["legend_md"] = legend_md
+        extract_and_save_roof_data(report, dst.parent)
 
     return report
 

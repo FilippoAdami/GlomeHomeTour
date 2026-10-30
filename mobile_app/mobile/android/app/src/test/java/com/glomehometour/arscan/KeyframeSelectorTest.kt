@@ -53,6 +53,20 @@ class KeyframeSelectorTest {
     }
 
     @Test
+    fun `floor count starts at ten elevated camera poses`() {
+        fun floorCount(elevatedCount: Int): Int {
+            val frames = (0 until 20).map { index ->
+                val y = if (index < elevatedCount) 3.1f else 0f
+                KeyframeSelector.PoseFrame(index, "frame_$index.jpg", identityMatrix(y = y))
+            }
+            return KeyframeSelector().selectKeyframes(frames, targetCount = 20).extent.floorCount
+        }
+
+        assertEquals(1, floorCount(9))
+        assertEquals(2, floorCount(10))
+    }
+
+    @Test
     fun `redundant stationary frames are decimated`() {
         val selector = KeyframeSelector()
         val frames = mutableListOf<KeyframeSelector.PoseFrame>()

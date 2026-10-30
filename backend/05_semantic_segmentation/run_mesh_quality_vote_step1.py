@@ -47,7 +47,9 @@ import matplotlib.colors as mcolors
 # Include FastGS camera loader
 backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(backend_dir / "03_FastGS_DNSplatter"))
-from gsplat_train import load_cameras
+from scene_inputs import (DEFAULT_WORKSPACE, colmap_point_counts, load_mesh_transform,
+                          load_scene_cameras, resolve_mesh, resolve_scene,
+                          resolve_sparse_dir, resolve_stage_output, validate_labels)
 
 def get_class_color(mid: int):
     """Deterministic color matching 2D overlays in run_full_scene_pipeline.py."""
@@ -74,27 +76,12 @@ def compute_mask_distance_weights(labels: np.ndarray) -> np.ndarray:
     return w_edge
 
 def load_colmap_triangulated_points(images_txt_path: Path):
-    """Parses COLMAP images.txt to get the count of triangulated 3D points per image."""
-    frame_pts = {}
-    if not images_txt_path.exists():
-        return frame_pts
-    with open(images_txt_path) as f:
-        lines = f.readlines()
-    for i in range(len(lines)):
-        line = lines[i].strip()
-        if not line or line.startswith('#'): continue
-        parts = line.split()
-        if len(parts) >= 10 and (parts[9].endswith('.jpg') or parts[9].endswith('.png')):
-            name = parts[9]
-            pts_parts = lines[i+1].strip().split()
-            num_2d = len(pts_parts) // 3
-            num_3d = sum(1 for k in range(num_2d) if int(pts_parts[k*3+2]) != -1)
-            frame_pts[name] = num_3d
-    return frame_pts
+    """Count every COLMAP image record, including empty POINTS2D records."""
+    return colmap_point_counts(images_txt_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Step 1: Quality-Weighted Vote Accumulation Per-Face")
-    parser.add_argument("--workspace", type=Path, default=backend_dir / "current_scene")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--mesh-path", type=Path, default=None)
     parser.add_argument("--npz-dir", type=Path, default=None)
     parser.add_argument("--transform-path", type=Path, default=None)
@@ -104,20 +91,21 @@ def main():
     parser.add_argument("--max-frames", type=int, default=None)
     args = parser.parse_args()
 
-    workspace = args.workspace
-    mesh_path = args.mesh_path or (workspace / "06c_semantic_segmentation/inputs/mesh.ply")
-    t_path = args.transform_path or (workspace / "06c_semantic_segmentation/inputs/T_mesh_to_raw.npy")
-    npz_dir = args.npz_dir or (workspace / "06c_semantic_segmentation/full362_final_pipeline/npz_data")
-    summary_path = workspace / "06c_semantic_segmentation/full362_final_pipeline/full_pipeline_benchmark_summary.json"
-    images_txt_path = workspace / "06c_semantic_segmentation/inputs/sparse/0/images.txt"
-    out_dir = args.output_dir or (workspace / "06c_semantic_segmentation/mesh_projection_step1")
+    workspace = resolve_scene(args.workspace)
+    stage = resolve_stage_output(workspace, create=False)
+    mesh_path = resolve_mesh(workspace, args.mesh_path)
+    T_mesh_to_raw = load_mesh_transform(args.transform_path)
+    npz_dir = args.npz_dir or stage / "panoptic_data/npz_data"
+    summary_path = stage / "panoptic_data/full_pipeline_benchmark_summary.json"
+    images_txt_path = resolve_sparse_dir(workspace) / "images.txt"
+    out_dir = args.output_dir or resolve_stage_output(workspace, "mesh_projection_step1")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=================================================================")
     print("STEP 1: QUALITY-WEIGHTED VOTE ACCUMULATION (PER-FACE)")
     print(f"Workspace:          {workspace}")
     print(f"Mesh:               {mesh_path}")
-    print(f"Transform:          {t_path}")
+    print(f"Transform:          {args.transform_path or 'identity (mesh and cameras share COLMAP space)'}")
     print(f"NPZ Data:           {npz_dir}")
     print(f"Output:             {out_dir}")
     print(f"COLMAP Threshold:   {args.colmap_threshold} triangulated 3D points")
@@ -149,8 +137,7 @@ def main():
     print(f"Mesh loaded: {num_vertices:,} vertices, {num_triangles:,} triangles")
 
     # Transform mesh to Raw camera space for exact ray intersection
-    T_mesh_to_raw = np.load(t_path)
-    print(f"Loaded T_mesh_to_raw (translation Y = {T_mesh_to_raw[1, 3]:.4f}m):")
+    print(f"Loaded mesh-to-camera transform (translation Y = {T_mesh_to_raw[1, 3]:.4f}m):")
     print(T_mesh_to_raw)
 
     print("Transforming mesh into Raw Camera Coordinate space...")
@@ -167,7 +154,7 @@ def main():
     print(f"BVH built in {time.perf_counter() - t_bvh_start:.3f}s")
 
     # 3. Load Cameras
-    all_cameras = load_cameras(workspace, resolution=1)
+    all_cameras = load_scene_cameras(workspace, resolution=1)
     if args.max_frames:
         all_cameras = all_cameras[:args.max_frames]
     num_frames = len(all_cameras)
@@ -195,7 +182,7 @@ def main():
     filtered_wall_pixels_total = 0
 
     for f_idx, cam in enumerate(all_cameras):
-        img_name = Path(cam['image_path']).name
+        img_name = Path(cam['image_path']).relative_to(workspace / 'images').as_posix()
         stem = Path(cam['image_path']).stem
         npz_file = npz_dir / f"{stem}_final.npz"
         if not npz_file.exists():
@@ -208,7 +195,7 @@ def main():
             continue
 
         data = np.load(npz_file)
-        labels = data['labels'] # [1920, 1080] int32
+        labels = validate_labels(data['labels'], cam, persistent_classes)
 
         # Pinhole rays in raw camera space
         t_r0 = time.perf_counter()

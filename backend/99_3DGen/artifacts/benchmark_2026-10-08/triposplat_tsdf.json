@@ -1,0 +1,169 @@
+{
+  "input": "triposplat_rocm.ply",
+  "output": "triposplat_tsdf.glb",
+  "runtime_seconds": 3.777090601999589,
+  "method": "14 orthographic Gaussian-splat depth maps -> weighted TSDF -> marching cubes",
+  "settings": {
+    "volume_resolution": 96,
+    "depth_resolution": 192,
+    "truncation_world_units": 0.045,
+    "splat_opacity_threshold": 0.15,
+    "splat_front_support_sigma": 2.0
+  },
+  "views": [
+    {
+      "direction": [
+        0.3996526300907135,
+        0.0,
+        0.9166666865348816
+      ],
+      "covered_pixels": 12515
+    },
+    {
+      "direction": [
+        -0.4877236783504486,
+        -0.4467948377132416,
+        0.75
+      ],
+      "covered_pixels": 12547
+    },
+    {
+      "direction": [
+        0.0710100457072258,
+        0.8091228604316711,
+        0.5833333134651184
+      ],
+      "covered_pixels": 12181
+    },
+    {
+      "direction": [
+        0.5531070232391357,
+        -0.7214301824569702,
+        0.4166666567325592
+      ],
+      "covered_pixels": 12458
+    },
+    {
+      "direction": [
+        -0.9534447193145752,
+        0.16865095496177673,
+        0.25
+      ],
+      "covered_pixels": 14238
+    },
+    {
+      "direction": [
+        0.8408204913139343,
+        0.534861147403717,
+        0.0833333358168602
+      ],
+      "covered_pixels": 11364
+    },
+    {
+      "direction": [
+        -0.2587013244628906,
+        -0.9623560309410095,
+        -0.0833333358168602
+      ],
+      "covered_pixels": 9593
+    },
+    {
+      "direction": [
+        -0.44627130031585693,
+        0.8592682480812073,
+        -0.25
+      ],
+      "covered_pixels": 10904
+    },
+    {
+      "direction": [
+        0.853898823261261,
+        -0.3118424713611603,
+        -0.4166666567325592
+      ],
+      "covered_pixels": 14293
+    },
+    {
+      "direction": [
+        -0.7507838606834412,
+        -0.30991265177726746,
+        -0.5833333134651184
+      ],
+      "covered_pixels": 12597
+    },
+    {
+      "direction": [
+        0.2803477644920349,
+        0.5990868806838989,
+        -0.75
+      ],
+      "covered_pixels": 12662
+    },
+    {
+      "direction": [
+        0.11960957944393158,
+        -0.38133418560028076,
+        -0.9166666865348816
+      ],
+      "covered_pixels": 12862
+    },
+    {
+      "direction": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "covered_pixels": 13540
+    },
+    {
+      "direction": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "covered_pixels": 8635
+    }
+  ],
+  "tsdf_observed_fraction": 0.8812820999710648,
+  "vertices": 33750,
+  "faces": 67054,
+  "watertight": false,
+  "vertex_color_range_rgb": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      241,
+      212,
+      184
+    ]
+  ],
+  "exported_color_range_rgb": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      241,
+      212,
+      184
+    ]
+  ],
+  "bounds": [
+    [
+      -0.4333929169876099,
+      -0.36880754672279537,
+      -0.3761899765297557
+    ],
+    [
+      0.513832028388977,
+      0.34801256767716515,
+      0.4051454688683295
+    ]
+  ],
+  "glb_bytes": 1345620,
+  "notes": "Gaussian-derived orthographic depth approximation; vertex colors from nearest Gaussian DC color. Not a calibrated renderer or UV texture reconstruction."
+}

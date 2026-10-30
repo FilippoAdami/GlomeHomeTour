@@ -17,7 +17,7 @@ Features:
    - Exports clean sub-meshes under 'extracted_instances/'.
 """
 
-import os, sys, json, time, argparse
+import os, sys, json, time, argparse, shutil
 from pathlib import Path
 import numpy as np
 import scipy.sparse as sp
@@ -26,7 +26,9 @@ import cv2
 
 backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(backend_dir / "03_FastGS_DNSplatter"))
-from gsplat_train import load_cameras
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scene_inputs import DEFAULT_WORKSPACE, resolve_scene, resolve_stage_output
+from export_delivery import deliver_stage05_outputs
 
 def get_class_color(mid: int):
     if mid <= 0:
@@ -248,15 +250,29 @@ def export_binary_rgba_ply(file_path: Path, vertices: np.ndarray, faces: np.ndar
 
 def main():
     parser = argparse.ArgumentParser(description="Step 3: 3D Object Extraction & Filtering")
-    parser.add_argument("--workspace", type=Path, default=backend_dir / "current_scene")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--mesh-path", type=Path, default=None)
+    parser.add_argument("--labels-path", type=Path, default=None,
+                        help="exact Step 2 triangle_labels.npz; required if not in the standard Step 2 output")
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--structural-json", type=Path, default=None)
     args = parser.parse_args()
 
-    workspace = args.workspace
-    mesh_path = args.mesh_path or (workspace / "06c_semantic_segmentation/mesh_dispute_resolution_step2/mesh_dispute_resolved.ply")
-    summary_path = workspace / "06c_semantic_segmentation/full362_final_pipeline/full_pipeline_benchmark_summary.json"
-    out_dir = args.output_dir or (workspace / "06c_semantic_segmentation/mesh_objects_step3")
+    workspace = resolve_scene(args.workspace)
+    stage = resolve_stage_output(workspace, create=False)
+    step2_dir = stage / "mesh_dispute_resolution_step2"
+    mesh_path = args.mesh_path or step2_dir / "mesh_dispute_resolved.ply"
+    labels_path = args.labels_path or step2_dir / "triangle_labels.npz"
+    summary_candidates = [
+        stage / "panoptic_data/full_pipeline_benchmark_summary.json",
+    ]
+    summary_path = next((p for p in summary_candidates if p.is_file()), summary_candidates[0])
+    structural_json_path = args.structural_json or (
+        stage / "structural_classes.json"
+        if (stage / "structural_classes.json").is_file()
+        else stage / "step3_structural_detection/structural_classes.json"
+    )
+    out_dir = args.output_dir or resolve_stage_output(workspace, "mesh_objects_step3")
     out_dir.mkdir(parents=True, exist_ok=True)
     obj_export_dir = out_dir / "extracted_instances"
     obj_export_dir.mkdir(parents=True, exist_ok=True)
@@ -265,12 +281,34 @@ def main():
     print("STEP 3: 3D OBJECT EXTRACTION, FLOATER PRUNING & BOUNDING BOX GENERATION", flush=True)
     print(f"Workspace:         {workspace}", flush=True)
     print(f"Source Mesh:       {mesh_path}", flush=True)
+    print(f"Triangle Labels:   {labels_path}", flush=True)
     print(f"Output Directory:  {out_dir}", flush=True)
     print("=================================================================", flush=True)
 
     with open(summary_path) as f:
         bench_summary = json.load(f)
     persistent_classes = sorted(bench_summary['final_classes'])
+    with open(structural_json_path, encoding="utf-8") as f:
+        structural_data = json.load(f)
+    classifications = structural_data.get("classifications", {})
+    role_aliases = {
+        "wall_sottoscala": "wall", "door": "object", "wall_fixture": "object",
+        "furniture_horizontal": "object", "furniture_vertical": "object",
+        "column": "columns", "columns": "columns",
+        "ramp": "ramps", "ramps": "ramps",
+    }
+    class_metadata = {}
+    for cid in persistent_classes:
+        info = classifications.get(str(cid), classifications.get(cid))
+        if info is None:
+            raise ValueError(f"No structural metadata for class {cid} in {structural_json_path}")
+        role = role_aliases.get(info.get("structural_role", "object"), info.get("structural_role", "object"))
+        if role not in {"object", "ceiling", "wall", "floor", "stairs", "columns", "ramps"}:
+            role = "object"
+        class_metadata[int(cid)] = {
+            "class_id": int(cid), "structural_role": role,
+            "confidence": info.get("confidence"), "details": info.get("details", ""),
+        }
 
     print("Loading geometry-resolved 3D mesh...", flush=True)
     t0 = time.perf_counter()
@@ -289,18 +327,15 @@ def main():
     cross = np.cross(v1 - v0, v2 - v0)
     tri_areas = 0.5 * np.linalg.norm(cross, axis=1)
 
-    print("Mapping triangle class IDs from mesh vertex colors...", flush=True)
-    tri_colors = vertex_colors_np[triangles_np[:, 0]]
-    color_to_cid = {}
-    for cid in persistent_classes:
-        _, rgb = get_class_color(cid)
-        color_to_cid[tuple(np.round(rgb, 3))] = cid
-
-    tri_cids = np.zeros(num_triangles, dtype=np.int32)
-    rounded_cols = np.round(tri_colors, 3)
-    for col_key, cid in color_to_cid.items():
-        match = (np.abs(rounded_cols - col_key) < 0.05).all(axis=1)
-        tri_cids[match] = cid
+    if not labels_path.is_file():
+        raise FileNotFoundError(f"Exact Step 2 labels are required: {labels_path}")
+    with np.load(labels_path) as labels_data:
+        if "triangle_labels" not in labels_data:
+            raise ValueError(f"{labels_path} does not contain triangle_labels")
+        tri_cids = np.asarray(labels_data["triangle_labels"], dtype=np.int32)
+    if tri_cids.shape != (num_triangles,) or np.any(~np.isin(tri_cids, [0, *persistent_classes])):
+        raise ValueError("Step 2 triangle labels do not match this mesh or persistent class list")
+    print("Loaded exact Step 2 triangle labels.", flush=True)
 
     print("Building true geometric dual-graph adjacency...", flush=True)
     edges = np.vstack([
@@ -618,6 +653,37 @@ def main():
     with open(manifest_json_path, 'w') as f:
         json.dump(objects_manifest, f, indent=2)
     print(f"Exported metadata manifest: {manifest_json_path} ({len(objects_manifest)} objects)", flush=True)
+
+    # Package the final regularized outputs
+    candidate_sources = [
+        stage / "panoptic_data/npz_data",
+    ]
+    masks_source = next((p for p in candidate_sources if p.is_dir() and any(p.glob("*.npz"))), None)
+
+    delivery_instances = {}
+    for cid in persistent_classes:
+        for k, comp in enumerate(class_instance_map[cid], 1):
+            inst_key = f"inst_{cid}_{k}"
+            delivery_instances[inst_key] = {
+                "class_id": int(cid),
+                "instance_index": k,
+                "triangles": np.array(comp["tri_indices"], dtype=np.int32),
+                "area_m2": float(comp["area_m2"]),
+                "h_mean": float(comp["centroid"][1]),
+                "h_span": float(comp["dimensions"][1]),
+                "bounds_min": [float(x) for x in comp["bbox_min"]],
+                "bounds_max": [float(x) for x in comp["bbox_max"]],
+                "spans": [float(x) for x in comp["dimensions"]],
+            }
+
+    deliver_stage05_outputs(
+        sealed_mesh_path=mesh_path,
+        triangle_labels=tri_cids,
+        instances=delivery_instances,
+        classifications=class_metadata,
+        output_dir=out_dir,
+        panoptic_npz_dir=masks_source,
+    )
 
     print("\n--- Generating Class-Instance Grid Table ---", flush=True)
     max_instances = max(len(class_instance_map[cid]) for cid in persistent_classes)

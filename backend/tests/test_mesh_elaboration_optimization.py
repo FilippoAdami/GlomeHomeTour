@@ -31,7 +31,9 @@ def test_regularization_requires_fitted_manifests_without_inventing_geometry(tmp
     import argparse
     import recognize_and_regularize_patterns as regularizer
     output = tmp_path/'output'
-    monkeypatch.setattr(regularizer, 'parse_args', lambda: argparse.Namespace(instances_dir=tmp_path, output_dir=output))
+    monkeypatch.setattr(regularizer, 'parse_args', lambda: argparse.Namespace(
+        instances_dir=tmp_path, output_dir=output, wall_manifest=None,
+    ))
     assert regularizer.main() == 1
     assert 'Required fitted geometry manifest not found' in capsys.readouterr().out
     assert not list(output.glob('*.ply'))

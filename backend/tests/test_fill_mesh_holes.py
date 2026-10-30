@@ -6,7 +6,15 @@ import numpy as np
 import open3d as o3d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "04_3DGS_to_mesh"))
-from fill_mesh_holes import fill_mesh, boundary_loops, main, patch_loop, edge_keys
+from fill_mesh_holes import (
+    CoplanarTextureSampler,
+    boundary_loops,
+    derive_infilled_face_textures,
+    edge_keys,
+    fill_mesh,
+    main,
+    patch_loop,
+)
 
 
 def test_fills_only_selected_hole_and_preserves_colors():
@@ -196,3 +204,89 @@ def test_seal_all_repairs_zero_length_boundary_edge():
     assert records[0]["filled_region"] == "seal_all"
     assert not boundary_loops(np.asarray(filled.triangles))
     assert np.linalg.norm(np.asarray(filled.vertices)[loop[1]] - np.asarray(filled.vertices)[loop[0]]) > 0
+
+
+def test_coplanar_texture_sampler_logic():
+    # Wall in X-Z plane (Y=0), normal [0, 1, 0], pure white [1.0, 1.0, 1.0]
+    wall_v = np.array([[0, 0, 0], [1, 0, 0], [0, 0, 1], [1, 0, 1]], dtype=float)
+    wall_t = np.array([[0, 2, 1], [1, 2, 3]])
+    wall_c = np.ones((len(wall_v), 3))
+
+    # Floor in X-Y plane (Z=0), normal [0, 0, 1], dark brown [0.2, 0.1, 0.05]
+    floor_v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float)
+    floor_t = np.array([[0, 1, 2], [1, 3, 2]])
+    floor_c = np.full((len(floor_v), 3), [0.2, 0.1, 0.05])
+
+    all_v = np.vstack([wall_v, floor_v + [0, 0, 0]])
+    all_t = np.vstack([wall_t, floor_t + len(wall_v)])
+    all_c = np.vstack([wall_c, floor_c])
+
+    sampler = CoplanarTextureSampler(all_v, all_t, all_c)
+
+    # Query 1: point on wall plane (Y=0), normal [0, 1, 0]
+    wall_sample = sampler.query([0.5, 0.0, 0.5], [0.0, 1.0, 0.0])
+    np.testing.assert_allclose(wall_sample, [1.0, 1.0, 1.0], atol=1e-5)
+
+    # Query 2: point on floor plane (Z=0), normal [0, 0, 1]
+    floor_sample = sampler.query([0.5, 0.5, 0.0], [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(floor_sample, [0.2, 0.1, 0.05], atol=1e-5)
+
+
+def test_coplanar_texture_assignment_avoids_cross_plane_bleeding():
+    # 5x5 grid in X-Z (vertical wall, Y=0) with hole at (x=1, z=1)
+    dx = 0.1
+    xs, zs = np.meshgrid(np.arange(5) * dx, np.arange(5) * dx)
+    wall_v = np.column_stack((xs.ravel(), np.zeros(25), zs.ravel()))
+    wall_faces = []
+    for z in range(4):
+        for x in range(4):
+            if (x, z) == (1, 1):
+                continue
+            a = z * 5 + x
+            wall_faces.extend([[a, a + 5, a + 1], [a + 1, a + 5, a + 6]])
+
+    # 5x5 grid in X-Y (horizontal floor, Z=0) with hole at (x=1, y=1)
+    xs_f, ys_f = np.meshgrid(np.arange(5) * dx, np.arange(1, 5) * dx)
+    floor_v = np.column_stack((xs_f.ravel(), ys_f.ravel(), np.zeros(20)))
+    floor_faces = []
+    for y in range(4):
+        for x in range(4):
+            if (x, y) == (1, 1):
+                continue
+            a = x if y == 0 else 25 + (y - 1) * 5 + x
+            b = (x + 1) if y == 0 else 25 + (y - 1) * 5 + x + 1
+            c = 25 + y * 5 + x
+            d = 25 + y * 5 + x + 1
+            floor_faces.extend([[a, b, c], [b, d, c]])
+
+    all_v = np.vstack([wall_v, floor_v])
+    all_t = np.vstack([wall_faces, floor_faces])
+
+    colors = np.zeros((len(all_v), 3))
+    colors[:25] = [1.0, 1.0, 1.0]      # White wall
+    colors[25:] = [0.2, 0.1, 0.05]    # Dark brown floor
+
+    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(all_v), o3d.utility.Vector3iVector(all_t))
+    mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
+
+    filled, records = fill_mesh(mesh, [], auto=True)
+    assert sum(r["filled_region"] == "auto" for r in records) == 2
+
+    # Derived infilled triangle textures
+    infill_face_colors = derive_infilled_face_textures(filled, len(mesh.triangles))
+    assert infill_face_colors is not None
+    assert len(infill_face_colors) == len(filled.triangles) - len(mesh.triangles)
+
+    # First 6 infilled triangles correspond to wall hole
+    wall_infill_colors = infill_face_colors[:6]
+    # Remaining 6 infilled triangles correspond to floor hole
+    floor_infill_colors = infill_face_colors[6:]
+
+    # Wall triangles must strictly be pure white (no floor brown contamination)
+    np.testing.assert_allclose(wall_infill_colors, np.ones_like(wall_infill_colors), atol=1e-3)
+
+    # Floor triangles must not have white contamination (mean RGB must be well below white)
+    assert np.all(floor_infill_colors[:, 0] < 0.4)
+    assert np.all(floor_infill_colors[:, 1] < 0.3)
+    assert np.all(floor_infill_colors[:, 2] < 0.25)
+

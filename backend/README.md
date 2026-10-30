@@ -18,8 +18,8 @@ collection of modules (no nested subpackages) importing each other by bare modul
 backend/
 ├── 00_ingestion/           # Ingestion (quality gate, blur/exposure filter, VIO sync)
 │                            #   moved directly on-device in mobile app; retained for standalone tools
-├── 01_poses_refinment/      # Step 1: COLMAP triangulation against fixed ARCore poses,
-│                            #   drift/Sampson diagnostics -> sparse/ reconstruction
+├── 01_poses_refinment/      # Step 1: Image-only COLMAP structure-from-motion (spatial candidate pairing),
+│                            #   metric scale calibration -> sparse/ reconstruction
 ├── 02_depth_estimation/      # Step 2: Depth Anything 3 + StableNormal inference + surfel-cloud
 │                            #   initialization from refined poses/images
 ├── 03_FastGS_DNSplatter/    # Step 3: gsplat training with depth and normal supervision
@@ -194,19 +194,20 @@ standalone script that can be run, inspected and resumed on its own:
 | # | Step | Script | Writes |
 | --- | --- | --- | --- |
 | 0 | extract | `Utilities/step_extract.py` | `images/`, `00_ingestion/transforms.json` |
-| 1 | colmap | `01_poses_refinment/step_colmap.py` | `sparse/0/`, `01_poses_refinment/colmap_diagnostics/` |
+| 1 | colmap | `01_poses_refinment/step_colmap.py` | For each scan: filtered `images/` and aligned `sparse/0/`; COLMAP outputs are temporary otherwise. |
 | 2 | depth | `02_depth_estimation/step_depth.py` | `02_depth_estimation/depth/depth_maps/`, `normal_maps/`, `points3D_depth.ply` |
-| 3 | train | `03_FastGS_DNSplatter/step_train.py` | `current_scene/03_FastGS_DNSplatter/checkpoint.pt`, `point_cloud/iteration_22000/` |
-| 4 | mesh | `04_3DGS_to_mesh/step_mesh.py` | `current_scene/04_3DGS_to_mesh/mesh.ply`, `mesh.json` |
-| 5 | mesh_cleanup | `06c_semantic_segmentation/step1_remove_mesh_floaters.py` | `step1_cleaned_mesh/mesh_cleaned.ply`, `mesh_sealed_colored.ply`, `mesh_sealed_red.ply` |
+| 3 | train | `03_FastGS_DNSplatter/step_train.py` | `current_scene/scan_N/gaussian_splat/checkpoint.pt`, `current_scene/scan_N/gaussian_splat/gaussian_splat.ply` |
+| 4 | mesh | `04_3DGS_to_mesh/step_mesh.py` | `<scan>/{mesh.ply,mesh.json,mesh_log.txt,mesh_stats.json}` plus sealed siblings under `<scan>/gaussian_splat/` |
 
-**Nothing is deleted mid-pipeline.** A frame a step rejects is *moved* into that
-step's own discard folder together with its camera entry, so every discard folder
-is itself a loadable scene and any step can be re-run in isolation. Frame
+Most steps preserve rejected data in their own discard folders. The COLMAP step
+removes unregistered or low-feature images in place and prunes the model to
+match, as requested by the ingestion-result workflow. Its per-scan updates are
+staged and only published after that scan succeeds. A `--force` rerun uses the
+remaining images; deleted images cannot be restored by this step. Frame
 basenames are never renumbered — depth maps, COLMAP image names and stats keys
 are all keyed by basename.
 
-Each step writes `<name>_log.txt`, `<name>_stats.json` and updates `pipeline_stats.json`; a completed step skips on re-run.
+Most steps write `<name>_log.txt` and `<name>_stats.json` alongside `pipeline_stats.json`. COLMAP keeps its detailed logs and reports in temporary storage and retains only aggregate `pipeline_stats.json` metrics; completed steps skip on re-run.
 
 ```bash
 --from-step colmap      # start there, skip everything earlier
@@ -237,7 +238,7 @@ backend/.venv/bin/python backend/03_FastGS_DNSplatter/step_train.py --workspace 
 backend/.venv/bin/python backend/04_3DGS_to_mesh/step_mesh.py --workspace backend/current_scene
 ```
 
-The stage 03 checkpoint format changed to `checkpoint.pt`; old FastGS checkpoints need retraining. Stage 04 writes the raw TSDF mesh to `04_3DGS_to_mesh/mesh.ply`. The next default step removes floaters and outliers, then seals the cleaned mesh in memory. It keeps `mesh_cleaned.ply` for semantic segmentation, writes blended patches to `mesh_sealed_colored.ply`, and marks them in `mesh_sealed_red.ply`. Web export reads `mesh_sealed_colored.ply`. `--resolution 4 --frame-stride 8` lowers memory use for mesh extraction.
+The stage 03 checkpoint format changed to `checkpoint.pt`; old FastGS checkpoints need retraining. Phase 04 runs fusion, floater removal/SOR, mesh sealing, Gaussian infill and RGB refinement in one `mesh` invocation. It retains only `mesh.ply`, a consolidated `mesh.json`, `mesh_log.txt` and `mesh_stats.json` directly in each scan folder; no `04_3DGS_to_mesh/` output folder is created. Intermediate meshes and automatic red copies are not kept. The original `gaussian_splat/checkpoint.pt` and `gaussian_splat.ply` remain unchanged; `checkpoint_sealed.pt` and `gaussian_splat_sealed.ply` are additional complete models in the same folder. Web export and stage 06 use their explicit manifest paths. Safe retries rebuild from upstream inputs with `--only-step mesh --force`, avoiding accumulated sharpening or infill. See the [stage 04 README](04_3DGS_to_mesh/README.md) for contracts and retained artifacts.
 
 See [stage 03 setup](03_FastGS_DNSplatter/README.md) for ROCm details and license provenance.
 
@@ -254,11 +255,12 @@ backend/.venv/bin/python3 shared/schemas/validate.py
 
 `04_3DGS_to_mesh/fill_mesh_holes.py` reports closed mesh boundary loops and can fill
 small, nearly planar loops inside explicitly selected 3D boxes. Run manual
-variants on the unsealed, floater-cleaned mesh; coordinates are in that mesh's frame:
+variants on an explicitly retained diagnostic raw mesh; production does not keep
+unsealed copies. Coordinates are in the selected input's frame:
 
 ```bash
 backend/.venv/bin/python backend/04_3DGS_to_mesh/fill_mesh_holes.py \
-  --input backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply \
+  --input agents_files/artifacts/mesh_holes/raw_input.ply \
   --report agents_files/artifacts/mesh_holes/boundary_loops.json
 ```
 
@@ -294,10 +296,10 @@ the selective repair:
 
 ```bash
 backend/.venv/bin/python backend/04_3DGS_to_mesh/fill_mesh_holes.py \
-  --input backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply \
+  --input agents_files/artifacts/mesh_holes/raw_input.ply \
   --seal-all \
-  --output backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_sealed_colored.ply \
-  --red-output backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_sealed_red.ply \
+  --output agents_files/artifacts/mesh_holes/mesh_sealed.ply \
+  --red-output agents_files/artifacts/mesh_holes/mesh_red.ply \
   --report agents_files/artifacts/mesh_holes/seal_all_report.json
 ```
 

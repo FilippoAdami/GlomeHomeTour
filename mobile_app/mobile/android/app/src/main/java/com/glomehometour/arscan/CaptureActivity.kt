@@ -16,11 +16,16 @@ import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -49,7 +54,7 @@ import kotlin.math.sqrt
  */
 class CaptureActivity : AppCompatActivity() {
 
-    private enum class State { IDLE, PREFLIGHT, SCANNING, TRANSITION, DONE }
+    private enum class State { IDLE, ALIGNMENT, PREFLIGHT, SCANNING, TRANSITION, DONE }
 
     /** Identifies a warning independent of its (sometimes dynamic) text, so the queue below can
      * dedupe by "what kind of issue" rather than by exact string. */
@@ -57,17 +62,21 @@ class CaptureActivity : AppCompatActivity() {
         REALIGNED, TRACKING_LOST, FINDING_POSITION, RELOCALIZE,
         TOO_BRIGHT, LIGHT_TRANSITION, TOO_FAST, TURN_SLOWLY,
     }
-    private enum class Pending { START, PREFLIGHT_NEXT, FINISH, RESUME, NEXT_ROOM, START_NEW_ROOM }
+    private enum class Pending { START, PREFLIGHT_NEXT, FINISH, RESUME, NEXT_ROOM, START_NEW_ROOM, SET_POSITION, ADD_CONNECTED_ROOM }
 
-    private var roomIndex = 1
+    private var roomIndex = 0
     private var isLoopClosedLatched = false
     private var isObjectCentricMode = false
     private var roomPathLengthM = 0f
     private val lastPathPos = FloatArray(3)
-    private val scratchLmX = FloatArray(FeatureParallaxTracker.TARGET_ROOM_LANDMARKS * 4)
-    private val scratchLmY = FloatArray(FeatureParallaxTracker.TARGET_ROOM_LANDMARKS * 4)
-    private val scratchLmZ = FloatArray(FeatureParallaxTracker.TARGET_ROOM_LANDMARKS * 4)
+    private val scratchLmX = FloatArray(35000)
+    private val scratchLmY = FloatArray(35000)
+    private val scratchLmZ = FloatArray(35000)
     private lateinit var secondaryButton: Button
+    private lateinit var alignmentOverlay: FrameLayout
+    private lateinit var alignmentGhostImage: ImageView
+    private var alignToSession: String? = null
+    private var lastFinishedSessionName: String? = null
 
     private lateinit var root: FrameLayout
     private lateinit var topColumn: View
@@ -186,9 +195,11 @@ class CaptureActivity : AppCompatActivity() {
     private var prevForward: FloatArray? = null
     private var prevForwardNanos = 0L
     private var angularRateDegPerSec = 0f
+    private var instantAngularRateDegPerSec = 0f
     private var prevPosition: FloatArray? = null
     private var prevPositionNanos = 0L
     private var speedMetresPerSec = 0f
+    private var instantSpeedMetresPerSec = 0f
 
     /**
      * README §6 step 3's level indicator reads gravity, not the ARCore pose. Tilt is a property
@@ -265,13 +276,27 @@ class CaptureActivity : AppCompatActivity() {
      * shows up under "Unassigned" in the gallery, it just isn't indexed against a property. */
     private var propertyId: String? = null
     private var roomLabel: String? = null
+    private var currentRoomName: String = "Room 1"
+    private var upcomingRoomName: String = "Room 2"
+    private val roomLabelsByIndex = mutableMapOf<Int, String>()
     private val propertyStore by lazy { PropertyStore(this) }
 
     // Milestone haptic flags to give physical tactile feedback on landmark targets
-    private var hapticMilestone200 = false
-    private var hapticMilestone350 = false
-    private var hapticMilestone500 = false
+    private var hapticMilestoneTarget = false
+    private var hapticMilestoneGood = false
+    private var hapticMilestoneVeryGood = false
+    private var hapticMilestoneExcellent = false
     private var hapticLoopClosed = false
+
+    // Spatial dimension tracking & dynamic target updates
+    private var camMinX = Float.MAX_VALUE
+    private var camMaxX = -Float.MAX_VALUE
+    private var camMinY = Float.MAX_VALUE
+    private var camMaxY = -Float.MAX_VALUE
+    private var camMinZ = Float.MAX_VALUE
+    private var camMaxZ = -Float.MAX_VALUE
+    private var lastDimensionCheckNanos = 0L
+    private var currentDimensions: FeatureParallaxTracker.ScanDimensions? = null
 
     // Tracking recovery & relocalization state. The actual point-matching/RANSAC search
     // (RelocalizationRecovery.estimateAlignmentPreferId) runs on its own HandlerThread, never the
@@ -279,9 +304,14 @@ class CaptureActivity : AppCompatActivity() {
     private var needsRelocalizationCheck = false
     private var lastRelocalizationNanos = 0L
     private var relocalizedToastUntilNanos = 0L
-    private val scratchLandmarkX = FloatArray(20000)
-    private val scratchLandmarkY = FloatArray(20000)
-    private val scratchLandmarkZ = FloatArray(20000)
+    private var isTrackingLost = false
+    private var consecutiveLostFrames = 0
+    private var trackingLostTimestampNs = 0L
+    private val trackingLostCamPos = FloatArray(3)
+    private var trackingLossWarningShown = false
+    private val scratchLandmarkX = FloatArray(35000)
+    private val scratchLandmarkY = FloatArray(35000)
+    private val scratchLandmarkZ = FloatArray(35000)
     private val relocIdCurX = FloatArray(64)
     private val relocIdCurY = FloatArray(64)
     private val relocIdCurZ = FloatArray(64)
@@ -333,7 +363,11 @@ class CaptureActivity : AppCompatActivity() {
         // Operator-set capture thresholds, if any (SettingsActivity); defaults otherwise.
         Tunables.load(this)
         propertyId = intent.getStringExtra(PropertyStore.EXTRA_PROPERTY_ID)
-        roomLabel = intent.getStringExtra(PropertyStore.EXTRA_ROOM_LABEL)
+        val initialLabel = intent.getStringExtra(PropertyStore.EXTRA_ROOM_LABEL)
+        currentRoomName = initialLabel?.takeIf { it.isNotBlank() } ?: "Room 1"
+        roomLabel = currentRoomName
+        roomLabelsByIndex[0] = currentRoomName
+        upcomingRoomName = "Room 2"
         installCameraRaceGuard()
         setContentView(R.layout.activity_main)
         root = findViewById(R.id.root)
@@ -366,6 +400,9 @@ class CaptureActivity : AppCompatActivity() {
         instructionBody = findViewById(R.id.instructionBody)
         primaryButton = findViewById(R.id.primaryButton)
         secondaryButton = findViewById(R.id.secondaryButton)
+        alignmentOverlay = findViewById(R.id.alignmentOverlay)
+        alignmentGhostImage = findViewById(R.id.alignmentGhostImage)
+        alignToSession = intent.getStringExtra(EXTRA_ALIGN_TO_SESSION)
         hintText = findViewById(R.id.hintText)
         bottomPadBase = bottomColumn.paddingBottom
         applyInsets()
@@ -404,6 +441,7 @@ class CaptureActivity : AppCompatActivity() {
             view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
             pending = when (state) {
                 State.IDLE, State.DONE -> Pending.START
+                State.ALIGNMENT -> Pending.SET_POSITION
                 State.PREFLIGHT -> Pending.PREFLIGHT_NEXT
                 State.SCANNING -> if (interrupted) Pending.RESUME else Pending.FINISH
                 State.TRANSITION -> Pending.START_NEW_ROOM
@@ -416,6 +454,20 @@ class CaptureActivity : AppCompatActivity() {
             if (state == State.SCANNING) {
                 pending = Pending.NEXT_ROOM
                 pendingAtNanos = System.nanoTime()
+            } else if (state == State.DONE) {
+                pending = Pending.ADD_CONNECTED_ROOM
+                pendingAtNanos = System.nanoTime()
+            } else if (state == State.ALIGNMENT) {
+                pending = Pending.START
+                pendingAtNanos = System.nanoTime()
+            } else if (state == State.TRANSITION) {
+                promptRenameRoom()
+            }
+        }
+
+        instructionTitle.setOnClickListener {
+            if (state == State.TRANSITION || state == State.PREFLIGHT || state == State.IDLE || state == State.ALIGNMENT) {
+                promptRenameRoom()
             }
         }
 
@@ -586,6 +638,34 @@ class CaptureActivity : AppCompatActivity() {
         root.addView(view, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         glSurfaceView = view
         renderer = r
+        val toAlign = alignToSession
+        if (toAlign != null) {
+            alignToSession = null
+            enterAlignmentMode(toAlign)
+        }
+    }
+
+    private fun enterAlignmentMode(sessionName: String) {
+        Thread {
+            val bmp = ScanProcessor.getLastFrameBitmap(this, sessionName)
+            if (bmp != null) {
+                val cutout = ScanProcessor.createCenterCutout(bmp, 0.20f)
+                runOnUiThread {
+                    alignmentGhostImage.setImageBitmap(cutout)
+                    alignmentOverlay.setVisible(true)
+                    state = State.ALIGNMENT
+                }
+            } else {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Could not load reference frame from previous room.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    state = State.IDLE
+                }
+            }
+        }.start()
     }
 
     /**
@@ -626,34 +706,146 @@ class CaptureActivity : AppCompatActivity() {
             }
             Pending.NEXT_ROOM -> {
                 archiveCurrentRoomLandmarks2D()
+                val w = writer
+                val g = worker
+                val r = renderer
+                val stats = g?.stats
+                val summary = DatasetFormat.summaryJson(
+                    durationSeconds = (System.nanoTime() - sessionStartNanos) / 1e9f,
+                    coverageFraction = stats?.coverage ?: 0f,
+                    occupiedVoxels = stats?.occupied ?: 0,
+                    verifiedVoxels = stats?.verified ?: 0,
+                    freeVoxels = stats?.free ?: 0,
+                    occludedVoxels = stats?.occluded ?: 0,
+                    voxelSizeM = g?.grid?.voxelSizeM ?: 0f,
+                    gridFull = stats?.gridFull ?: false,
+                    framesSeen = framesSeen,
+                    framesExported = w?.currentRoomKeyframeCount ?: 0,
+                    droppedDark = droppedDark,
+                    droppedBlown = droppedBlown,
+                    droppedTransition = droppedTransition,
+                    droppedMotion = droppedMotion,
+                    droppedQueue = w?.droppedQueue?.get() ?: 0,
+                    trackingLosses = trackingLosses,
+                    depthSource = when {
+                        r?.depthSupported == true -> "arcore_depth"
+                        else -> "arcore_point_cloud"
+                    },
+                )
+                w?.finishCurrentRoom(
+                    r?.focalX ?: 0f, r?.focalY ?: 0f, r?.principalX ?: 0f, r?.principalY ?: 0f,
+                    r?.imageWidth ?: 0, r?.imageHeight ?: 0, summary,
+                    k1 = r?.pipeline?.lensDistortionK1, k2 = r?.pipeline?.lensDistortionK2,
+                )
                 state = State.TRANSITION
             }
             Pending.START_NEW_ROOM -> {
                 startNewRoom(currentPose)
             }
+            Pending.SET_POSITION -> {
+                runOnUiThread { alignmentOverlay.setVisible(false) }
+                val activePose = currentPose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
+                beginSession(activePose)
+                miniMapView.post {
+                    miniMapView.addDoorway(startPosition[0], startPosition[2])
+                }
+                state = State.TRANSITION
+            }
+            Pending.ADD_CONNECTED_ROOM -> {
+                val session = lastFinishedSessionName ?: writer?.sessionName
+                if (session != null) {
+                    enterAlignmentMode(session)
+                } else {
+                    runOnUiThread {
+                        Toast.makeText(this, "No previous session found to align with.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
         }
     }
 
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun promptRenameRoom() {
+        val isTransition = (state == State.TRANSITION)
+        val current = if (isTransition) upcomingRoomName else currentRoomName
+        val input = EditText(this).apply {
+            hint = "Room name"
+            setText(current)
+            setSelection(text.length)
+        }
+        val container = LinearLayout(this).apply {
+            setPadding(dp(24), dp(8), dp(24), 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (isTransition) "Name next room" else "Name this room")
+            .setView(container)
+            .setPositiveButton("Set name") { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    if (isTransition) {
+                        upcomingRoomName = name
+                    } else {
+                        currentRoomName = name
+                        roomLabel = name
+                        roomLabelsByIndex[roomIndex] = name
+                    }
+                    updateUi(null)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun archiveCurrentRoomLandmarks2D() {
-        miniMapView.archiveActiveLandmarks()
+        miniMapView.post { miniMapView.archiveActiveLandmarks() }
     }
 
     private fun startNewRoom(pose: Pose?) {
+        val w = writer
+        val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
         archiveCurrentRoomLandmarks2D()
         parallaxTracker.reset()
-        roomIndex++
-        val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
+        camMinX = Float.MAX_VALUE; camMaxX = -Float.MAX_VALUE
+        camMinY = Float.MAX_VALUE; camMaxY = -Float.MAX_VALUE
+        camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
+        lastDimensionCheckNanos = 0L
+        currentDimensions = null
+        if (w != null && w.currentRoomKeyframeCount > 0) {
+            roomIndex++
+            w.startNewRoom(roomIndex)
+        }
+        currentRoomName = upcomingRoomName
+        roomLabel = currentRoomName
+        roomLabelsByIndex[roomIndex] = currentRoomName
+        upcomingRoomName = "Room ${roomIndex + 2}"
         activePose.getTranslation(startPosition, 0)
         activePose.getTranslation(lastPathPos, 0)
         floorY = activePose.ty() - PHONE_HEIGHT_M
-        miniMapView.addDoorway(startPosition[0], startPosition[2])
+        miniMapView.post {
+            miniMapView.addDoorway(startPosition[0], startPosition[2])
+            miniMapView.setStart(startPosition[0], startPosition[2])
+        }
+        interrupted = false
         isLoopClosedLatched = false
         isObjectCentricMode = false
         roomPathLengthM = 0f
-        hapticMilestone200 = false
-        hapticMilestone350 = false
-        hapticMilestone500 = false
+        hapticMilestoneTarget = false
+        hapticMilestoneGood = false
+        hapticMilestoneVeryGood = false
+        hapticMilestoneExcellent = false
         hapticLoopClosed = false
+        isTrackingLost = false
+        trackingLossWarningShown = false
+        trackingLostTimestampNs = 0L
+        consecutiveLostFrames = 0
+        speedMetresPerSec = 0f
+        angularRateDegPerSec = 0f
+        instantSpeedMetresPerSec = 0f
+        instantAngularRateDegPerSec = 0f
+        prevForward = null
+        prevPosition = null
         beginPreflight()
     }
 
@@ -666,10 +858,26 @@ class CaptureActivity : AppCompatActivity() {
         isLoopClosedLatched = false
         isObjectCentricMode = false
         roomPathLengthM = 0f
-        hapticMilestone200 = false
-        hapticMilestone350 = false
-        hapticMilestone500 = false
+        camMinX = Float.MAX_VALUE; camMaxX = -Float.MAX_VALUE
+        camMinY = Float.MAX_VALUE; camMaxY = -Float.MAX_VALUE
+        camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
+        lastDimensionCheckNanos = 0L
+        currentDimensions = null
+        hapticMilestoneTarget = false
+        hapticMilestoneGood = false
+        hapticMilestoneVeryGood = false
+        hapticMilestoneExcellent = false
         hapticLoopClosed = false
+        isTrackingLost = false
+        trackingLossWarningShown = false
+        trackingLostTimestampNs = 0L
+        consecutiveLostFrames = 0
+        speedMetresPerSec = 0f
+        angularRateDegPerSec = 0f
+        instantSpeedMetresPerSec = 0f
+        instantAngularRateDegPerSec = 0f
+        prevForward = null
+        prevPosition = null
         needsRelocalizationCheck = false
         state = State.SCANNING
     }
@@ -718,7 +926,7 @@ class CaptureActivity : AppCompatActivity() {
             else -> {
                 // Step 2 -> Begin 3D capture session
                 val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
-                if (roomIndex > 1) {
+                if (writer != null) {
                     resumeScanningNewRoom(activePose)
                 } else {
                     beginSession(activePose)
@@ -743,7 +951,7 @@ class CaptureActivity : AppCompatActivity() {
         floorY = pose.ty() - PHONE_HEIGHT_M
         pose.getTranslation(startPosition, 0)
         pose.getTranslation(lastPathPos, 0)
-        roomIndex = 1
+        roomIndex = 0
         isLoopClosedLatched = false
         isObjectCentricMode = false
         roomPathLengthM = 0f
@@ -758,19 +966,30 @@ class CaptureActivity : AppCompatActivity() {
         gatePassedCounter = 0L
         finishedPath = null
         interrupted = false
-        hapticMilestone200 = false
-        hapticMilestone350 = false
-        hapticMilestone500 = false
+        hapticMilestoneTarget = false
+        hapticMilestoneGood = false
+        hapticMilestoneVeryGood = false
+        hapticMilestoneExcellent = false
         hapticLoopClosed = false
+        isTrackingLost = false
+        consecutiveLostFrames = 0
+        trackingLossWarningShown = false
+        trackingLostTimestampNs = 0L
         needsRelocalizationCheck = false
         lastRelocalizationNanos = 0L
         relocalizedToastUntilNanos = 0L
+        camMinX = Float.MAX_VALUE; camMaxX = -Float.MAX_VALUE
+        camMinY = Float.MAX_VALUE; camMaxY = -Float.MAX_VALUE
+        camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
+        lastDimensionCheckNanos = 0L
+        currentDimensions = null
         parallaxTracker.reset()
         state = State.SCANNING
     }
 
     private fun finishSession() {
         val w = writer ?: return
+        lastFinishedSessionName = w.sessionName
         val g = worker
         val r = renderer
         val stats = g?.stats
@@ -810,7 +1029,7 @@ class CaptureActivity : AppCompatActivity() {
             if (id != null) {
                 propertyStore.recordRoomScan(
                     propertyId = id,
-                    label = roomLabel ?: "Room",
+                    label = currentRoomName,
                     sessionName = w.sessionName,
                     coveragePercent = (stats?.coverage ?: 0f) * 100f,
                 )
@@ -837,7 +1056,7 @@ class CaptureActivity : AppCompatActivity() {
         // ISO metering (README §4) runs from the moment the camera opens (IDLE, before the
         // operator has tapped anything) through all of pre-flight, so it has the most time to
         // converge before the value gets locked in for the whole scan.
-        val meteringActive = state == State.IDLE || state == State.PREFLIGHT
+        val meteringActive = state == State.IDLE || state == State.PREFLIGHT || state == State.ALIGNMENT
         // Every other frame, not every frame (SPEC §1.3 risk 2): acquiring and reading a 1080p
         // CPU image is the single most expensive thing on the render thread, and 15 Hz is still
         // three times the keyframe cap. The photometric window then spans twice the wall time,
@@ -852,25 +1071,28 @@ class CaptureActivity : AppCompatActivity() {
         applyPending(sample?.pose)
 
         if (sample == null) {
-            if (wasTracking && state == State.SCANNING) {
-                trackingLosses++
-                needsRelocalizationCheck = true
-                // A candidate carried over from a prior recovery cycle must not be allowed to
-                // "confirm" a candidate from this new one -- they were never independently
-                // rediscovering the same alignment, just coincidentally close.
-                relocPendingCandidate = null
+            consecutiveLostFrames++
+            if (wasTracking && state == State.SCANNING && consecutiveLostFrames >= 5) {
+                if (!isTrackingLost) {
+                    trackingLosses++
+                    isTrackingLost = true
+                    trackingLostTimestampNs = System.nanoTime()
+                    trackingLostCamPos[0] = translation[0]
+                    trackingLostCamPos[1] = translation[1]
+                    trackingLostCamPos[2] = translation[2]
+                    needsRelocalizationCheck = true
+                }
             }
             wasTracking = false
-            // Poses either side of a tracking gap are unrelated; differencing them would
-            // manufacture a huge rate the moment tracking comes back.
             prevForward = null
             prevPosition = null
             postUi(null)
             return
         }
+        consecutiveLostFrames = 0
         if (!wasTracking && state == State.SCANNING) {
+            isTrackingLost = false
             needsRelocalizationCheck = true
-            relocPendingCandidate = null
         }
         wasTracking = true
         framesSeen++
@@ -884,53 +1106,15 @@ class CaptureActivity : AppCompatActivity() {
         // Feed sparse feature points to parallax tracker continuously (live viewport feedback & triangulation)
         if (sample.points != null && sample.pointIds != null && sample.numPoints > 0) {
             val now = System.nanoTime()
-            if (state == State.SCANNING && needsRelocalizationCheck && parallaxTracker.verifiedLandmarkCount >= 10 &&
-                (now - lastRelocalizationNanos) > 1_000_000_000L && relocJobRunning.compareAndSet(false, true)
-            ) {
-                lastRelocalizationNanos = now
-                // Cheap on the GL thread: bounded array copies, no search. The actual matching
-                // happens off-thread in the block below.
-                val landmarkCount = parallaxTracker.getLandmarkData(scratchLandmarkX, scratchLandmarkY, scratchLandmarkZ)
-                val idMatchCount = parallaxTracker.matchById(
-                    sample.pointIds, sample.points, sample.numPoints,
-                    relocIdCurX, relocIdCurY, relocIdCurZ, relocIdLandX, relocIdLandY, relocIdLandZ,
-                )
-                val camX = translation[0]; val camY = translation[1]; val camZ = translation[2]
-                val currentPoints = sample.points
-                val currentNumPoints = sample.numPoints
-                relocHandler.post {
-                    try {
-                        val transform = RelocalizationRecovery.estimateAlignmentPreferId(
-                            idMatchCount, relocIdCurX, relocIdCurY, relocIdCurZ, relocIdLandX, relocIdLandY, relocIdLandZ,
-                            currentPoints, currentNumPoints, camX, camY, camZ,
-                            scratchLandmarkX, scratchLandmarkY, scratchLandmarkZ, landmarkCount,
-                        )
-                        val pending = relocPendingCandidate
-                        if (transform != null && transform.isSignificant) {
-                            if (pending != null && RelocalizationRecovery.isSimilarTransform(pending, transform)) {
-                                relocConfirmedTransform.set(transform)
-                                relocPendingCandidate = null
-                            } else {
-                                relocPendingCandidate = transform
-                            }
-                        } else {
-                            relocPendingCandidate = null
-                        }
-                    } finally {
-                        relocJobRunning.set(false)
-                    }
-                }
+            val recoveryElapsedNs = now - trackingLostTimestampNs
+            // Exit relocalization check cleanly once 3 seconds have elapsed after tracking loss
+            if (needsRelocalizationCheck && trackingLostTimestampNs > 0L && recoveryElapsedNs > 3_000_000_000L) {
+                needsRelocalizationCheck = false
             }
 
-            // Cheap poll every frame: applies a transform once it's been rediscovered on two
-            // independent background passes (see relocPendingCandidate above).
-            val confirmedTransform = relocConfirmedTransform.getAndSet(null)
-            if (confirmedTransform != null) {
-                parallaxTracker.transformLandmarks(confirmedTransform)
-                needsRelocalizationCheck = false
-                relocalizedToastUntilNanos = now + 2_500_000_000L // show for 2.5s
-                root.post { root.performHapticFeedback(HapticFeedbackConstants.CONFIRM) }
-            }
+            // Note: ARCore's internal SLAM maintains the world coordinate frame across tracking pauses.
+            // Verified landmarks must NOT be mutated with unconstrained 3-point RANSAC transforms, as false-positive
+            // triangle matches in furnished rooms scramble the map and cause existing points to jump/tilt.
 
             val dxP = translation[0] - lastPathPos[0]
             val dyP = translation[1] - lastPathPos[1]
@@ -949,13 +1133,59 @@ class CaptureActivity : AppCompatActivity() {
                 isObjectCentricMode = true
             }
 
+            val isFastMotion = tooFastForCapture()
+            val allowNewLandmarks = !isFastMotion && consecutiveLostFrames == 0 && state == State.SCANNING
             val updateStartNs = System.nanoTime()
             parallaxTracker.update(
                 sample.points, sample.pointIds, sample.numPoints,
                 translation[0], translation[1], translation[2],
                 sample.timestampNs,
+                allowNewLandmarks = allowNewLandmarks,
             )
             logIfSlow("parallaxTracker.update", updateStartNs, parallaxTracker.verifiedLandmarkCount)
+
+            if (state == State.SCANNING) {
+                if (translation[0] < camMinX) camMinX = translation[0]
+                if (translation[0] > camMaxX) camMaxX = translation[0]
+                if (translation[1] < camMinY) camMinY = translation[1]
+                if (translation[1] > camMaxY) camMaxY = translation[1]
+                if (translation[2] < camMinZ) camMinZ = translation[2]
+                if (translation[2] > camMaxZ) camMaxZ = translation[2]
+
+                val nowNs = sample.timestampNs
+                if (lastDimensionCheckNanos == 0L) {
+                    lastDimensionCheckNanos = nowNs
+                } else if ((nowNs - lastDimensionCheckNanos) >= 10_000_000_000L) {
+                    lastDimensionCheckNanos = nowNs
+                    // 1. Update running average median distance and dynamic max inlier distance (2.5x median)
+                    parallaxTracker.updateRunningMedianDistance(translation[0], translation[1], translation[2])
+
+                    // 2. Prune any outliers that exceed the dynamic room envelope
+                    val pruned = parallaxTracker.pruneOutliers(camMinX, camMaxX, camMinY, camMaxY, camMinZ, camMaxZ)
+                    if (pruned > 0) {
+                        miniMapView.post {
+                            val lmCount = parallaxTracker.getLandmarkData(scratchLmX, scratchLmY, scratchLmZ)
+                            miniMapView.updateActiveLandmarks(scratchLmX, scratchLmZ, lmCount)
+                        }
+                    }
+
+                    // 3. Compute dimensions using dynamic distance threshold
+                    val dims = parallaxTracker.computeDimensions(camMinX, camMaxX, camMinY, camMaxY, camMinZ, camMaxZ)
+                    currentDimensions = dims
+                    // Point heuristic:
+                    // - Smallest rooms start at and require a minimum of 500 points
+                    // - Base target: 150 points / m²
+                    // - Good quality: 300 points / m² (2x base target)
+                    // - Very good quality: ~500 points / m² (3.33x base target)
+                    // - Excellent quality: 750 points / m² (5x base target)
+                    val computedTarget = if (dims.floorAreaSqm > 0.5f) {
+                        kotlin.math.round(dims.floorAreaSqm * 150f).toInt().coerceIn(FeatureParallaxTracker.MIN_ROOM_LANDMARKS, 30000)
+                    } else {
+                        FeatureParallaxTracker.MIN_ROOM_LANDMARKS
+                    }
+                    parallaxTracker.updateTargetLandmarks(computedTarget)
+                }
+            }
             val exportStartNs = System.nanoTime()
             val exportedCount = parallaxTracker.exportPointVertices(
                 pointSpriteExportBuf,
@@ -1060,7 +1290,9 @@ class CaptureActivity : AppCompatActivity() {
         val prev = prevForward
         val turnDt = (now - prevForwardNanos) / 1e9f
         if (prev != null && turnDt >= MIN_KINEMATIC_DT_S && turnDt <= MAX_KINEMATIC_DT_S) {
-            angularRateDegPerSec += (angleBetweenDeg(prev, forward) / turnDt - angularRateDegPerSec) * SMOOTH_ALPHA
+            val rawTurnRate = angleBetweenDeg(prev, forward) / turnDt
+            instantAngularRateDegPerSec = rawTurnRate
+            angularRateDegPerSec += (rawTurnRate - angularRateDegPerSec) * SMOOTH_ALPHA
         }
         prevForward = forward.copyOf()
         prevForwardNanos = now
@@ -1068,7 +1300,9 @@ class CaptureActivity : AppCompatActivity() {
         val prevPos = prevPosition
         val moveDt = (now - prevPositionNanos) / 1e9f
         if (prevPos != null && moveDt >= MIN_KINEMATIC_DT_S && moveDt <= MAX_KINEMATIC_DT_S) {
-            speedMetresPerSec += (distance(prevPos, translation) / moveDt - speedMetresPerSec) * SMOOTH_ALPHA
+            val rawSpeed = distance(prevPos, translation) / moveDt
+            instantSpeedMetresPerSec = rawSpeed
+            speedMetresPerSec += (rawSpeed - speedMetresPerSec) * SMOOTH_ALPHA
         }
         prevPosition = translation.copyOf()
         prevPositionNanos = now
@@ -1082,9 +1316,9 @@ class CaptureActivity : AppCompatActivity() {
      * `onUntrackedImage`) -- metering has to work before ARCore reaches TRACKING, since a too-dark
      * exposure is exactly what can keep it from ever getting there. */
     private fun onMeteringImage(image: android.media.Image) {
-        if (state != State.IDLE && state != State.PREFLIGHT) return
-        // Auto-meter exposure during IDLE and Step 0
-        if (state == State.IDLE || (state == State.PREFLIGHT && preflightStep == 0)) {
+        if (state != State.IDLE && state != State.PREFLIGHT && state != State.ALIGNMENT) return
+        // Auto-meter exposure during IDLE, ALIGNMENT, and Step 0
+        if (state == State.IDLE || state == State.ALIGNMENT || (state == State.PREFLIGHT && preflightStep == 0)) {
             sampleExposurePreview(image)
         }
         // Sample white balance in Step 0 (continuous auto estimate) and Step 1 (reticle sampling)
@@ -1188,13 +1422,18 @@ class CaptureActivity : AppCompatActivity() {
         val y = image.planes[0]
         val meanLuma = Luma.mean(y.buffer, image.width, image.height, y.rowStride, y.pixelStride)
         val exposure = meteredExposure(meanLuma, currentIso, currentShutterNs)
-        currentIso = exposure.iso
-        currentShutterNs = exposure.shutterNs
-        renderer?.adjustExposure(currentIso, currentShutterNs)
+        if (exposure.iso != currentIso || exposure.shutterNs != currentShutterNs) {
+            currentIso = exposure.iso
+            currentShutterNs = exposure.shutterNs
+            renderer?.adjustExposure(currentIso, currentShutterNs)
+        }
     }
 
     private fun tooFastForCapture(): Boolean =
-        speedMetresPerSec > MAX_KEYFRAME_SPEED_MS || angularRateDegPerSec > MAX_KEYFRAME_RATE_DEG_S
+        instantAngularRateDegPerSec > MAX_INSTANT_KEYFRAME_RATE_DEG_S ||
+        instantSpeedMetresPerSec > MAX_INSTANT_KEYFRAME_SPEED_MS ||
+        angularRateDegPerSec > MAX_KEYFRAME_RATE_DEG_S ||
+        speedMetresPerSec > MAX_KEYFRAME_SPEED_MS
 
     /**
      * Keyframe selection (README §4/§5): fixed-ratio decimation of the stream, keeping 1 of
@@ -1255,26 +1494,32 @@ class CaptureActivity : AppCompatActivity() {
         )
         phaseText.text = when (state) {
             State.IDLE -> "READY"
-            State.PREFLIGHT -> if (roomIndex > 1) "SETUP · R$roomIndex" else "SETUP"
-            State.SCANNING -> if (interrupted) "PAUSED" else if (isObjectCentricMode) "EXTERIOR" else "ROOM $roomIndex"
+            State.ALIGNMENT -> "ALIGN"
+            State.PREFLIGHT -> if (roomIndex > 0) "SETUP · ${currentRoomName.uppercase()}" else "SETUP"
+            State.SCANNING -> if (interrupted) "PAUSED" else if (isObjectCentricMode) "EXTERIOR" else currentRoomName.uppercase()
             State.TRANSITION -> "TRANSITION"
             State.DONE -> "SAVED"
         }
         timerText.text = if (state == State.SCANNING || state == State.TRANSITION) elapsed() else ""
         // Monotonically non-decreasing 3D Landmark Discovery & Multi-View Parallax Progress
-        // Progress strictly matches landmark density (%d/500 points):
+        val targetCount = parallaxTracker.targetLandmarkCount
         val displayCoverage = parallaxTracker.coverageFraction
         val displayPercent = (displayCoverage * 100).toInt().coerceIn(0, 100)
-        val isParallaxComplete = displayCoverage >= 0.70f || parallaxTracker.verifiedLandmarkCount >= 350
+        val isParallaxComplete = displayCoverage >= 1.0f || parallaxTracker.verifiedLandmarkCount >= targetCount
 
         val landmarkCount = parallaxTracker.verifiedLandmarkCount
         val densityTag = when {
-            landmarkCount >= 350 -> "EXCELLENT · 4K 3DGS"
-            landmarkCount >= 200 -> "GOOD COVERAGE"
+            landmarkCount >= targetCount -> "TARGET REACHED"
+            landmarkCount >= (targetCount * 0.70f).toInt() -> "GOOD COVERAGE"
             else -> "ORBIT OBJECTS"
         }
+        val dims = currentDimensions ?: parallaxTracker.computeDimensions(camMinX, camMaxX, camMinY, camMaxY, camMinZ, camMaxZ)
         coverageValue.text = "$displayPercent%"
-        coverageLabel.text = "ROOM %d DENSITY: %d/500 PTS · %s".format(roomIndex, landmarkCount, densityTag)
+        coverageLabel.text = if (dims.widthM > 0.5f && dims.lengthM > 0.5f) {
+            "%s DENSITY: %d/%d PTS (%.1fx%.1fm) · %s".format(currentRoomName.uppercase(), landmarkCount, targetCount, dims.widthM, dims.lengthM, densityTag)
+        } else {
+            "%s DENSITY: %d/%d PTS · %s".format(currentRoomName.uppercase(), landmarkCount, targetCount, densityTag)
+        }
         progressBar.progress = displayPercent
         progressBar.progressTintList = ColorStateList.valueOf(
             color(if (isParallaxComplete) R.color.action_ready else R.color.text_primary)
@@ -1299,11 +1544,8 @@ class CaptureActivity : AppCompatActivity() {
             }
 
             // Real-time online 2D feature landmarks updated dynamically as objects are orbited.
-            // If points wobble (e.g. scanning a flat poster or low-parallax wall), projection is paused to prevent map deformation!
-            if (parallaxTracker.isTrackingAnchored) {
-                val lmCount = parallaxTracker.getLandmarkData(scratchLmX, scratchLmY, scratchLmZ)
-                miniMapView.updateActiveLandmarks(scratchLmX, scratchLmZ, lmCount)
-            }
+            val lmCount = parallaxTracker.getLandmarkData(scratchLmX, scratchLmY, scratchLmZ)
+            miniMapView.updateActiveLandmarks(scratchLmX, scratchLmZ, lmCount)
 
             miniMapView.updateUser(translation[0], translation[2], arcoreBearingDeg)
         }
@@ -1325,14 +1567,15 @@ class CaptureActivity : AppCompatActivity() {
                 active += WarningKind.REALIGNED to "✓ Re-aligned to Room Objects\nPoints snapped back to physical surfaces"
             }
             if (sample == null) {
-                active += if (trackingLosses > 0) {
-                    WarningKind.TRACKING_LOST to "Tracking lost\n" + trackingAdvice(r?.trackingState)
-                } else {
-                    WarningKind.FINDING_POSITION to "Finding position…\n" + trackingAdvice(r?.trackingState)
+                if (!trackingLossWarningShown) {
+                    active += WarningKind.TRACKING_LOST to "Tracking paused\nSlowly pan across previously scanned surfaces"
+                    trackingLossWarningShown = true
                 }
-            }
-            if (needsRelocalizationCheck) {
-                active += WarningKind.RELOCALIZE to "🔍 Aim at Previously Scanned Objects\nHold steady at familiar corners/furniture to restore alignment"
+            } else {
+                trackingLossWarningShown = false
+                if (needsRelocalizationCheck) {
+                    active += WarningKind.RELOCALIZE to "🔍 Finding Alignment\nSlowly pan across familiar corners/furniture to re-align"
+                }
             }
             if (lastVerdict == PhotometricGate.Verdict.BLOWN) {
                 active += WarningKind.TOO_BRIGHT to "Too bright\nAim away from the window or lamp"
@@ -1340,10 +1583,12 @@ class CaptureActivity : AppCompatActivity() {
             if (lastVerdict == PhotometricGate.Verdict.TRANSITION) {
                 active += WarningKind.LIGHT_TRANSITION to "Adjusting to the light change…"
             }
-            if (speedMetresPerSec > MAX_WALK_SPEED_MS) {
+            val isWalkingFast = speedMetresPerSec > MAX_WALK_SPEED_MS || instantSpeedMetresPerSec > 0.45f
+            if (isWalkingFast) {
                 active += WarningKind.TOO_FAST to "Slow down\nWalk slower for sharp frames"
             }
-            if (angularRateDegPerSec > MAX_TURN_RATE_DEG_S) {
+            val isTurningFast = angularRateDegPerSec > MAX_TURN_RATE_DEG_S || instantAngularRateDegPerSec > 32f
+            if (isTurningFast) {
                 active += WarningKind.TURN_SLOWLY to "Turn more slowly"
             }
             warning = pickWarning(nowUi, active)
@@ -1379,16 +1624,29 @@ class CaptureActivity : AppCompatActivity() {
         var label: String
         var hint: String? = null
         var enabled = true
-        if (state != State.SCANNING) {
+        if (state != State.SCANNING && state != State.ALIGNMENT && state != State.DONE && state != State.TRANSITION) {
             secondaryButton.setVisible(false)
             secondaryButton.isEnabled = false
         }
+        alignmentOverlay.setVisible(state == State.ALIGNMENT)
         when {
             fatal -> {
                 title = fatalTitle ?: ""
                 body = fatalBody ?: ""
                 label = primaryButton.text.toString()
                 enabled = false
+            }
+            state == State.ALIGNMENT -> {
+                title = "Align with Previous Room"
+                body = "Point camera at doorway where previous room scan ended. Match ghost frame with surroundings, then tap 'Set position'."
+                label = "Set position"
+                enabled = true
+                if (!tracking) hint = trackingAdvice(r?.trackingState)
+                secondaryButton.setVisible(true)
+                secondaryButton.isEnabled = true
+                secondaryButton.text = "Skip alignment"
+                secondaryButton.backgroundTintList = ColorStateList.valueOf(color(R.color.action))
+                secondaryButton.setTextColor(color(R.color.text_primary))
             }
             state == State.IDLE -> {
                 title = "Ready when you are"
@@ -1401,27 +1659,27 @@ class CaptureActivity : AppCompatActivity() {
                 val remainingS = (5.0f - elapsedCalibS).coerceAtLeast(0f)
                 val isCalibDone = elapsedCalibS >= 5.0f
                 if (!isCalibDone) {
-                    title = "⚡ Calibrating Lighting (Room $roomIndex · %.0fs)".format(remainingS)
-                    body = "Slowly pan the phone across Room $roomIndex for 5 seconds. The optimal ISO and shutter speed are being calibrated to maximize brightness."
+                    title = "⚡ Calibrating Lighting ($currentRoomName · %.0fs)".format(remainingS)
+                    body = "Slowly pan the phone across $currentRoomName for 5 seconds. The optimal ISO and shutter speed are being calibrated to maximize brightness."
                     label = "Calibrating (%.0fs)…".format(remainingS)
                     enabled = false
                 } else {
-                    title = "✓ Lighting Calibrated (Room $roomIndex)"
+                    title = "✓ Lighting Calibrated ($currentRoomName)"
                     body = "Exposure optimized for clear visibility. Tap Next to review color balance."
                     label = "Next: Color Balance"
                     enabled = true
                 }
             }
             state == State.PREFLIGHT && preflightStep == 1 -> {
-                title = "Room $roomIndex · Step 1 of 2 · Color Balance"
+                title = "$currentRoomName · Step 1 of 2 · Color Balance"
                 body = "Colour is balanced for this room's light and now held steady. Check it looks right — nudge the sliders if it doesn't — then tap Lock Color."
                 label = "Lock Color"
                 enabled = true
             }
             state == State.PREFLIGHT -> {
-                title = "Room $roomIndex · Step 2 of 2 · Camera Angle"
+                title = "$currentRoomName · Step 2 of 2 · Camera Angle"
                 body = "Tilt the phone down until the dot sits in the green band (5–20°). Hold this angle to capture floors and room geometry."
-                label = "Start 3D Capture (Room $roomIndex)"
+                label = "Start 3D Capture ($currentRoomName)"
                 if (!tracking) {
                     hint = trackingAdvice(r?.trackingState)
                 }
@@ -1433,21 +1691,28 @@ class CaptureActivity : AppCompatActivity() {
             }
             state == State.SCANNING -> {
                 val count = parallaxTracker.verifiedLandmarkCount
-                val minReady = count >= 200
-                val idealReady = count >= 350
+                val target = parallaxTracker.targetLandmarkCount // 150 pts/m², min 500
+                val minReady = count >= target                   // Base: 150 pts/m² (min 500)
+                val goodReady = count >= (target * 2)            // Good: 300 pts/m² (2x target)
+                val veryGoodReady = count >= (target * 3.33f).toInt() // Very Good: ~500 pts/m²
+                val excellentReady = count >= (target * 5)       // Excellent: 750 pts/m² (5x target)
 
                 // Physical tactile haptic pulses on milestone crossings:
-                if (count >= 200 && !hapticMilestone200) {
-                    hapticMilestone200 = true
+                if (count >= target && !hapticMilestoneTarget) {
+                    hapticMilestoneTarget = true
                     root.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                 }
-                if (count >= 350 && !hapticMilestone350) {
-                    hapticMilestone350 = true
+                if (goodReady && !hapticMilestoneGood) {
+                    hapticMilestoneGood = true
+                    root.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                }
+                if (veryGoodReady && !hapticMilestoneVeryGood) {
+                    hapticMilestoneVeryGood = true
+                    root.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                }
+                if (excellentReady && !hapticMilestoneExcellent) {
+                    hapticMilestoneExcellent = true
                     root.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                }
-                if (count >= 500 && !hapticMilestone500) {
-                    hapticMilestone500 = true
-                    root.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
                 }
                 if (loopClosed && !hapticLoopClosed && minReady) {
                     hapticLoopClosed = true
@@ -1459,15 +1724,19 @@ class CaptureActivity : AppCompatActivity() {
                 if (isObjectCentricMode) {
                     title = "🏡 Exterior Scan: Orbit Building Perimeter"
                     body = if (minReady) {
-                        "Exterior coverage reached (%d landmarks)! Tap Finish tour anywhere to complete (loop return not required).".format(count)
+                        "Exterior coverage reached (%,d landmarks)! Tap Finish tour anywhere to complete (loop return not required).".format(count)
                     } else {
-                        "Orbit along the building facade (%d/200 pts). Loop return waived for exterior.".format(count)
+                        "Orbit along the building facade (%,d/%,d pts). Loop return waived for exterior.".format(count, target)
                     }
-                    label = if (idealReady) "Finish tour (High Quality)" else "Finish tour"
+                    label = when {
+                        excellentReady -> "Finish tour (Excellent)"
+                        veryGoodReady -> "Finish tour (Very Good)"
+                        goodReady -> "Finish tour (Good Quality)"
+                        else -> "Finish tour"
+                    }
                     enabled = minReady && issues.isEmpty()
                     hint = when {
-                        !parallaxTracker.isTrackingAnchored -> "Stabilizing surface… orbit smoothly to lock depth"
-                        !minReady -> "Capture at least 200 points on exterior · currently %d/200".format(count)
+                        !minReady -> "Capture at least %,d points on exterior · currently %,d/%,d".format(target, count, target)
                         issues.isNotEmpty() -> issues.joinToString(" · ")
                         else -> null
                     }
@@ -1476,32 +1745,52 @@ class CaptureActivity : AppCompatActivity() {
                     secondaryButton.isEnabled = false
                 } else {
                     when {
-                        idealReady && loopClosed -> {
-                            title = "🌟 Room $roomIndex: Ideal 3DGS Quality (4K Splats)!"
-                            body = "Superb coverage achieved (%d landmarks)! Move to next room or finish the tour.".format(count)
+                        excellentReady && loopClosed -> {
+                            title = "💎 $currentRoomName: Excellent Quality!"
+                            body = "Superb 3D coverage achieved (%,d landmarks)! Move to next room or finish the tour.".format(count)
+                        }
+                        veryGoodReady && loopClosed -> {
+                            title = "🌟 $currentRoomName: Very Good Quality!"
+                            body = "Great coverage achieved (%,d landmarks)! Move to next room or keep orbiting for excellent (%,d pts).".format(count, target * 5)
+                        }
+                        goodReady && loopClosed -> {
+                            title = "✨ $currentRoomName: Good Quality"
+                            body = "Solid coverage achieved (%,d landmarks)! Move to next room or keep orbiting for higher quality.".format(count)
                         }
                         minReady && loopClosed -> {
-                            title = "✓ Room $roomIndex: Minimum Coverage Met"
-                            body = "Ready to proceed to next room or finish tour, or keep orbiting to hit 350-500 pts."
+                            title = "✓ $currentRoomName: Minimum Coverage Met"
+                            body = "Ready to proceed to next room or finish tour, or keep orbiting to reach %,d–%,d pts.".format(target * 2, target * 5)
                         }
-                        idealReady && !loopClosed -> {
-                            title = "🎯 Room $roomIndex: 3D Coverage Complete (%d pts)".format(count)
+                        excellentReady && !loopClosed -> {
+                            title = "🎯 $currentRoomName: Excellent Coverage (%,d pts)".format(count)
                             body = "Room fully mapped! Walk back to your starting doorway (%.1f m away) to close the loop.".format(distanceToStart)
                         }
+                        veryGoodReady && !loopClosed -> {
+                            title = "🎯 $currentRoomName: Very Good Coverage (%,d pts)".format(count)
+                            body = "High quality achieved! Return to starting doorway (%.1f m away) to close loop or keep orbiting.".format(distanceToStart)
+                        }
+                        goodReady && !loopClosed -> {
+                            title = "🎯 $currentRoomName: Good Quality (%,d pts)".format(count)
+                            body = "Good progress! Return to starting doorway (%.1f m away) or keep orbiting to hit %,d pts.".format(distanceToStart, target * 5)
+                        }
                         minReady && !loopClosed -> {
-                            title = "🎮 Room $roomIndex: Good Progress (%d pts)".format(count)
-                            body = "Base coverage unlocked! Keep orbiting unexplored furniture & corners to reach 350–500 pts, then return to doorway."
+                            title = "🎮 $currentRoomName: Minimum Coverage Met (%,d pts)".format(count)
+                            body = "Base coverage unlocked! Keep orbiting unexplored corners to reach %,d–%,d pts, then return to doorway.".format(target * 2, target * 5)
                         }
                         else -> {
-                            title = "✨ Room $roomIndex: Orbit Objects & Corners"
-                            body = "Move dynamically around furniture and points of interest! Watch amber dots pop into emerald green as you orbit (%d/500).".format(count)
+                            title = "✨ $currentRoomName: Orbit Objects & Corners"
+                            body = "Move dynamically around furniture and corners! Watch amber dots pop into emerald green as you orbit (%,d/%,d).".format(count, target)
                         }
                     }
-                    label = if (idealReady) "Finish tour (High Quality)" else "Finish tour"
+                    label = when {
+                        excellentReady -> "Finish tour (Excellent)"
+                        veryGoodReady -> "Finish tour (Very Good)"
+                        goodReady -> "Finish tour (Good Quality)"
+                        else -> "Finish tour"
+                    }
                     enabled = minReady && loopClosed && issues.isEmpty()
                     hint = when {
-                        !parallaxTracker.isTrackingAnchored -> "Stabilizing surface… orbit smoothly to lock depth"
-                        !minReady -> "Capture at least 200 points in Room $roomIndex · currently %d/200".format(count)
+                        !minReady -> "Capture at least %,d points in $currentRoomName · currently %,d/%,d".format(target, count, target)
                         !loopClosed -> "Return to starting doorway to seal loop · %.1f m away".format(distanceToStart)
                         issues.isNotEmpty() -> issues.joinToString(" · ")
                         else -> null
@@ -1517,11 +1806,15 @@ class CaptureActivity : AppCompatActivity() {
                 }
             }
             state == State.TRANSITION -> {
-                secondaryButton.setVisible(false)
-                secondaryButton.isEnabled = false
-                title = "Moving to Room ${roomIndex + 1}"
-                body = "Open doors, switch on lights, and walk to entering doorway. If scanning exterior, tap EXTERIOR in top bar or orbit facade. Tap 'Start Room ${roomIndex + 1}' when in position."
-                label = "Start Room ${roomIndex + 1}"
+                secondaryButton.setVisible(true)
+                secondaryButton.isEnabled = true
+                secondaryButton.text = "✏️ Rename room"
+                secondaryButton.backgroundTintList = ColorStateList.valueOf(color(R.color.card))
+                secondaryButton.setTextColor(color(R.color.text_secondary))
+                val targetRoomName = upcomingRoomName
+                title = "Moving to $targetRoomName"
+                body = "Open doors, switch on lights, and walk to entering doorway. Tap '✏️ Rename room' to rename, or 'Start $targetRoomName' when in position."
+                label = "Start $targetRoomName"
                 enabled = tracking
                 hint = if (!tracking) trackingAdvice(r?.trackingState) else null
             }
@@ -1531,10 +1824,17 @@ class CaptureActivity : AppCompatActivity() {
                     body = "$frames frames · compressing and writing to disk. Keep the app open until this finishes."
                     label = "Saving…"
                     enabled = false
+                    secondaryButton.setVisible(false)
+                    secondaryButton.isEnabled = false
                 } else {
                     title = "Scan saved"
                     body = "$frames frames · saved to $finishedPath"
                     label = "Start new scan"
+                    secondaryButton.setVisible(true)
+                    secondaryButton.isEnabled = true
+                    secondaryButton.text = "Add connected room"
+                    secondaryButton.backgroundTintList = ColorStateList.valueOf(color(R.color.action))
+                    secondaryButton.setTextColor(color(R.color.text_primary))
                 }
             }
         }
@@ -1550,7 +1850,8 @@ class CaptureActivity : AppCompatActivity() {
             color(
                 when {
                     !enabled -> R.color.action_disabled
-                    state == State.SCANNING && loopClosed && (parallaxTracker.verifiedLandmarkCount >= 200) && issues.isEmpty() -> R.color.action_ready
+                    state == State.ALIGNMENT -> R.color.action_ready
+                    state == State.SCANNING && loopClosed && (parallaxTracker.verifiedLandmarkCount >= parallaxTracker.targetLandmarkCount) && issues.isEmpty() -> R.color.action_ready
                     else -> R.color.action
                 }
             )
@@ -1561,7 +1862,7 @@ class CaptureActivity : AppCompatActivity() {
 
         if (!showDiag) return
         diagText.text = buildString {
-            append("state $state  room $roomIndex  frames $frames kept / $framesSeen seen  [${r?.trackingState}]\n")
+            append("state $state  room ${roomIndex + 1} ($currentRoomName)  frames $frames kept / $framesSeen seen  [${r?.trackingState}]\n")
             append("depth: " + if (r?.depthSupported == true) "ARCore" else "sparse feature points (triangulated)\n")
             append("  img: ${r?.imageWidth}x${r?.imageHeight}")
             append("  fl: %.0f\n".format(r?.focalX ?: 0f))
@@ -1620,6 +1921,7 @@ class CaptureActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "ArScan"
+        const val EXTRA_ALIGN_TO_SESSION = "com.glomehometour.arscan.extra.ALIGN_TO_SESSION"
 
         /** camera2 refusing a change to a session it already closed -- see installCameraRaceGuard. */
         fun isClosedCaptureSessionRace(e: Throwable): Boolean =
@@ -1654,8 +1956,8 @@ class CaptureActivity : AppCompatActivity() {
         const val UI_EVERY_N_FRAMES = 5L
 
         /** Operator-facing kinematic limits (projet.md §2.4): warn here. */
-        const val MAX_WALK_SPEED_MS = 0.4f
-        const val MAX_TURN_RATE_DEG_S = 30f
+        const val MAX_WALK_SPEED_MS = 0.40f
+        const val MAX_TURN_RATE_DEG_S = 28f
 
         /** Minimum gap between tap-to-focus triggers (see root.setOnTouchListener): continuous
          * AF is already running, so this only exists to stop rapid incidental touches from
@@ -1667,11 +1969,11 @@ class CaptureActivity : AppCompatActivity() {
          * overexposure, speed) clear in a fraction of a second, which made the banner
          * unreadable before this floor existed. */
         const val MIN_WARNING_DISPLAY_NANOS = 3_000_000_000L
-        /** Keyframe rejection limits, deliberately above the warning ones: the banner should
-         * appear before frames start being thrown away, otherwise the operator's first signal
-         * that anything is wrong is a coverage bar that stopped moving. */
-        const val MAX_KEYFRAME_SPEED_MS = 0.55f
-        const val MAX_KEYFRAME_RATE_DEG_S = 45f
+        /** Keyframe rejection limits: tightened to prevent motion blur and ARCore pose drift */
+        const val MAX_KEYFRAME_SPEED_MS = 0.45f
+        const val MAX_KEYFRAME_RATE_DEG_S = 32f
+        const val MAX_INSTANT_KEYFRAME_SPEED_MS = 0.50f
+        const val MAX_INSTANT_KEYFRAME_RATE_DEG_S = 36f
 
         /** README §4/§5: keep 1 of every 6-10 gate-passed frames. 8 is the midpoint of that
          * range -- calibration knob, move within [6, 10] rather than outside it. */

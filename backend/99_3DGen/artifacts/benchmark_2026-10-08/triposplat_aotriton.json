@@ -1,0 +1,13 @@
+{
+  "model_load_seconds": 8.088372168999967,
+  "pipeline_seconds": 46.46527594899999,
+  "end_to_end_seconds": 55.30125235499986,
+  "peak_allocated_gib": 6.407400608062744,
+  "device": "AMD Radeon RX 9060 XT",
+  "torch": "2.10.0+rocm7.0",
+  "hip": "7.0.51831",
+  "steps": 20,
+  "guidance_scale": 3.0,
+  "num_gaussians": 262144,
+  "attention_backend": "AOTriton SDPA (experimental gfx1200 allowlist)"
+}

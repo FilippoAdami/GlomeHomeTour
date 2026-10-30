@@ -5,6 +5,7 @@ import json
 import math
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -214,6 +215,146 @@ def test_coordinate_conversions_roundtrip():
     mat_gl_roundtrip = opencv_to_opengl(mat_cv)
 
     np.testing.assert_allclose(mat_gl, mat_gl_roundtrip, atol=1e-6)
+
+
+def test_ingestion_publish_places_result_at_scene_root(tmp_path: Path):
+    from step_ingest import _publish
+
+    staged = tmp_path / "staged"
+    workspace = tmp_path / "current_scene"
+    workspace.mkdir()
+    (workspace / "00_ingestion").mkdir()
+    (staged / "images").mkdir(parents=True)
+    (staged / "images" / "frame.jpg").write_bytes(b"image")
+    (staged / "ingestion_results.json").write_text('{"images_path": "images"}')
+
+    _publish(staged, workspace)
+
+    assert (workspace / "images" / "frame.jpg").is_file()
+    assert not (workspace / "00_ingestion").exists()
+    assert json.loads((workspace / "ingestion_results.json").read_text()) == {"images_path": "images"}
+
+
+def test_ingest_writes_root_result_with_scene_relative_paths(mock_package_dir: Path, tmp_path: Path):
+    from ingestion import ingest
+
+    output = tmp_path / "output"
+    result = ingest(mock_package_dir, output, started=time.perf_counter())
+
+    assert (output / "ingestion_results.json").is_file()
+    assert not (output / "00_ingestion").exists()
+    saved = json.loads((output / "ingestion_results.json").read_text())
+    assert saved == result
+    assert (output / saved["images_path"]).is_dir()
+    assert (output / saved["metadata_path"]).is_dir()
+    assert (output / saved["transforms_path"]).is_file()
+
+
+def test_certificate_can_live_in_capture_wrapper(tmp_path: Path):
+    from ingestion import _find_certificate
+
+    payload = tmp_path / "input"
+    scene = payload / "Bedroom2" / "scan"
+    scene.mkdir(parents=True)
+    certificate = payload / "Bedroom2" / "certificate.json"
+    certificate.write_text("{}")
+
+    assert _find_certificate(scene, payload) == certificate
+
+
+@pytest.mark.parametrize("elevated_count, expected_floors", [(9, 1), (10, 2)])
+def test_floor_count_threshold_requires_ten_elevated_poses(elevated_count: int, expected_floors: int):
+    from ingestion import _extent_from_trajectory
+
+    poses = np.zeros((20, 3), dtype=np.float64)
+    poses[:elevated_count, 1] = 3.1
+
+    assert _extent_from_trajectory(poses)["floor_count"] == expected_floors
+
+
+@pytest.mark.parametrize(
+    "member, content",
+    [("../outside.txt", b"data"), ("notes.txt", b"#!/bin/sh\necho unsafe\n")],
+)
+def test_unsafe_zip_is_rejected_deleted_and_not_extracted(
+    member: str, content: bytes, tmp_path: Path
+):
+    from ingestion import IngestionError, ingest
+
+    archive = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(archive, "w") as zipped:
+        zipped.writestr(member, content)
+
+    output = tmp_path / "output"
+    with pytest.raises(IngestionError) as error:
+        ingest(archive, output, started=time.perf_counter())
+
+    assert error.value.code == "UNSAFE_ARCHIVE"
+    assert error.value.details["source_archive_deleted"] is True
+    assert not archive.exists()
+    assert not output.exists()
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_ingest_processes_certified_scan_folders_independently(
+    mock_package_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from Utilities.generate_capture_certificate import generate_certificate
+    import step_ingest
+
+    session = tmp_path / "session"
+    for index in range(2):
+        shutil.copytree(mock_package_dir, session / f"scan_{index}")
+    certificate, _ = generate_certificate(session)
+    (session / "certificate.json").write_text(json.dumps(certificate))
+    archive = tmp_path / "session.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zipped:
+        for path in session.rglob("*"):
+            if path.is_file():
+                zipped.write(path, path.relative_to(session))
+
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "images").mkdir()
+    (output / "ingestion_results.json").write_text("{}")
+    (output / "scan_7").mkdir()
+    monkeypatch.setattr(step_ingest, "DEFAULT_WORKSPACE", output)
+    assert step_ingest.main([str(archive)]) == 0
+
+    assert (output / "certificate.json").is_file()
+    assert not (output / "ingestion_results.json").exists()
+    assert not (output / "images").exists()
+    assert not (output / "scan_7").exists()
+    for scan_name in ("scan_0", "scan_1"):
+        scan = output / scan_name
+        scan_result = json.loads((scan / "ingestion_results.json").read_text())
+        assert scan_result["source_format"] == "arcore_app_certified"
+        assert scan_result["retained_images_count"] == 2
+        assert (scan / scan_result["images_path"]).is_dir()
+        assert (scan / scan_result["transforms_path"]).is_file()
+
+
+def test_uncertified_scan_normalization_stays_inside_each_scan(
+    mock_package_dir: Path, tmp_path: Path
+):
+    from ingestion import ingest
+
+    session = tmp_path / "session"
+    for index in range(2):
+        shutil.copytree(mock_package_dir, session / f"scan_{index}")
+    output = tmp_path / "output"
+
+    result = ingest(session, output, started=time.perf_counter())
+
+    assert result["scan_count"] == 2
+    assert {path.name for path in output.iterdir()} == {"scan_0", "scan_1"}
+    for scan_name in ("scan_0", "scan_1"):
+        scan = output / scan_name
+        assert not (scan / ".normalized").exists()
+        scan_result = json.loads((scan / "ingestion_results.json").read_text())
+        assert scan_result["source_format"] == "arcore"
+        assert (scan / scan_result["images_path"]).is_dir()
+        assert (scan / scan_result["transforms_path"]).is_file()
 
 
 # ==============================================================================

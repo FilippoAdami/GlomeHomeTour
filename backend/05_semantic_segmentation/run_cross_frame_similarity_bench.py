@@ -4,6 +4,7 @@ Compute cross-frame class similarity matrices and 3-column side-by-side comparis
 for consecutive frames in the first 50 frames processed by pipeline 06c.
 """
 
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, numpy as np
@@ -11,6 +12,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 def get_class_color(mid: int):
     k = mid - 1
@@ -111,10 +113,14 @@ def create_cross_matrix_plot(sim_mat: np.ndarray, ids_a: list, ids_b: list,
     plt.close(fig)
 
 def main():
-    root = Path(__file__).resolve().parent.parent
-    data_dir = root / "current_scene" / "06c_semantic_segmentation" / "first50_streamlined_grid12_merge069"
-    img_dir = root / "current_scene" / "06c_semantic_segmentation" / "inputs" / "images"
-    out_dir = root / "current_scene" / "06c_semantic_segmentation" / "cross_frame_similarity_first50"
+    parser = argparse.ArgumentParser(description="Render cross-frame similarity diagnostics.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
+    workspace = stage_directory(args.workspace)
+    data_dir = workspace / "first50_streamlined_grid12_merge069"
+    image_paths = registered_images(args.workspace)
+    img_dir = image_paths[0].parent
+    out_dir = workspace / "cross_frame_similarity_first50"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     npz_files = sorted(data_dir.glob("frame_*_merged.npz"))

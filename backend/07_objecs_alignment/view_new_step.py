@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import argparse
+import colorsys
 import json
 import math
 import os
@@ -20,59 +21,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from matplotlib.lines import Line2D
 
 
 BACKEND = Path(__file__).resolve().parents[1]
 SCENE = BACKEND / "current_scene"
 INPUT = SCENE / "06_mesh_elaboration/new_step"
 OUTPUT = INPUT / "outputs"
+ALIGNMENT_OUTPUT = OUTPUT / "segmentation_alignment"
 ROLE_COLORS = {"wall": (0.2, 0.55, 1.0), "floor": (0.2, 0.9, 0.3), "ceiling": (1.0, 0.65, 0.1)}
-BASELINE_VIEWS = ((0, 2, "Plan · X/Z", "X (m)", "Z (m)"),
-                  (0, 1, "Elevation · X/Y", "X (m)", "Y (m)"),
-                  (2, 1, "Elevation · Z/Y", "Z (m)", "Y (m)"))
-
-
-def write_baseline_overview(shell, objects, provenance_path, output_path, source_face_ids=None,
-                            point_size=0.5):
-    sv, sf = np.asarray(shell.vertices), np.asarray(shell.triangles)
-    ov, of = np.asarray(objects.vertices), np.asarray(objects.triangles)
-    source_faces = (np.load(provenance_path)["source_face_ids"] if source_face_ids is None
-                    else source_face_ids)
-    regions = np.load(SCENE / "06_mesh_elaboration/generic_graph_regions/triangle_class_labels.npy",
-                      mmap_mode="r")[source_faces]
-    centers = ov[of].mean(axis=1)
-    class189 = regions == 189
-    ordinary = ~class189
-    shell_stride = max(1, math.ceil(len(sf) / 25_000))
-    object_stride = max(1, math.ceil(len(of) / 35_000))
-
-    fig, axes = plt.subplots(1, 3, figsize=(18, 7), constrained_layout=True)
-    for ax, (x_axis, y_axis, title, xlabel, ylabel) in zip(axes, BASELINE_VIEWS):
-        edges = sv[sf[::shell_stride]][:, :, [x_axis, y_axis]]
-        ax.add_collection(LineCollection(edges, colors="#777777", linewidths=0.35,
-                                         alpha=0.45, zorder=1))
-        ax.scatter(centers[ordinary][::object_stride, x_axis],
-                   centers[ordinary][::object_stride, y_axis], s=point_size,
-                   c="#8f5937", alpha=0.55, linewidths=0, zorder=2)
-        ax.scatter(centers[class189][::object_stride, x_axis],
-                   centers[class189][::object_stride, y_axis], s=point_size * 1.6,
-                   c="#ff7f0e", alpha=0.85, linewidths=0, zorder=3)
-        ax.autoscale()
-        ax.set_aspect("equal", adjustable="datalim")
-        ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.grid(alpha=0.2)
-    axes[0].legend(handles=[
-        Line2D([], [], color="#777777", label="Regularized shell"),
-        Line2D([], [], marker="o", linestyle="", color="#8f5937", label="Other objects"),
-        Line2D([], [], marker="o", linestyle="", color="#ff7f0e", label="Region class 189")],
-        loc="upper right", fontsize=8)
-    path = output_path
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-    return path
 
 
 def write_instance_translation_delta(shell):
@@ -128,107 +84,104 @@ def write_instance_translation_delta(shell):
     return path
 
 
+def load_contact_group_meshes(manifest_path, alignment_output, unresolved_group_ids=()):
+    manifest = json.loads(manifest_path.read_text())
+    meshes = []
+    for group in manifest["groups"]:
+        hue = (int(group["group_id"]) * 0.618033988749895) % 1.0
+        color = ((1.0, 0.04, 0.04) if int(group["group_id"]) in unresolved_group_ids
+                 else colorsys.hsv_to_rgb(hue, 0.78, 0.95))
+        mesh_path = alignment_output / group["path"]
+        mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+        if not len(mesh.triangles):
+            raise ValueError(f"Contact group mesh is empty or missing: {mesh_path}")
+        mesh.compute_vertex_normals()
+        mesh.paint_uniform_color(color)
+        meshes.append(mesh)
+    return manifest, meshes
+
+
+def back_shell_triangles(mesh, camera_position):
+    centers = np.asarray(mesh.vertices)[np.asarray(mesh.triangles)].mean(axis=1)
+    normals = np.asarray(mesh.triangle_normals)
+    return np.einsum("ij,ij->i", normals, centers - camera_position) >= 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contacts-only", action="store_true", help="show provisional object-to-shell contact vectors")
-    parser.add_argument("--rigid-baseline", action="store_true", help="compare rigid candidate objects with the unchanged shell")
+    parser.add_argument("--rigid-baseline", action="store_true", help="show touching object blocks around the see-through shell")
+    parser.add_argument("--structural-fit", action="store_true", help="show translated contact blocks inside the see-through shell")
     parser.add_argument("--instance-translated", action="store_true", help="show minimum per-instance translations inside the shell")
     args = parser.parse_args()
     shell = o3d.io.read_triangle_mesh(str(INPUT / "all_structural_regularized.ply"))
     shell.compute_vertex_normals()
     shell.paint_uniform_color((0.72, 0.72, 0.72))
-    if args.rigid_baseline or args.instance_translated:
-        mode = "instance_translated" if args.instance_translated else "rigid_baseline"
-        provenance_path = OUTPUT / f"{mode}_provenance.npz"
-        report_path = OUTPUT / ("instance_translation_report.json" if args.instance_translated
-                                else "rigid_baseline_report.json")
-        objects = o3d.io.read_triangle_mesh(str(OUTPUT / f"{mode}_objects.ply"))
-        report = json.loads(report_path.read_text())
-        objects.compute_vertex_normals()
-        regions = np.load(SCENE / "06_mesh_elaboration/generic_graph_regions/triangle_class_labels.npy",
-                          mmap_mode="r")
-        colors = np.tile((0.58, 0.34, 0.22), (len(objects.vertices), 1))
-        source_faces = np.load(provenance_path)["source_face_ids"]
-        class_vertices = np.unique(np.asarray(objects.triangles)[regions[source_faces] == 189])
-        colors[class_vertices] = (1.0, 0.38, 0.04)
-        objects.vertex_colors = o3d.utility.Vector3dVector(colors)
-        instance_manifest_path = OUTPUT / "rigid_baseline_clusters.json"
-        instance_meshes = []
-        instance_points = []
-        preview_objects, preview_source_faces = objects, None
-        preview_shell = shell
-        if mode == "rigid_baseline" and instance_manifest_path.exists():
-            cluster_data = json.loads(instance_manifest_path.read_text())
-            source_ids = np.load(OUTPUT / "rigid_baseline_instance_provenance.npz")["source_face_ids"]
-            assignments = np.load(OUTPUT / "panoptic3d_workspace/06c_semantic_segmentation/"
-                                  "panoptic3d_current_source_candidate/face_assignments.npz")
-            all_instance_ids = assignments["instance_ids"]
-            regions = np.load(SCENE / "06_mesh_elaboration/generic_graph_regions/triangle_class_labels.npy",
-                              mmap_mode="r")
-            structural = json.loads((SCENE / "06_mesh_elaboration/generic_graph_regions/"
-                                     "structural_classes.json").read_text())["classifications"]
-            structural_ids = {int(class_id) for class_id, info in structural.items()
-                              if info.get("structural_role") in {"wall", "floor", "ceiling"}}
-            first = None
-            for item in cluster_data["instances"]:
-                instance_faces = regions[(all_instance_ids == item["instance_id"]) &
-                                         ~assignments["removed"] &
-                                         (regions > 0)]
-                if not len(instance_faces):
-                    continue
-                class_ids, class_counts = np.unique(instance_faces, return_counts=True)
-                dominant_class = int(class_ids[np.argmax(class_counts)])
-                if dominant_class not in structural_ids:
-                    first = item
-                    break
-            if first is None:
-                raise ValueError("No instance with a known non-structural dominant class was found")
-            cluster_count = max(1, len(cluster_data["clusters"]))
-            cluster_colors = plt.get_cmap("hsv")
-            item = first
-            mesh = o3d.io.read_triangle_mesh(str(OUTPUT / "rigid_baseline_instances" / item["path"]))
-            mesh.compute_vertex_normals()
-            color = cluster_colors(item["cluster_id"] / cluster_count)
-            colors = np.tile(color[:3], (len(mesh.vertices), 1))
-            mesh.vertex_colors = o3d.utility.Vector3dVector(colors)
-            instance_meshes.append(mesh)
-            points = o3d.geometry.PointCloud()
-            points.points = mesh.vertices
-            points.paint_uniform_color((1.0, 0.1, 0.1))
-            instance_points.append(points)
-            start, count = item["provenance_offset"], item["provenance_count"]
-            preview_objects = mesh
-            preview_source_faces = source_ids[start:start + count]
-            geometries = (instance_meshes[0], instance_points[0])
-            preview_shell = o3d.geometry.TriangleMesh()
-            color = matplotlib.colors.to_hex(cluster_colors(first["cluster_id"] / cluster_count)[:3])
-            _, component_counts, _ = instance_meshes[0].cluster_connected_triangles()
-            print(f"Displaying first non-structural instance {first['path']} "
-                  f"(dominant class {dominant_class}, {first['faces_written']} faces), "
-                  f"cluster {first['cluster_id']} color {color}; "
-                  f"{len(component_counts)} disconnected pieces. Red points mark its vertices.")
-        else:
-            geometries = (shell, objects)
+    culling_shell = None
+    if args.rigid_baseline or args.structural_fit or args.instance_translated:
+        mode = "instance_translated" if args.instance_translated else ("structural_fit" if args.structural_fit else "rigid_baseline")
+        if mode in {"rigid_baseline", "structural_fit"}:
+            report_path = (ALIGNMENT_OUTPUT / "rigid_baseline_report.json" if mode == "rigid_baseline"
+                           else ALIGNMENT_OUTPUT / "structural_fit/structural_fit_report.json")
+            if not report_path.is_file():
+                package = SCENE / "05_semantic_segmentation/mesh_objects_step3/segmentation_output"
+                if mode == "structural_fit":
+                    raise SystemExit("Fitted blocks are missing. Build them first with:\n"
+                                     "  backend/.venv/bin/python backend/06_mesh_elaboration/fit_contact_groups_inside.py")
+                raise SystemExit("Alignment output is missing. Build it first with:\n"
+                                 "  backend/.venv/bin/python backend/06_mesh_elaboration/build_rigid_baseline.py\n"
+                                 f"Required Stage 05 instance package: {package}\n"
+                                 "Generate that package with the 3D object extraction step, then rerun this viewer.")
+            report = json.loads(report_path.read_text())
+            shell_path = (json.loads((ALIGNMENT_OUTPUT / "rigid_baseline_report.json").read_text())["inputs"]["regularized_shell"]
+                          if mode == "structural_fit" else report["inputs"]["regularized_shell"])
+            shell = o3d.io.read_triangle_mesh(shell_path)
+            shell.compute_triangle_normals()
+            shell.compute_vertex_normals()
+            shell.paint_uniform_color((0.72, 0.72, 0.72))
+            culling_shell = o3d.geometry.TriangleMesh(shell)
+            group_report_path = (ALIGNMENT_OUTPUT / "contact_groups.json" if mode == "rigid_baseline"
+                                 else ALIGNMENT_OUTPUT / "structural_fit/contact_groups.json")
+            if not group_report_path.is_file():
+                raise SystemExit(
+                    "Contact groups are missing. Build them with:\n"
+                    "  backend/.venv/bin/python backend/06_mesh_elaboration/group_touching_instances.py"
+                )
+            unresolved = ({item["group_id"] for item in report["groups"]
+                           if item.get("contained_surface_percent", 100.0) < 99.99}
+                          if mode == "structural_fit" else ())
+            group_report, group_meshes = load_contact_group_meshes(group_report_path, ALIGNMENT_OUTPUT, unresolved)
+            geometries = (shell, *group_meshes)
+            if mode == "rigid_baseline":
+                title = "Touching object blocks around the regularized shell"
+                transform = report["transform"]
+                print(f"Translation: {transform['translation_m']}; rotation: "
+                      f"{transform['rotation_angle_deg']:.3f} degrees; "
+                      f"structural fit inliers: {report['fit']['inliers']}/{report['fit']['anchors']}.")
+                print(f"Contact blocks: {group_report['group_count']} from {group_report['instance_count']} instances; "
+                      f"{group_report['contact_pair_count']} touching pairs at "
+                      f"{group_report['contact_distance_m']:.3f} m tolerance.")
+            else:
+                title = "Bounded rigid fit of contact blocks inside the regularized shell"
+                print(f"Fitted blocks: {report['group_count']}; transformed: {report['transformed_groups']}; "
+                      f"left unchanged for insignificant gain: {report['unchanged_insignificant_gain_groups']}; "
+                      f"partial: {report['partial_groups']}; mean contained surface: "
+                      f"{report['mean_contained_surface_percent']:.2f}%.")
+                print("Blocks use at most 5 cm translation per axis and 5 degrees of vertical-axis yaw; there is no tilt. Partial blocks are red.")
+            print("Each color is one rigid block. Near-side shell triangles are hidden from the current view.")
+            fallback = report_path
         if mode == "instance_translated":
-            print("Gray: regularized shell. Brown: translated objects. Orange: region class 189.")
-        else:
-            print("Gray: regularized shell. Each border-connected cluster has its own color; untracked geometry is gray.")
-        if args.instance_translated:
+            report_path = OUTPUT / "instance_translation_report.json"
+            objects = o3d.io.read_triangle_mesh(str(OUTPUT / f"{mode}_objects.ply"))
+            report = json.loads(report_path.read_text())
+            objects.compute_vertex_normals()
+            geometries = (shell, objects)
+            fallback = report_path
+            print("Gray: regularized shell. Brown: translated objects.")
             title = "Minimum per-instance translations inside the shell"
             print(f"Translated groups: {report['translated_groups']}; unresolved groups: {report['unresolved_groups']}.")
             print("Each group is rigidly translated; no triangles are removed.")
             print(f"Before/after displacement view: {write_instance_translation_delta(shell)}")
-        else:
-            title = ("First aligned object instance" if mode == "rigid_baseline" and instance_meshes
-                     else "Global structural alignment applied to original objects")
-            alignment = report["global_alignment"]
-            role_rms = ", ".join(f"{role} {alignment['roles'][role]['after']['area_confidence_weighted_rms_m']:.3f}"
-                                  for role in ("wall", "floor", "ceiling"))
-            print(f"One rigid transform applied to all objects: translation {alignment['translation_m']}, "
-                  f"rotation {alignment['rotation_angle_deg']:.3f}°. Fit RMS (m): {role_rms}.")
-            print("No per-instance transforms or boundary-based triangle removals were applied.")
-        fallback = report_path
-        overview_path = OUTPUT / f"{mode}_overview.png"
     elif args.contacts_only:
         lines = o3d.io.read_line_set(str(OUTPUT / "instance_contact_preview.ply"))
         objects = o3d.io.read_triangle_mesh(str(OUTPUT / "candidate_instances_for_contact_review.ply"))
@@ -259,28 +212,30 @@ def main():
         print("Orbit/zoom to check whether each line endpoint lands on its intended shell surface.")
     viewer = o3d.visualization.Visualizer()
     if not viewer.create_window(title, width=1400, height=900):
-        if args.rigid_baseline or args.instance_translated:
-            fallback = write_baseline_overview(preview_shell, preview_objects, provenance_path, overview_path,
-                                               preview_source_faces, point_size=8.0)
-        print(f"Open3D could not create a graphics window. Review artifact: {fallback if args.contacts_only or args.rigid_baseline or args.instance_translated else OUTPUT / 'structural_correspondence_overview.png'}")
+        print(f"Open3D could not create a graphics window. Review artifact: {fallback if args.contacts_only or args.rigid_baseline or args.structural_fit or args.instance_translated else OUTPUT / 'structural_correspondence_overview.png'}")
         return
     for geometry in geometries:
         viewer.add_geometry(geometry)
     options = viewer.get_render_option()
     if options is None:
         viewer.destroy_window()
-        if args.rigid_baseline or args.instance_translated:
-            fallback = write_baseline_overview(preview_shell, preview_objects, provenance_path, overview_path,
-                                               preview_source_faces, point_size=8.0)
-        print(f"Open3D graphics initialization failed. Review artifact: {fallback if args.contacts_only or args.rigid_baseline or args.instance_translated else OUTPUT / 'structural_correspondence_overview.png'}")
+        print(f"Open3D graphics initialization failed. Review artifact: {fallback if args.contacts_only or args.rigid_baseline or args.structural_fit or args.instance_translated else OUTPUT / 'structural_correspondence_overview.png'}")
         return
     options.mesh_color_option = o3d.visualization.MeshColorOption.Color
     options.light_on = False
     options.mesh_show_back_face = True
-    options.point_size = 8.0 if args.rigid_baseline else 4.0
-    if args.rigid_baseline:
-        options.mesh_show_wireframe = True
+    options.point_size = 4.0
     while viewer.poll_events():
+        if culling_shell is not None:
+            parameters = viewer.get_view_control().convert_to_pinhole_camera_parameters()
+            camera_position = np.linalg.inv(parameters.extrinsic)[:3, 3]
+            keep = back_shell_triangles(culling_shell, camera_position)
+            current = np.asarray(shell.triangles)
+            if len(current) != int(keep.sum()) or not np.array_equal(current, np.asarray(culling_shell.triangles)[keep]):
+                shell.triangles = o3d.utility.Vector3iVector(np.asarray(culling_shell.triangles)[keep])
+                shell.compute_triangle_normals()
+                shell.compute_vertex_normals()
+                viewer.update_geometry(shell)
         viewer.update_renderer()
         # Cap software-rendered previews at 10 fps so an idle review window stays usable.
         time.sleep(0.1)

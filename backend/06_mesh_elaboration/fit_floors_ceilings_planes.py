@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
         "backend/current_scene/06_mesh_elaboration/extracted_structural_instances/wall_planes_manifest.json"))
     parser.add_argument("--dist-thresh", type=float, default=0.10,
                         help="Maximum perpendicular residual (metres) for retained faces.")
+    parser.add_argument("--max-tilt-deg", type=float, default=4.0,
+                        help="Maximum tilt angle in degrees from horizontal to snap to strictly horizontal.")
     return parser.parse_args()
 
 
@@ -146,8 +148,11 @@ def fit_robust_plane(
 
 
 def _should_flatten(points: np.ndarray, weights: np.ndarray, normal: np.ndarray, d: float,
-                    distance_threshold: float) -> bool:
-    """Only flatten when horizontal residual is indistinguishable from fit noise."""
+                    distance_threshold: float, max_tilt_deg: float = 4.0) -> bool:
+    """Only flatten when tilt from horizontal is within max_tilt_deg or horizontal residual is noise."""
+    tilt_deg = float(np.rad2deg(np.arccos(np.clip(abs(normal[1]), -1.0, 1.0))))
+    if tilt_deg <= max_tilt_deg:
+        return True
     residual = np.abs(points @ normal + d)
     y = float(np.average(points[:, 1], weights=weights))
     horizontal = np.abs(points[:, 1] - y)
@@ -233,7 +238,7 @@ def main() -> int:
             print(f"error: fitting {item['name']} retained no faces", file=sys.stderr)
             return 2
         fitted_support = keep & compatible
-        if _should_flatten(centres[fitted_support], areas[fitted_support], normal, d, args.dist_thresh):
+        if _should_flatten(centres[fitted_support], areas[fitted_support], normal, d, args.dist_thresh, max_tilt_deg=args.max_tilt_deg):
             normal = np.array([0.0, 1.0 if up else -1.0, 0.0])
             d = -float(normal[1] * np.average(centres[fitted_support, 1], weights=areas[fitted_support]))
             keep = valid & (np.abs(centres @ normal + d) <= args.dist_thresh)

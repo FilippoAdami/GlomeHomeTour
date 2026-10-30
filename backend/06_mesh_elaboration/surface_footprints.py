@@ -13,7 +13,9 @@ def polygons(geometry):
         return []
     if geometry.geom_type == 'Polygon':
         return [geometry]
-    return [part for geom in geometry.geoms for part in polygons(geom)]
+    if geometry.geom_type in ('MultiPolygon', 'GeometryCollection'):
+        return [part for geom in geometry.geoms for part in polygons(geom)]
+    return []
 
 
 def frame_footprint(geometry, a, b, inverse=False):
@@ -106,19 +108,22 @@ def wall_regions(wall_planes, a, b, elevation=None, tolerance=.15):
     """Close only local endpoint errors; polygonize arbitrary measured wall layouts."""
     segments = []
     for wall in wall_planes:
-        bounds = wall.get('bounds_y')
-        if elevation is not None and bounds and not bounds[0]-max(tolerance, .15*(bounds[1]-bounds[0])) <= elevation <= bounds[1]+max(tolerance, .15*(bounds[1]-bounds[0])):
-            continue
         normal = np.array(wall['normal_unit'])
         if abs(normal @ a) > .999:
-            span = wall['span_w_m']
-            segment = np.array([[wall['offset_m'], span[0]], [wall['offset_m'], span[1]]])
+            full_span = wall['span_w_m']
+            make_segment = lambda span: np.array([[wall['offset_m'], span[0]], [wall['offset_m'], span[1]]])
         elif abs(normal @ b) > .999:
-            span = wall['span_u_m']
-            segment = np.array([[span[0], wall['offset_m']], [span[1], wall['offset_m']]])
+            full_span = wall['span_u_m']
+            make_segment = lambda span: np.array([[span[0], wall['offset_m']], [span[1], wall['offset_m']]])
         else:
             continue
-        segments.append(segment)
+        for region in wall.get('trim_regions') or [{'span_m': full_span, 'bounds_y': wall.get('bounds_y')}]:
+            bounds = region.get('bounds_y', wall.get('bounds_y'))
+            if (elevation is not None and bounds
+                    and not bounds[0]-max(tolerance, .15*(bounds[1]-bounds[0]))
+                    <= elevation <= bounds[1]+max(tolerance, .15*(bounds[1]-bounds[0]))):
+                continue
+            segments.append(make_segment(region['span_m']))
     for i, first in enumerate(segments):
         for second in segments[i+1:]:
             first_axis = int(np.argmax(np.abs(first[1]-first[0])))
@@ -149,8 +154,9 @@ def constrain_footprint(observed, regions, tolerance=.15):
         overlap = observed.intersection(room)
         if overlap.area < .1*min(observed.area, room.area):
             continue
-        # Full support on all four sides distinguishes a complete floor from a mezzanine.
-        if np.max(np.abs(np.array(overlap.bounds)-np.array(room.bounds))) <= tolerance:
+        # Matching bounds alone mistakes a boundary notch for an incomplete room.
+        if (np.max(np.abs(np.array(overlap.bounds)-np.array(room.bounds))) <= tolerance
+                and overlap.boundary.hausdorff_distance(room.boundary) <= tolerance):
             result = result.union(room)
     wall_contour = unary_union(regions)
     outside = result.difference(wall_contour)
@@ -179,10 +185,12 @@ def snap_footprint_to_walls(geometry, wall_planes, a, b, tolerance=.15):
                 normal_axis = a if axis == 0 else b
                 if abs(normal @ normal_axis) < .999:
                     continue
-                span = wall['span_w_m'] if axis == 0 else wall['span_u_m']
-                overlap = min(high, span[1])-max(low, span[0])
                 distance = abs(ring[i, axis]-wall['offset_m'])
-                if distance < tolerance and overlap >= .5*(high-low):
+                if distance >= tolerance:
+                    continue
+                span_key = 'span_w_m' if axis == 0 else 'span_u_m'
+                spans = [region['span_m'] for region in wall.get('trim_regions', [])] or [wall[span_key]]
+                if any(min(high, span[1])-max(low, span[0]) >= .5*(high-low) for span in spans):
                     choices.append((distance, wall['offset_m']))
             if choices:
                 ring[[i, j], axis] = min(choices)[1]
@@ -220,16 +228,71 @@ def clean_footprint(geometry, min_edge=.10, hole_size=.40):
                     changed[[i, j, neighbor], axis] = value
                     replacement = rings.copy(); replacement[r] = changed
                     candidate = Polygon(replacement[0], replacement[1:]).simplify(0)
+                    if not candidate.is_valid:
+                        candidate = candidate.buffer(0).simplify(1e-8)
                     if not candidate.is_valid or candidate.is_empty or candidate.area < 1e-10:
                         continue
-                    new_count = sum(len(h.coords)-1 for h in [candidate.exterior, *candidate.interiors])
+                    if candidate.geom_type != 'Polygon':
+                        continue
+                    new_count = sum(
+                        len(ring.coords)-1
+                        for ring in [candidate.exterior, *candidate.interiors]
+                    )
                     if new_count >= sum(len(h) for h in rings):
                         continue
                     # Prefer trimming a protrusion to filling a measured wall recess.
                     added = candidate.difference(poly).area
                     candidates.append((added > 1e-9, candidate.symmetric_difference(poly).area, candidate))
             if not candidates:
-                raise ValueError('Cannot remove a sub-minimum footprint edge without destroying the surface')
+                break  # Keep measured contour when every simplification would erase surface.
             poly = min(candidates, key=lambda c: c[:2])[2]
         result.append(poly)
     return unary_union(result)
+
+
+def regularize_orthogonal_footprint(geometry, min_edge=.10, tolerance=.02):
+    """Fit axis-aligned polygon rings and enforce right-angle corners and a minimum edge."""
+    if not np.isfinite([min_edge, tolerance]).all() or min_edge <= 0 or tolerance < 0:
+        raise ValueError('Footprint edge and fit tolerances must be finite and positive')
+
+    tolerance = max(tolerance, min_edge / 2)
+    fitted = []
+    for source in polygons(geometry):
+        rings = []
+        for source_ring in [source.exterior, *source.interiors]:
+            source_points = np.asarray(source_ring.coords[:-1], dtype=float)
+            points = orthogonal_ring(source_points, tolerance)
+            if points is None:
+                raise ValueError('Could not fit an orthogonal footprint ring')
+            source_area = .5 * np.sum(
+                source_points[:, 0] * np.roll(source_points[:, 1], -1)
+                - source_points[:, 1] * np.roll(source_points[:, 0], -1)
+            )
+            fitted_area = .5 * np.sum(
+                points[:, 0] * np.roll(points[:, 1], -1)
+                - points[:, 1] * np.roll(points[:, 0], -1)
+            )
+            rings.append(points if source_area * fitted_area >= 0 else points[::-1].copy())
+        polygon = Polygon(rings[0], rings[1:])
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if not polygon.is_valid or polygon.is_empty or polygon.area <= 1e-8:
+            raise ValueError('Orthogonal footprint fit produced invalid geometry')
+        fitted.extend(polygons(clean_footprint(polygon, min_edge, hole_size=0.0)))
+
+    result = unary_union(fitted)
+    if result.is_empty:
+        raise ValueError('Orthogonal footprint fit produced an empty shape')
+    for polygon in polygons(result):
+        for ring in [polygon.exterior, *polygon.interiors]:
+            points = np.asarray(ring.coords, dtype=float)
+            edges = np.diff(points, axis=0)
+            lengths = np.linalg.norm(edges, axis=1)
+            if np.any(lengths < min_edge - 1e-8):
+                raise ValueError(f'Orthogonal footprint contains an edge shorter than {min_edge:.2f} m')
+            if np.any((np.abs(edges[:, 0]) > 1e-8) & (np.abs(edges[:, 1]) > 1e-8)):
+                raise ValueError('Orthogonal footprint contains a diagonal edge')
+            previous = np.roll(edges, 1, axis=0)
+            if np.any(np.abs(np.sum(previous * edges, axis=1)) > 1e-8):
+                raise ValueError('Orthogonal footprint has neighboring edges that are not perpendicular')
+    return result

@@ -1,3 +1,4 @@
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, torch, numpy as np
@@ -10,6 +11,7 @@ import matplotlib.patches as patches
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fast_sam2_generator import FastSAM2Generator
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -74,9 +76,11 @@ def clean_carved_mask(m: np.ndarray, min_chunk_area: int, min_thickness: float =
     return np.zeros_like(m)
 
 def main():
-    workspace = Path("backend/current_scene/06c_semantic_segmentation")
-    img_dir = workspace / "inputs" / "images"
-    image_paths = sorted(img_dir.glob("*.jpg"))[:50]
+    parser = argparse.ArgumentParser(description="Benchmark the streamlined 12x12 semantic pipeline.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
+    workspace = stage_directory(args.workspace)
+    image_paths = registered_images(args.workspace)[:50]
     out_dir = workspace / "first50_streamlined_grid12_merge069"
     out_dir.mkdir(parents=True, exist_ok=True)
 

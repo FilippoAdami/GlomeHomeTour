@@ -1,0 +1,1032 @@
+{
+  "image_dir": "/home/monday/Desktop/3DGen/images",
+  "images": [
+    "bench.jpg",
+    "desk_scene.jpg",
+    "drawer.jpg",
+    "library.jpg",
+    "mirror.jpg",
+    "person.jpg",
+    "punchingbag.jpg",
+    "puzzle.jpg",
+    "radiator.jpg",
+    "worldmap.jpg"
+  ],
+  "seed": 34,
+  "configuration": {
+    "seed": 34,
+    "resolution": 1024,
+    "steps": 12,
+    "max_num_tokens": 49152,
+    "decimation_target": 150000,
+    "texture_size": 1024
+  },
+  "pixal3d_low_vram": true,
+  "trellis2_pipeline_type": "1024_cascade",
+  "runs": [
+    {
+      "model": "pixal3d",
+      "image": "bench.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_bench.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_bench.log",
+      "exit_code": 0,
+      "wall_seconds": 255.8330349349999,
+      "glb_bytes": 5419512,
+      "steps_seconds": {
+        "pixal_model_init": 74.261,
+        "image_preprocess": 5.021,
+        "moge_model_load": 5.403,
+        "moge_camera_estimate": 2.879,
+        "condition_sparse_structure": 1.688,
+        "sample_sparse_structure": 19.585,
+        "condition_shape_lr": 2.992,
+        "sample_shape_lr": 14.111,
+        "upsample_shape_coords": 2.262,
+        "condition_shape_hr": 5.798,
+        "sample_shape_hr": 57.786,
+        "condition_texture": 12.025,
+        "sample_texture": 30.696,
+        "decode_latents": 4.396
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 249.64,
+      "pipeline_seconds": 151.38,
+      "glb_export_seconds": 10.22,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_bench.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "desk_scene.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.log",
+      "exit_code": 0,
+      "wall_seconds": 203.72111244000007,
+      "glb_bytes": 5445308,
+      "steps_seconds": {
+        "pixal_model_init": 56.153,
+        "image_preprocess": 2.853,
+        "moge_model_load": 4.068,
+        "moge_camera_estimate": 2.544,
+        "condition_sparse_structure": 2.236,
+        "sample_sparse_structure": 13.908,
+        "condition_shape_lr": 2.925,
+        "sample_shape_lr": 7.716,
+        "upsample_shape_coords": 0.995,
+        "condition_shape_hr": 5.771,
+        "sample_shape_hr": 45.493,
+        "condition_texture": 11.966,
+        "sample_texture": 25.661,
+        "decode_latents": 3.141
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 197.1,
+      "pipeline_seconds": 119.84,
+      "glb_export_seconds": 11.21,
+      "peak_allocated_gib": 13.03,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "drawer.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_drawer.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_drawer.log",
+      "exit_code": 0,
+      "wall_seconds": 180.41238939700088,
+      "glb_bytes": 5020040,
+      "steps_seconds": {
+        "pixal_model_init": 56.742,
+        "image_preprocess": 2.812,
+        "moge_model_load": 4.048,
+        "moge_camera_estimate": 2.521,
+        "condition_sparse_structure": 1.56,
+        "sample_sparse_structure": 13.923,
+        "condition_shape_lr": 2.934,
+        "sample_shape_lr": 4.838,
+        "upsample_shape_coords": 17.403,
+        "condition_shape_hr": 5.842,
+        "sample_shape_hr": 22.534,
+        "condition_texture": 12.071,
+        "sample_texture": 13.52,
+        "decode_latents": 2.111
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 175.07,
+      "pipeline_seconds": 96.77,
+      "glb_export_seconds": 11.75,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_drawer.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "library.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_library.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_library.log",
+      "exit_code": 0,
+      "wall_seconds": 209.60985074400014,
+      "glb_bytes": 5813052,
+      "steps_seconds": {
+        "pixal_model_init": 56.752,
+        "image_preprocess": 2.879,
+        "moge_model_load": 5.081,
+        "moge_camera_estimate": 2.611,
+        "condition_sparse_structure": 1.65,
+        "sample_sparse_structure": 14.086,
+        "condition_shape_lr": 2.942,
+        "sample_shape_lr": 3.107,
+        "upsample_shape_coords": 7.628,
+        "condition_shape_hr": 5.746,
+        "sample_shape_hr": 15.902,
+        "condition_texture": 55.349,
+        "sample_texture": 15.276,
+        "decode_latents": 3.359
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 202.92,
+      "pipeline_seconds": 125.08,
+      "glb_export_seconds": 10.04,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_library.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "mirror.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_mirror.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_mirror.log",
+      "exit_code": 0,
+      "wall_seconds": 179.67764315500062,
+      "glb_bytes": 5612220,
+      "steps_seconds": {
+        "pixal_model_init": 57.69,
+        "image_preprocess": 2.853,
+        "moge_model_load": 4.869,
+        "moge_camera_estimate": 2.55,
+        "condition_sparse_structure": 1.653,
+        "sample_sparse_structure": 14.184,
+        "condition_shape_lr": 2.988,
+        "sample_shape_lr": 3.051,
+        "upsample_shape_coords": 4.683,
+        "condition_shape_hr": 8.526,
+        "sample_shape_hr": 14.33,
+        "condition_texture": 17.782,
+        "sample_texture": 11.387,
+        "decode_latents": 11.865
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 172.17,
+      "pipeline_seconds": 90.48,
+      "glb_export_seconds": 13.28,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_mirror.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "person.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_person.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_person.log",
+      "exit_code": 0,
+      "wall_seconds": 182.18957796500035,
+      "glb_bytes": 4800676,
+      "steps_seconds": {
+        "pixal_model_init": 54.774,
+        "image_preprocess": 2.855,
+        "moge_model_load": 5.475,
+        "moge_camera_estimate": 2.562,
+        "condition_sparse_structure": 3.819,
+        "sample_sparse_structure": 14.104,
+        "condition_shape_lr": 2.993,
+        "sample_shape_lr": 6.186,
+        "upsample_shape_coords": 0.967,
+        "condition_shape_hr": 5.836,
+        "sample_shape_hr": 32.369,
+        "condition_texture": 12.057,
+        "sample_texture": 19.151,
+        "decode_latents": 2.627
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 175.9,
+      "pipeline_seconds": 100.14,
+      "glb_export_seconds": 9.63,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_person.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "punchingbag.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_punchingbag.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_punchingbag.log",
+      "exit_code": 0,
+      "wall_seconds": 134.56494071199995,
+      "glb_bytes": 5031828,
+      "steps_seconds": {
+        "pixal_model_init": 56.352,
+        "image_preprocess": 2.836,
+        "moge_model_load": 4.175,
+        "moge_camera_estimate": 2.536,
+        "condition_sparse_structure": 1.581,
+        "sample_sparse_structure": 13.936,
+        "condition_shape_lr": 2.932,
+        "sample_shape_lr": 2.582,
+        "upsample_shape_coords": 4.902,
+        "condition_shape_hr": 5.773,
+        "sample_shape_hr": 7.101,
+        "condition_texture": 11.991,
+        "sample_texture": 4.416,
+        "decode_latents": 1.363
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 129.12,
+      "pipeline_seconds": 56.61,
+      "glb_export_seconds": 6.17,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_punchingbag.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "puzzle.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_puzzle.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_puzzle.log",
+      "exit_code": 0,
+      "wall_seconds": 159.0326604969996,
+      "glb_bytes": 7275064,
+      "steps_seconds": {
+        "pixal_model_init": 56.274,
+        "image_preprocess": 2.862,
+        "moge_model_load": 4.126,
+        "moge_camera_estimate": 2.643,
+        "condition_sparse_structure": 1.622,
+        "sample_sparse_structure": 14.09,
+        "condition_shape_lr": 2.949,
+        "sample_shape_lr": 3.855,
+        "upsample_shape_coords": 0.998,
+        "condition_shape_hr": 5.812,
+        "sample_shape_hr": 18.446,
+        "condition_texture": 12.075,
+        "sample_texture": 11.084,
+        "decode_latents": 2.523
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 153.49,
+      "pipeline_seconds": 73.49,
+      "glb_export_seconds": 13.64,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_puzzle.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "radiator.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_radiator.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_radiator.log",
+      "exit_code": 0,
+      "wall_seconds": 165.40304756300065,
+      "glb_bytes": 4867564,
+      "steps_seconds": {
+        "pixal_model_init": 56.157,
+        "image_preprocess": 2.853,
+        "moge_model_load": 4.859,
+        "moge_camera_estimate": 1.596,
+        "condition_sparse_structure": 1.637,
+        "sample_sparse_structure": 14.039,
+        "condition_shape_lr": 2.946,
+        "sample_shape_lr": 4.836,
+        "upsample_shape_coords": 1.237,
+        "condition_shape_hr": 5.799,
+        "sample_shape_hr": 24.143,
+        "condition_texture": 12.095,
+        "sample_texture": 14.585,
+        "decode_latents": 2.247
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 159.28,
+      "pipeline_seconds": 83.61,
+      "glb_export_seconds": 9.82,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_radiator.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "pixal3d",
+      "image": "worldmap.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_worldmap.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_worldmap.log",
+      "exit_code": 0,
+      "wall_seconds": 152.5875434569989,
+      "glb_bytes": 6632216,
+      "steps_seconds": {
+        "pixal_model_init": 54.396,
+        "image_preprocess": 2.851,
+        "moge_model_load": 4.213,
+        "moge_camera_estimate": 1.71,
+        "condition_sparse_structure": 1.503,
+        "sample_sparse_structure": 14.103,
+        "condition_shape_lr": 2.947,
+        "sample_shape_lr": 4.058,
+        "upsample_shape_coords": 0.887,
+        "condition_shape_hr": 5.805,
+        "sample_shape_hr": 18.726,
+        "condition_texture": 12.046,
+        "sample_texture": 11.462,
+        "decode_latents": 2.368
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "glb_header_valid": true,
+      "total_seconds": 147.11,
+      "pipeline_seconds": 73.94,
+      "glb_export_seconds": 9.6,
+      "peak_allocated_gib": 13.02,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_worldmap.json",
+      "trimesh_scene_mesh_count": 1,
+      "seed": 34
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/bench.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_bench.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_bench.log",
+      "exit_code": 0,
+      "wall_seconds": 221.3796332820002,
+      "glb_bytes": 5111024,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_bench.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 68.3739316329993,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 134.7833932450012,
+      "glb_export_seconds": 11.834537486000045,
+      "total_seconds": 215.00765752299958,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.774306565999723
+        ],
+        "get_cond": [
+          1.5451146879986482,
+          3.3043537070007005
+        ],
+        "sample_sparse_structure": [
+          14.748594249000234
+        ],
+        "sample_shape_slat_cascade": [
+          48.60110550900026
+        ],
+        "sample_tex_slat": [
+          27.58875871500095
+        ],
+        "decode_latent": [
+          36.21611087399833
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_bench.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/desk_scene.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_desk_scene.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_desk_scene.log",
+      "exit_code": 0,
+      "wall_seconds": 200.8028705509987,
+      "glb_bytes": 5189156,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_desk_scene.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.8885516600003,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 123.53663249999954,
+      "glb_export_seconds": 9.094419315999403,
+      "total_seconds": 194.53356003200133,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7873547569997754
+        ],
+        "get_cond": [
+          2.4241809699997248,
+          3.305349051999656
+        ],
+        "sample_sparse_structure": [
+          14.505460009999297
+        ],
+        "sample_shape_slat_cascade": [
+          65.77092843199898
+        ],
+        "sample_tex_slat": [
+          31.304952258000412
+        ],
+        "decode_latent": [
+          3.433722772000692
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_desk_scene.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/drawer.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_drawer.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_drawer.log",
+      "exit_code": 0,
+      "wall_seconds": 192.29142529899946,
+      "glb_bytes": 4749028,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_drawer.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.267170683000586,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 116.06041770999946,
+      "glb_export_seconds": 9.660701962999156,
+      "total_seconds": 187.00041906200022,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7495284380001976
+        ],
+        "get_cond": [
+          1.54270065899982,
+          3.2977178170003754
+        ],
+        "sample_sparse_structure": [
+          14.45813628400174
+        ],
+        "sample_shape_slat_cascade": [
+          62.03247855900008
+        ],
+        "sample_tex_slat": [
+          29.397299041000224
+        ],
+        "decode_latent": [
+          2.580715562000478
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_drawer.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/library.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_library.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_library.log",
+      "exit_code": 0,
+      "wall_seconds": 133.83951596599945,
+      "glb_bytes": 5406404,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_library.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.219969805999426,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 62.388195010000345,
+      "glb_export_seconds": 4.960717001000376,
+      "total_seconds": 128.57980278799914,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7691628090015
+        ],
+        "get_cond": [
+          1.5067274310003995,
+          3.364494024999658
+        ],
+        "sample_sparse_structure": [
+          14.473766903000069
+        ],
+        "sample_shape_slat_cascade": [
+          33.130757306000305
+        ],
+        "sample_tex_slat": [
+          5.886532193000676
+        ],
+        "decode_latent": [
+          1.2550728999995044
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_library.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/mirror.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_mirror.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_mirror.log",
+      "exit_code": 0,
+      "wall_seconds": 133.46599252799933,
+      "glb_bytes": 5451408,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_mirror.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.18610147999971,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 54.27486286400017,
+      "glb_export_seconds": 12.429135895999934,
+      "total_seconds": 127.90114919000007,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.752008286999626
+        ],
+        "get_cond": [
+          1.5137227399991389,
+          3.307641341998533
+        ],
+        "sample_sparse_structure": [
+          14.452048660999935
+        ],
+        "sample_shape_slat_cascade": [
+          21.64252467299957
+        ],
+        "sample_tex_slat": [
+          8.981042238001464
+        ],
+        "decode_latent": [
+          1.6235301830001845
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_mirror.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/person.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_person.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_person.log",
+      "exit_code": 0,
+      "wall_seconds": 187.4286806199998,
+      "glb_bytes": 4661028,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_person.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.51512845900106,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 110.5132091760006,
+      "glb_export_seconds": 10.179150417001438,
+      "total_seconds": 182.2195299219984,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7890103089994227
+        ],
+        "get_cond": [
+          1.5164695479998045,
+          3.2852039629997307
+        ],
+        "sample_sparse_structure": [
+          14.598478159001388
+        ],
+        "sample_shape_slat_cascade": [
+          58.11148731200046
+        ],
+        "sample_tex_slat": [
+          27.406043581999256
+        ],
+        "decode_latent": [
+          2.8039071840012184
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_person.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/punchingbag.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_punchingbag.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_punchingbag.log",
+      "exit_code": 0,
+      "wall_seconds": 119.89223965000019,
+      "glb_bytes": 5202552,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_punchingbag.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.62145281000085,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 45.80412985000112,
+      "glb_export_seconds": 7.220649883001897,
+      "total_seconds": 114.65727625899854,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7762429639988113
+        ],
+        "get_cond": [
+          1.5193937509993702,
+          3.3707567609999387
+        ],
+        "sample_sparse_structure": [
+          14.606616324001152
+        ],
+        "sample_shape_slat_cascade": [
+          16.05298057800246
+        ],
+        "sample_tex_slat": [
+          6.16499707299954
+        ],
+        "decode_latent": [
+          1.3113842050006497
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_punchingbag.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/puzzle.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_puzzle.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_puzzle.log",
+      "exit_code": 0,
+      "wall_seconds": 169.86517474500215,
+      "glb_bytes": 5146644,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_puzzle.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.45199334100107,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 62.50420464400304,
+      "glb_export_seconds": 40.69072961100028,
+      "total_seconds": 164.65859619000184,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7919651809970674
+        ],
+        "get_cond": [
+          1.51662029200088,
+          3.2967779179998615
+        ],
+        "sample_sparse_structure": [
+          14.573204778000218
+        ],
+        "sample_shape_slat_cascade": [
+          26.865623265999602
+        ],
+        "sample_tex_slat": [
+          11.598398209000152
+        ],
+        "decode_latent": [
+          1.8589518699991459
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_puzzle.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/radiator.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_radiator.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_radiator.log",
+      "exit_code": 0,
+      "wall_seconds": 164.51915178900163,
+      "glb_bytes": 5953424,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_radiator.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.580060837997735,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 87.31418814900098,
+      "glb_export_seconds": 10.352526823000517,
+      "total_seconds": 159.26018838500022,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.7717892619984923
+        ],
+        "get_cond": [
+          1.522792018000473,
+          3.2761015010000847
+        ],
+        "sample_sparse_structure": [
+          14.467836440999235
+        ],
+        "sample_shape_slat_cascade": [
+          42.28704831499999
+        ],
+        "sample_tex_slat": [
+          20.146521102000406
+        ],
+        "decode_latent": [
+          2.8397840799989353
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_radiator.json",
+      "trimesh_scene_mesh_count": 1
+    },
+    {
+      "model": "trellis2",
+      "image": "/home/monday/Desktop/3DGen/images/worldmap.jpg",
+      "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_worldmap.glb",
+      "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_worldmap.log",
+      "exit_code": 0,
+      "wall_seconds": 130.59451874300066,
+      "glb_bytes": 5835984,
+      "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_worldmap.glb",
+      "gpu": "AMD Radeon RX 9060 XT",
+      "hip": "7.0.51831",
+      "seed": 34,
+      "pipeline_type": "1024_cascade",
+      "resolution": 1024,
+      "low_vram": true,
+      "model_load_seconds": 61.13753428099881,
+      "gpu_resident_setup_seconds": 0.0,
+      "inference_seconds": 47.53136906800137,
+      "glb_export_seconds": 16.684130728997843,
+      "total_seconds": 125.36449604199879,
+      "peak_allocated_gib": 4.762181282043457,
+      "steps_seconds": {
+        "preprocess_image": [
+          2.781549243001791
+        ],
+        "get_cond": [
+          1.5300878080015536,
+          3.2798888060024183
+        ],
+        "sample_sparse_structure": [
+          14.536261466000724
+        ],
+        "sample_shape_slat_cascade": [
+          17.166299325999717
+        ],
+        "sample_tex_slat": [
+          6.63909027399859
+        ],
+        "decode_latent": [
+          1.5968823410003097
+        ]
+      },
+      "config": {
+        "seed": 34,
+        "resolution": 1024,
+        "steps": 12,
+        "max_num_tokens": 49152,
+        "decimation_target": 150000,
+        "texture_size": 1024,
+        "low_vram": true,
+        "pipeline_type": "1024_cascade"
+      },
+      "checkpoint": "microsoft/TRELLIS.2-4B",
+      "glb_header_valid": true,
+      "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_worldmap.json",
+      "trimesh_scene_mesh_count": 1
+    }
+  ],
+  "started_at": "2026-10-08T11:38:41+0200",
+  "finished_at": "2026-10-08T12:36:38+0200",
+  "successful_glb_count": 20,
+  "failed_runs": []
+}

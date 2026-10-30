@@ -745,6 +745,7 @@ def absorb_enclosed_patches(
     active_classes: List[int],
     max_patch_size: int = 1500,
     encirclement_ratio_thresh: float = 0.70,
+    tri_centroids: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, int]:
     """
     Absorbs enclosed patches (< max_patch_size triangles) into their enclosing host class
@@ -776,50 +777,64 @@ def absorb_enclosed_patches(
         n_comp, comp_ids = csgraph.connected_components(sub_adj, directed=False)
         comp_sizes = np.bincount(comp_ids)
 
-        small_comps = np.where(comp_sizes < max_patch_size)[0]
-        if len(small_comps) == 0:
+        is_small = comp_sizes < max_patch_size
+        if not np.any(is_small):
             continue
 
-        for comp_id in small_comps:
-            comp_tris = c_indices[comp_ids == comp_id]
-            is_p = np.zeros(num_tris, dtype=bool)
-            is_p[comp_tris] = True
+        tri_comp = np.full(num_tris, -1, dtype=np.int32)
+        small_mask = is_small[comp_ids]
+        small_tris = c_indices[small_mask]
+        tri_comp[small_tris] = comp_ids[small_mask]
 
-            b_edges = is_p[adj_u] & (~is_p[adj_v])
-            if not np.any(b_edges):
-                continue
+        edge_mask = (tri_comp[adj_u] >= 0) & (cleaned[adj_v] >= 0) & (cleaned[adj_v] != cid)
+        if not np.any(edge_mask):
+            continue
 
-            nbr_labels = cleaned[adj_v[b_edges]]
-            ext_nbrs = nbr_labels[nbr_labels != cid]
-            if len(ext_nbrs) == 0:
-                continue
+        u_comps = tri_comp[adj_u[edge_mask]]
+        v_nbrs = cleaned[adj_v[edge_mask]]
 
-            vals, cnts = np.unique(ext_nbrs, return_counts=True)
-            best_idx = cnts.argmax()
-            dominant_nbr = int(vals[best_idx])
-            dominant_frac = cnts[best_idx] / len(ext_nbrs)
+        # Compute total external boundary edges per small component
+        comp_total_ext = np.bincount(u_comps, minlength=n_comp)
 
-            if dominant_frac >= encirclement_ratio_thresh:
-                # Check orientation invariants
+        sort_k = np.lexsort((v_nbrs, u_comps))
+        u_sorted = u_comps[sort_k]
+        v_sorted = v_nbrs[sort_k]
+
+        split_mask = np.concatenate([[True], (u_sorted[:-1] != u_sorted[1:]) | (v_sorted[:-1] != v_sorted[1:])])
+        pair_u = u_sorted[split_mask]
+        pair_v = v_sorted[split_mask]
+        run_lens = np.diff(np.concatenate([np.flatnonzero(split_mask), [len(u_sorted)]]))
+
+        for pu, pv, cnt in zip(pair_u, pair_v, run_lens):
+            tot = comp_total_ext[pu]
+            if tot > 0 and (cnt / tot) >= encirclement_ratio_thresh:
+                comp_tris = c_indices[comp_ids == pu]
                 c_norms = tri_normals[comp_tris]
                 mean_ny = float(c_norms[:, 1].mean())
                 frac_vert = float((np.abs(c_norms[:, 1]) < 0.25).mean())
 
-                # Vertical surfaces cannot become floor or ceiling
-                if dominant_nbr in (14, 1) and frac_vert > 0.40:
-                    continue
-                # Downward surfaces cannot become floor
-                if dominant_nbr == 14 and mean_ny < 0.0:
-                    continue
-                # Upward surfaces cannot become ceiling
-                if dominant_nbr == 1 and mean_ny > 0.0:
-                    continue
-                # Wall is the background substrate; foreground objects mounted on walls (posters, art, shelves)
-                # must not be swallowed into the wall if they have substantial size (>= 200 triangles)
-                if dominant_nbr == 5 and cid not in (1, 14) and len(comp_tris) >= 200:
+                # Guard: Objects resting on furniture/shelves (pv not in structural) must NOT be swallowed
+                if pv not in (1, 2, 5, 12, 14) and len(comp_tris) >= 150:
                     continue
 
-                cleaned[comp_tris] = dominant_nbr
+                # Guard: Volumetric 3D objects with physical volume must not be absorbed as surface patches
+                if tri_centroids is not None:
+                    pts = tri_centroids[comp_tris]
+                    spans = pts.max(axis=0) - pts.min(axis=0)
+                    if min(spans) > 0.05 and max(spans) > 0.12:
+                        continue
+
+                # Invariants: vertical surfaces cannot become floor or ceiling
+                if pv in (2, 14, 1, 12) and frac_vert > 0.40:
+                    continue
+                if pv in (2, 14) and mean_ny < 0.0:
+                    continue
+                if pv in (1, 12) and mean_ny > 0.0:
+                    continue
+                if pv == 5 and cid not in (1, 2, 12, 14) and len(comp_tris) >= 200:
+                    continue
+
+                cleaned[comp_tris] = pv
                 total_absorbed += len(comp_tris)
 
     return cleaned, total_absorbed
@@ -988,11 +1003,12 @@ def extract_instances(
     min_instance_area: float = 0.02,
     min_instance_span: float = 0.15,
     max_proximity_merge_dist: float = 0.08,
+    supported_faces: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[int, int]]:
     """
     Performs 3D mesh instance segmentation across all active classes.
     Groups triangles of each class into spatial connected components >= min_instance_size.
-    Enforces physical size checks (area >= min_instance_area, span >= min_instance_span).
+    Triangle minimum is mandatory; evidence can bypass only area/span checks.
     Optionally unifies components of the same class within max_proximity_merge_dist.
     Returns:
       instances: Dict[inst_id, Dict[str, Any]]
@@ -1001,6 +1017,8 @@ def extract_instances(
     instances = {}
     class_instance_counts = {}
     num_tris = len(triangle_labels)
+    if supported_faces is not None and np.shape(supported_faces) != (num_tris,):
+        raise ValueError('supported_faces must match the source mesh face order')
 
     for cid in active_classes:
         c_mask = triangle_labels == cid
@@ -1026,12 +1044,10 @@ def extract_instances(
             comp_ids = np.arange(n_comp, dtype=np.int32)
 
         comp_sizes = np.bincount(comp_ids)
-        valid_comps = [c for c in np.argsort(-comp_sizes) if comp_sizes[c] >= min_instance_size]
+        valid_comps = [c for c in np.argsort(-comp_sizes)
+                       if comp_sizes[c] >= min_instance_size]
 
-        if cid == 5 and len(valid_comps) > 1:
-            # Wall is 1 continuous structural perimeter shell. Unify all components into the single primary wall instance.
-            merged_comp_tris = [np.concatenate([c_indices[comp_ids == comp_id] for comp_id in valid_comps])]
-        elif max_proximity_merge_dist > 0 and len(valid_comps) > 1:
+        if max_proximity_merge_dist > 0 and len(valid_comps) > 1:
             merged_comp_tris = merge_proximate_components(
                 valid_comps, c_indices, comp_ids, tri_centroids, max_dist=max_proximity_merge_dist
             )
@@ -1044,7 +1060,9 @@ def extract_instances(
             tot_a = float(tri_areas[p_tris].sum())
             p_cents = tri_centroids[p_tris]
             spans = p_cents.max(axis=0) - p_cents.min(axis=0) if len(p_tris) > 0 else np.zeros(3)
-            if len(p_tris) < min_instance_size or tot_a < min_instance_area or max(spans) < min_instance_span:
+            supported = (supported_faces is not None
+                         and np.count_nonzero(supported_faces[p_tris]) >= max(3, 0.75 * len(p_tris)))
+            if len(p_tris) < min_instance_size or (not supported and (tot_a < min_instance_area or max(spans) < min_instance_span)):
                 continue
             valid_merged_tris.append(p_tris)
 
@@ -1454,6 +1472,8 @@ def decompose_class_into_connected_pieces(
             piece_dict["frac_up"] = float(p_areas[p_up > 0.60].sum() / max(1e-8, tot_area))
             piece_dict["frac_down"] = float(p_areas[p_up < -0.40].sum() / max(1e-8, tot_area))
             piece_dict["frac_vert"] = float(p_areas[np.abs(p_up) < 0.25].sum() / max(1e-8, tot_area))
+            piece_dict["frac_tilted"] = float(p_areas[(p_up >= 0.819) & (p_up <= 0.996)].sum() / max(1e-8, tot_area))
+            piece_dict["norm_std"] = float(np.std(p_norms, axis=0).mean()) if len(p_norms) > 1 else 0.0
             piece_dict["h_mean"] = float(p_h.mean())
             piece_dict["h_min"] = float(p_h.min())
             piece_dict["h_max"] = float(p_h.max())
@@ -1554,6 +1574,8 @@ def analyze_class_geometry(
         frac_up = float(c_areas[c_up > 0.60].sum() / max(1e-8, tot_area))
         frac_down = float(c_areas[c_up < -0.40].sum() / max(1e-8, tot_area))
         frac_vert = float(c_areas[np.abs(c_up) < 0.25].sum() / max(1e-8, tot_area))
+        frac_tilted = float(c_areas[(c_up >= 0.819) & (c_up <= 0.996)].sum() / max(1e-8, tot_area))
+        norm_std = float(np.std(c_norms, axis=0).mean()) if len(c_norms) > 1 else 0.0
 
         c_h_min = float(c_h.min())
         c_h_max = float(c_h.max())
@@ -1571,6 +1593,7 @@ def analyze_class_geometry(
         horiz_span_1 = float(spans_3d[horiz_axes[0]])
         horiz_span_2 = float(spans_3d[horiz_axes[1]])
         horiz_extent = max(horiz_span_1, horiz_span_2)
+        norm_horiz_std = float(np.std(c_norms[:, horiz_axes], axis=0).mean()) if len(c_norms) > 1 else 0.0
 
         pieces = decompose_class_into_connected_pieces(
             class_tri_indices=c_indices,
@@ -1650,6 +1673,9 @@ def analyze_class_geometry(
             "frac_up": frac_up,
             "frac_down": frac_down,
             "frac_vert": frac_vert,
+            "frac_tilted": frac_tilted,
+            "norm_std": norm_std,
+            "norm_horiz_std": norm_horiz_std,
             "h_min": c_h_min,
             "h_max": c_h_max,
             "h_span": c_h_span,
@@ -1682,11 +1708,6 @@ def classify_structural_classes(
     - 'floor' (structural floor slabs, with floor_level: 0, 1, ...)
     - 'ceiling' (overhead downward surfaces)
     - 'wall' (massive structural vertical boundaries)
-    - 'wall_sottoscala' (under-stair/mezzanine tilted architectural enclosure)
-    - 'door' (architectural doorway portals)
-    - 'wall_fixture' (posters, boards, wall-mounted planar items)
-    - 'furniture_horizontal' (beds, desks, tables)
-    - 'furniture_vertical' (wardrobes, cabinets, shelves)
     - 'stairs' (circulation stepped flights)
     - 'object' (props)
     """
@@ -1713,6 +1734,9 @@ def classify_structural_classes(
 
     classifications = {}
 
+    up_ax = int(scene_bands.get("up_axis_index", 1))
+    horiz_axes = [i for i in range(3) if i != up_ax]
+
     for cid, f in class_features.items():
         role = "object"
         confidence = 0.70
@@ -1736,19 +1760,19 @@ def classify_structural_classes(
             sim_to_wall = float(np.dot(canonical_embs[cid], canonical_embs[primary_wall_id]))
 
         # --- A. CEILING & SOTTOSCALA ---
-        if f_dn >= 0.40 and h_m >= h_ceiling_band:
+        if f_dn >= 0.40 and (h_m >= (h_ceiling_band - 0.40) or f.get("h_max", h_m) >= h_ceiling_band or h_m >= (h_min + 0.60 * scene_bands.get("h_scene", 3.0))):
             role = "ceiling"
             confidence = min(0.98, 0.70 + 0.30 * f_dn)
-            details = f"Overhead downward plane ({f_dn*100:.1f}%) at ceiling band ({h_m:.2f}m >= {h_ceiling_band:.2f}m)"
+            details = f"Overhead downward plane ({f_dn*100:.1f}%) at ceiling zone ({h_m:.2f}m)"
 
         # --- A2. ELEVATED HORIZONTAL SHELVES (Top & Bottom Faces) ---
         elif f_up >= 0.20 and f_dn >= 0.20 and tot_a <= 4.0:
-            role = "furniture_horizontal"
+            role = "object"
             confidence = 0.88
             details = f"Elevated horizontal shelving/surface (h_mean={h_m:.2f}m, area={tot_a:.2f}m2)"
 
         # --- A3. SOTTOSCALA (Tilted under-stair architectural enclosure, downward only) ---
-        elif f_dn >= 0.30 and f_up < 0.15 and h_m < h_ceiling_band and tot_a >= 1.0:
+        elif f_dn >= 0.30 and f_up < 0.15 and h_m < (h_ceiling_band - 0.40) and tot_a >= 1.0:
             role = "wall_sottoscala"
             confidence = 0.90
             details = f"Tilted architectural under-stair/mezzanine enclosure below ceiling band (area={tot_a:.2f}m2, h={h_m:.2f}m)"
@@ -1759,10 +1783,27 @@ def classify_structural_classes(
             confidence = 0.92
             details = f"Circulation stair flight ({stair_m.get('step_peaks', 0)} steps, span={h_sp:.2f}m, run={stair_m.get('total_run', 0.0):.2f}m)"
 
+        # --- B2. RAMPS (Straight, clearly delimited linear tilted floor plane connecting elevations) ---
+        elif (
+            cid != primary_floor_id
+            and (
+                f.get("frac_tilted", 0.0) >= 0.50
+                or (0.85 <= abs(f.get("plane_eq", [0, 1, 0, 0])[up_ax]) <= 0.985 and f_vt < 0.35)
+            )
+            and f.get("norm_std", 1.0) <= 0.10
+            and f.get("plane_rmse", 1.0) <= 0.025
+            and f.get("inlier_ratio", 0.0) >= 0.85
+            and (0.10 <= h_sp <= 1.50)
+            and tot_a >= 0.35
+        ):
+            role = "ramps"
+            confidence = 0.94
+            details = f"Straight linear floor ramp connecting elevations (span={h_sp:.2f}m, rmse={f.get('plane_rmse', 0.0):.3f}m, area={tot_a:.2f}m2)"
+
         # --- C. STRUCTURAL FLOOR vs ELEVATED HORIZONTAL FURNITURE ---
         elif f_up >= 0.55:
             delta_h_base = h_m - floor_base_h
-            is_ground_floor = (cid == primary_floor_id) or (tot_a >= 3.0 and delta_h_base <= 0.25)
+            is_ground_floor = (cid == primary_floor_id) or (tot_a >= 4.0 and delta_h_base <= 0.15)
             is_upper_floor = (tot_a >= 5.0 and delta_h_base >= 1.80)
 
             if is_ground_floor or is_upper_floor:
@@ -1770,18 +1811,36 @@ def classify_structural_classes(
                 confidence = 0.98
                 details = f"Structural floor slab ({tot_a:.2f}m2, extent={horiz_ext:.2f}m)"
             else:
-                role = "furniture_horizontal"
+                role = "object"
                 confidence = 0.88
                 details = f"Elevated horizontal furniture/surface (h_mean={h_m:.2f}m, elevated {delta_h_base:.2f}m above floor base)"
 
-        # --- D. VERTICAL ELEMENTS: WALL, DOOR, FIXTURE, CABINET ---
-        elif f_vt >= 0.55:
+        # --- D. VERTICAL ELEMENTS: COLUMN, WALL, DOOR, FIXTURE, CABINET ---
+        elif f_vt >= 0.50:
+            max_horiz_span = max(spans[horiz_axes[0]], spans[horiz_axes[1]])
+            reaches_floor = (h_lo - floor_base_h) <= 0.35
+            reaches_ceiling = (f.get("h_max", h_m) >= (h_ceiling_band - 0.40))
+            spans_most_height = (h_sp >= 1.80) or (h_sp / max(0.1, h_ceiling_band - floor_base_h) >= 0.70)
+            is_column = (
+                (cid != primary_wall_id)
+                and max_horiz_span <= 0.85
+                and tot_a <= 8.0
+                and reaches_floor
+                and reaches_ceiling
+                and spans_most_height
+                and f.get("norm_horiz_std", 0.0) >= 0.15
+            )
+
             is_door_geom = (1.80 <= h_sp <= 2.50) and (min(spans[0], spans[2]) <= 0.60) and (max(spans[0], spans[2]) <= 1.40) and ((h_lo - floor_base_h) <= 0.25) and (tot_a <= 3.0)
             is_true_wall = (cid == primary_wall_id) or (tot_a >= 8.0 and h_sp >= 2.0 and horiz_ext >= 2.5)
             is_wall_fixture = (canonical_embs is not None and sim_to_wall < 0.50 and tot_a <= 4.0 and (h_lo - floor_base_h) >= 0.30) or (canonical_embs is not None and sim_to_wall < 0.40 and tot_a <= 4.5)
             is_cabinet = tot_a >= 2.0 or (h_sp >= 1.5 and max(spans[0], spans[2]) >= 1.0)
 
-            if is_true_wall:
+            if is_column:
+                role = "columns"
+                confidence = 0.95
+                details = f"Narrow isolated structural column/pillar from floor to ceiling (span={h_sp:.2f}m, footprint={max_horiz_span:.2f}m)"
+            elif is_true_wall:
                 role = "wall"
                 confidence = 0.98
                 details = f"Massive structural wall ({tot_a:.2f}m2, span={h_sp:.2f}m)"
@@ -1819,12 +1878,27 @@ def classify_structural_classes(
             p_f_dn = p.get("frac_down", 0.0)
             p_f_vt = p.get("frac_vert", 0.0)
             p_h = p.get("h_mean", h_m)
+            p_spans = p.get("spans", [0.0, 0.0, 0.0])
 
             p_role = "object"
             if p_f_dn >= 0.35 and p_h >= h_ceiling_band:
                 p_role = "ceiling"
             elif p_f_dn >= 0.30 and p_h < h_ceiling_band and p_area >= 0.5:
                 p_role = "wall_sottoscala"
+            elif (
+                p_f_vt >= 0.50
+                and max(p_spans[horiz_axes[0]], p_spans[horiz_axes[1]]) <= 0.85
+                and (p.get("h_min", p_h) - floor_base_h) <= 0.35
+                and p.get("h_max", p_h) >= (h_ceiling_band - 0.40)
+                and p.get("h_span", 0.0) >= 1.80
+            ):
+                p_role = "columns"
+            elif (
+                p.get("frac_tilted", 0.0) >= 0.50
+                and p.get("norm_std", 1.0) <= 0.12
+                and (0.06 <= p.get("h_span", 0.0) <= 1.50)
+            ):
+                p_role = "ramps"
             elif p_f_up >= 0.55:
                 p_role = "floor" if (p_area >= 1.5 or (p.get("h_min", p_h) - floor_base_h) <= 0.25) else "furniture_horizontal"
             elif p_f_vt >= 0.60:
@@ -1890,6 +1964,29 @@ def classify_structural_classes(
             if touches_wall:
                 c["confidence"] = 0.95
                 c["details"] += " (contiguous with adjacent wall/ceiling)"
+
+    # Keep a compact public vocabulary; detailed geometric rules remain internal.
+    public_role = {
+        "wall_sottoscala": "wall",
+        "door": "object",
+        "wall_fixture": "object",
+        "furniture_horizontal": "object",
+        "furniture_vertical": "object",
+        "column": "columns",
+        "columns": "columns",
+        "ramp": "ramps",
+        "ramps": "ramps",
+    }
+    for c in classifications.values():
+        old_role = c["structural_role"]
+        c["structural_role"] = public_role.get(old_role, old_role)
+        for piece in c.get("piece_breakdown", []):
+            piece["role"] = public_role.get(piece["role"], piece["role"])
+        c.pop("sottoscala_subcomponent", None)
+        if old_role == "wall_sottoscala":
+            c["details"] = "Tilted structural wall/enclosure below the ceiling band"
+        elif old_role in {"door", "wall_fixture", "furniture_horizontal", "furniture_vertical"}:
+            c["details"] = "Non-structural object"
 
     return classifications
 
@@ -2071,13 +2168,10 @@ def export_structural_manifest(
             "num_classes_evaluated": len(classifications),
             "floors": [cid for cid, c in classifications.items() if c["structural_role"] == "floor"],
             "ceilings": [cid for cid, c in classifications.items() if c["structural_role"] == "ceiling"],
-            "walls": [cid for cid, c in classifications.items() if c["structural_role"] in ["wall", "wall_sottoscala"]],
-            "sottoscala_subcomponents": [cid for cid, c in classifications.items() if "sottoscala_subcomponent" in c],
-            "doors": [cid for cid, c in classifications.items() if c["structural_role"] == "door"],
-            "wall_fixtures": [cid for cid, c in classifications.items() if c["structural_role"] == "wall_fixture"],
+            "walls": [cid for cid, c in classifications.items() if c["structural_role"] == "wall"],
             "stairs": [cid for cid, c in classifications.items() if c["structural_role"] == "stairs"],
-            "furniture_horizontal": [cid for cid, c in classifications.items() if c["structural_role"] == "furniture_horizontal"],
-            "furniture_vertical": [cid for cid, c in classifications.items() if c["structural_role"] == "furniture_vertical"],
+            "columns": [cid for cid, c in classifications.items() if c["structural_role"] in ["columns", "column"]],
+            "ramps": [cid for cid, c in classifications.items() if c["structural_role"] in ["ramps", "ramp"]],
             "objects": [cid for cid, c in classifications.items() if c["structural_role"] == "object"],
             "total_instances_extracted": len(instances) if instances else 0,
         },
@@ -2127,12 +2221,9 @@ def export_structural_manifest(
         f"- **Floors**: {manifest_data['structural_summary']['floors']}",
         f"- **Ceilings**: {manifest_data['structural_summary']['ceilings']}",
         f"- **Walls**: {manifest_data['structural_summary']['walls']}",
-        f"- **Doors**: {manifest_data['structural_summary']['doors']}",
-        f"- **Wall Fixtures / Posters**: {manifest_data['structural_summary']['wall_fixtures']}",
-        f"- **Sottoscala Sub-components**: {manifest_data['structural_summary']['sottoscala_subcomponents']}",
         f"- **Stairs**: {manifest_data['structural_summary']['stairs']}",
-        f"- **Furniture (Horizontal)**: {manifest_data['structural_summary']['furniture_horizontal']}",
-        f"- **Furniture (Vertical)**: {manifest_data['structural_summary']['furniture_vertical']}",
+        f"- **Columns**: {manifest_data['structural_summary']['columns']}",
+        f"- **Ramps**: {manifest_data['structural_summary']['ramps']}",
         f"- **Objects / Props**: {manifest_data['structural_summary']['objects']}\n",
         "## Detailed Class Table\n",
         "| Class ID | Role | Conf | Area (m²) | Instances | Frac Up | Frac Down | Frac Vert | H Mean (m) | Details |",
@@ -2163,10 +2254,12 @@ def export_structural_manifest(
                 "Frac Up", "Frac Down", "Frac Vert", "H Mean (m)", "H Span (m)"
             ])
             for iid, inst in sorted(instances.items(), key=lambda x: (x[1]["class_id"], -x[1]["triangle_count"])):
+                cid = inst["class_id"]
+                assigned_role = inst.get("assigned_role") or classifications.get(cid, {}).get("structural_role", "object")
                 writer.writerow([
                     inst["instance_id"],
-                    inst["class_id"],
-                    inst["assigned_role"],
+                    cid,
+                    assigned_role,
                     inst["triangle_count"],
                     inst["area_m2"],
                     inst["bounds_min"][0], inst["bounds_min"][1], inst["bounds_min"][2],
@@ -2200,9 +2293,11 @@ def export_structural_manifest(
         top_insts = [inst for inst in instances.values() if inst["area_m2"] >= 0.20]
         top_insts.sort(key=lambda x: -x["area_m2"])
         for inst in top_insts[:100]:
+            cid = inst["class_id"]
+            assigned_role = inst.get("assigned_role") or classifications.get(cid, {}).get("structural_role", "object")
             spans_str = f"[{inst['spans'][0]:.2f}, {inst['spans'][1]:.2f}, {inst['spans'][2]:.2f}]"
             inst_lines.append(
-                f"| `{inst['instance_id']}` | **#{inst['class_id']}** | `{inst['assigned_role']}` | "
+                f"| `{inst['instance_id']}` | **#{cid}** | `{assigned_role}` | "
                 f"{inst['triangle_count']} | {inst['area_m2']:.2f} | {spans_str} | {inst['h_mean']:.2f} |"
             )
 
@@ -2414,7 +2509,7 @@ def main():
     # Load scene_size and canonical embeddings if available
     scene_size_file = args.scene_size_path
     if scene_size_file is None:
-        candidate_sz = args.mesh_path.parents[1] / "01_poses_refinment/scene_size.txt"
+        candidate_sz = args.mesh_path.parents[1] / "depth/scene_size.txt"
         if candidate_sz.is_file():
             scene_size_file = candidate_sz
     scene_info = read_scene_sizes(scene_size_file)
@@ -2471,13 +2566,9 @@ def main():
     for inst in instances.values():
         cid = inst["class_id"]
         c_role = classifications.get(cid, {}).get("structural_role", "object")
-        # Specialize if sottoscala sub-component
-        if c_role == "ceiling" and inst["h_mean"] < scene_bands["h_ceiling_band"] and inst["frac_down"] >= 0.30:
-            inst["assigned_role"] = "wall_sottoscala"
-        elif c_role == "floor":
-            inst["assigned_role"] = f"floor_level_{0 if (inst['h_mean'] - scene_bands['h_min']) <= 0.6 else 1}"
-        else:
-            inst["assigned_role"] = c_role
+        inst["assigned_role"] = c_role
+        if c_role == "floor":
+            inst["floor_level"] = 0 if (inst["h_mean"] - scene_bands["h_min"]) <= 0.6 else 1
 
     print(f"  Extracted {len(instances)} instances across {len(active_classes)} classes in {time.perf_counter() - t0_inst:.2f}s.")
 

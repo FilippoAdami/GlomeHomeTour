@@ -265,13 +265,13 @@ class KeyframeSelector(
         val yCoords = centers.map { it[1] }.sorted()
         val pLoY = yCoords[(yCoords.size * 0.01).toInt()]
 
-        // Floor count using 2.8m rise and 15 points threshold
+        // Match backend floor estimation: 2.8m rise and at least 10 poses.
         var floorCount = 1
         var floorNum = 2
-        while (true) {
+        while (floorNum < 20) {
             val thresh = 2.8f * (floorNum - 1) + 0.2f
             val countAbove = centers.count { (it[1] - pLoY) > thresh }
-            if (countAbove > 15) {
+            if (countAbove >= 10) {
                 floorCount = floorNum
                 floorNum++
             } else {

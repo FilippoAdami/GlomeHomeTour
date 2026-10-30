@@ -79,6 +79,7 @@ class CameraPipeline(
      */
     @Volatile var autoWhiteBalance: Boolean = true
         set(value) {
+            if (field == value) return
             field = value
             applyRepeatingRequest()
         }
@@ -90,24 +91,38 @@ class CameraPipeline(
     @Volatile var latestAwbTransform: ColorSpaceTransform? = null
         private set
 
+    @Volatile private var _isoSensitivity: Int = DEFAULT_ISO
     /** Manual ISO, metered from ambient light during pre-flight (README §4/§6) and then left
      * alone once scanning starts. Jointly tuned with `shutterNanos` against a shared tradeoff
      * curve (grain vs. motion blur) -- see `CaptureActivity.meteredExposure()`. */
-    @Volatile var isoSensitivity: Int = DEFAULT_ISO
+    var isoSensitivity: Int
+        get() = _isoSensitivity
         set(value) {
-            field = value
+            if (_isoSensitivity == value) return
+            _isoSensitivity = value
             applyRepeatingRequest()
         }
 
+    @Volatile private var _shutterNanos: Long = FASTEST_SHUTTER_NS
     /** Manual shutter (`SENSOR_EXPOSURE_TIME`), metered alongside ISO. README §4: ranges from
      * `FASTEST_SHUTTER_NS` (1/500s, outdoor/bright, minimal motion blur) down to
      * `SLOWEST_SHUTTER_NS` (1/50s, dim indoor rooms, admits more light without pushing ISO into
      * visible grain). Left alone once scanning starts, same as ISO. */
-    @Volatile var shutterNanos: Long = FASTEST_SHUTTER_NS
+    var shutterNanos: Long
+        get() = _shutterNanos
         set(value) {
-            field = value
+            if (_shutterNanos == value) return
+            _shutterNanos = value
             applyRepeatingRequest()
         }
+
+    /** Atomically update ISO and shutter time together with at most one repeating request update. */
+    fun setExposure(iso: Int, shutterNs: Long) {
+        if (_isoSensitivity == iso && _shutterNanos == shutterNs) return
+        _isoSensitivity = iso
+        _shutterNanos = shutterNs
+        applyRepeatingRequest()
+    }
 
     /** Opens the shared Camera2 device and starts a single manual capture session covering both
      * ARCore's required surfaces and any extra surfaces the caller wants frames from. Call once

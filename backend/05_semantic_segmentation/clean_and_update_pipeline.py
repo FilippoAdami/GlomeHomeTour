@@ -11,6 +11,7 @@ Updates:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import time
@@ -19,6 +20,8 @@ import numpy as np
 import open3d as o3d
 import scipy.sparse as sp
 from scipy.sparse import csgraph
+
+import scene_inputs
 
 from detect_structural_classes import (
     build_mesh_dual_graph,
@@ -111,13 +114,28 @@ def absorb_disconnected_wall_crumbs(
     return cleaned
 
 
-def main():
-    mesh_path = Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply")
-    raw_labels_path = Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/triangle_class_labels_raw.npy")
-    labels_path = Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/triangle_class_labels.npy")
-    struct_json_path = Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/structural_classes.json")
-    instances_csv_path = Path("backend/current_scene/06c_semantic_segmentation/step3_structural_detection/instances_summary.csv")
-    per_class_dir = Path("backend/current_scene/06c_semantic_segmentation/per_class_meshes")
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Micro-island cleanup and boundary update")
+    parser.add_argument("--workspace", type=Path, default=scene_inputs.DEFAULT_WORKSPACE)
+    parser.add_argument("--mesh-path", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    args = parser.parse_args(argv)
+
+    scan = scene_inputs.resolve_scene(args.workspace)
+    stage_out = scene_inputs.resolve_stage_output(scan)
+    out_dir = args.output_dir or stage_out
+
+    if args.mesh_path:
+        mesh_path = args.mesh_path
+    else:
+        candidate_refined = stage_out / "mesh_projected_refined.ply"
+        mesh_path = candidate_refined if candidate_refined.is_file() else scene_inputs.resolve_mesh(scan)
+
+    raw_labels_path = stage_out / "triangle_class_labels_raw.npy"
+    labels_path = stage_out / "triangle_class_labels.npy"
+    struct_json_path = stage_out / "structural_classes.json"
+    instances_csv_path = stage_out / "instances_summary.csv"
+    per_class_dir = stage_out / "per_class_meshes"
 
     print(f"Loading mesh: {mesh_path}...")
     t0 = time.perf_counter()
@@ -162,8 +180,8 @@ def main():
 
     # Pass 2: Geometric & Photometric Boundary Refinement (Structural Planes & Texture-Gated Absorption)
     print("\nPass 2: Geometric & Photometric Boundary Refinement (Creases, Planes & Universal Texture Snapping)...")
-    clean_mesh_path = Path("backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply")
-    contention_mesh_path = Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_contention.ply")
+    clean_mesh_path = Path("backend/current_scene/scan_0/mesh.ply")
+    contention_mesh_path = Path("backend/current_scene/05_semantic_segmentation/step2_mesh_projection/mesh_projected_contention.ply")
     cleaned_labels, absorbed_cids, reclaimed_stats = refine_all_boundaries(
         mesh_path=mesh_path,
         clean_mesh_path=clean_mesh_path,
@@ -336,7 +354,7 @@ def main():
     print(f"Extracted {len(instances):,} valid instances across {len(active_classes)} classes.")
 
     # Re-extract geometric features & classifications
-    scene_size_file = Path("backend/current_scene/01_poses_refinment/scene_size.txt")
+    scene_size_file = Path("backend/current_scene/scan_0/depth/scene_size.txt")
     scene_info = read_scene_sizes(scene_size_file if scene_size_file.is_file() else None)
     emb_file = Path("backend/current_scene/canonical_class_embeddings.npz")
     canonical_embs = load_canonical_dino_embeddings(emb_file if emb_file.is_file() else None, active_classes)
@@ -359,11 +377,7 @@ def main():
 
     for inst in instances.values():
         cid = inst["class_id"]
-        c_role = classifications.get(cid, {}).get("structural_role", "object")
-        if c_role == "ceiling" and inst["h_mean"] < scene_bands["h_ceiling_band"] and inst["frac_down"] >= 0.30:
-            inst["assigned_role"] = "wall_sottoscala"
-        else:
-            inst["assigned_role"] = c_role
+        inst["assigned_role"] = classifications.get(cid, {}).get("structural_role", "object")
 
     # Export updated manifests and instances summary
     step3_dir = struct_json_path.parent

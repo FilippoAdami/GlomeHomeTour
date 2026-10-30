@@ -5,7 +5,7 @@ import numpy as np
 import open3d as o3d
 from scipy.sparse import csr_matrix
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'06c_semantic_segmentation'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'05_semantic_segmentation'))
 from wall_orientation_refinement import refine_wall_orientations
 
 

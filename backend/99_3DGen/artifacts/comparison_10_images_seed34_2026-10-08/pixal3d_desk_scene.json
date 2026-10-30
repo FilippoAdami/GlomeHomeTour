@@ -1,0 +1,42 @@
+{
+  "model": "pixal3d",
+  "image": "desk_scene.jpg",
+  "glb": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.glb",
+  "log": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.log",
+  "exit_code": 0,
+  "wall_seconds": 203.72111244000007,
+  "glb_bytes": 5445308,
+  "steps_seconds": {
+    "pixal_model_init": 56.153,
+    "image_preprocess": 2.853,
+    "moge_model_load": 4.068,
+    "moge_camera_estimate": 2.544,
+    "condition_sparse_structure": 2.236,
+    "sample_sparse_structure": 13.908,
+    "condition_shape_lr": 2.925,
+    "sample_shape_lr": 7.716,
+    "upsample_shape_coords": 0.995,
+    "condition_shape_hr": 5.771,
+    "sample_shape_hr": 45.493,
+    "condition_texture": 11.966,
+    "sample_texture": 25.661,
+    "decode_latents": 3.141
+  },
+  "config": {
+    "seed": 34,
+    "resolution": 1024,
+    "steps": 12,
+    "max_num_tokens": 49152,
+    "decimation_target": 150000,
+    "texture_size": 1024,
+    "low_vram": true,
+    "pipeline_type": "1024_cascade"
+  },
+  "glb_header_valid": true,
+  "total_seconds": 197.1,
+  "pipeline_seconds": 119.84,
+  "glb_export_seconds": 11.21,
+  "peak_allocated_gib": 13.03,
+  "metrics_path": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/pixal3d_desk_scene.json",
+  "seed": 34
+}

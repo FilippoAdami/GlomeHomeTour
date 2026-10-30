@@ -49,7 +49,7 @@ object ThumbnailFetcher {
             ZipInputStream(bytes.inputStream()).use { zis ->
                 var entry = zis.nextEntry
                 while (entry != null) {
-                    if (!entry.isDirectory && entry.name.startsWith("images/") && entry.name.endsWith(".jpg")) {
+                    if (!entry.isDirectory && (entry.name.startsWith("images/") || entry.name.contains("/images/")) && entry.name.endsWith(".jpg")) {
                         val options = BitmapFactory.Options().apply { inSampleSize = 8 }
                         return BitmapFactory.decodeStream(zis, null, options)
                     }

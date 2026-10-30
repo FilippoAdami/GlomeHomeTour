@@ -32,7 +32,8 @@ import matplotlib.colors as mcolors
 
 backend_dir = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(backend_dir / "03_FastGS_DNSplatter"))
-from gsplat_train import load_cameras
+from scene_inputs import (DEFAULT_WORKSPACE, load_mesh_transform, load_scene_cameras,
+                          resolve_mesh, resolve_scene, resolve_stage_output)
 
 def get_class_color(mid: int):
     """Deterministic color matching 2D overlays in run_full_scene_pipeline.py."""
@@ -96,8 +97,10 @@ def build_mesh_dual_graph(triangles_np: np.ndarray, normals_tensor: torch.Tensor
 
 def main():
     parser = argparse.ArgumentParser(description="Step 2: Geometry & Scale-Aware Dispute Resolution")
-    parser.add_argument("--workspace", type=Path, default=backend_dir / "current_scene")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
     parser.add_argument("--mesh-path", type=Path, default=None)
+    parser.add_argument("--transform-path", type=Path, default=None,
+                        help="explicit rigid mesh-to-camera transform; defaults to identity")
     parser.add_argument("--step1-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--alpha", type=float, default=0.0, help="Scale damping exponent (0.0 = original confidence & occurrences)")
@@ -105,13 +108,13 @@ def main():
     parser.add_argument("--iterations", type=int, default=15, help="Graph smoothing relaxation iterations")
     args = parser.parse_args()
 
-    workspace = args.workspace
-    mesh_path = args.mesh_path or (workspace / "06c_semantic_segmentation/inputs/mesh.ply")
-    t_path = workspace / "06c_semantic_segmentation/inputs/T_mesh_to_raw.npy"
-    npz_dir = workspace / "06c_semantic_segmentation/full362_final_pipeline/npz_data"
-    step1_dir = args.step1_dir or (workspace / "06c_semantic_segmentation/mesh_projection_step1")
-    summary_path = workspace / "06c_semantic_segmentation/full362_final_pipeline/full_pipeline_benchmark_summary.json"
-    out_dir = args.output_dir or (workspace / "06c_semantic_segmentation/mesh_dispute_resolution_step2")
+    workspace = resolve_scene(args.workspace)
+    stage = resolve_stage_output(workspace, create=False)
+    mesh_path = resolve_mesh(workspace, args.mesh_path)
+    T_mesh_to_raw = load_mesh_transform(args.transform_path)
+    step1_dir = args.step1_dir or stage / "mesh_projection_step1"
+    summary_path = stage / "panoptic_data/full_pipeline_benchmark_summary.json"
+    out_dir = args.output_dir or resolve_stage_output(workspace, "mesh_dispute_resolution_step2")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=================================================================", flush=True)
@@ -477,6 +480,9 @@ def main():
     step2_mesh_path = out_dir / "mesh_dispute_resolved.ply"
     o3d.io.write_triangle_mesh(str(step2_mesh_path), mesh_colored)
     print(f"Exported Step 2 mesh: {step2_mesh_path} ({step2_mesh_path.stat().st_size / 1e6:.1f} MB)", flush=True)
+    labels_path = out_dir / "triangle_labels.npz"
+    np.savez_compressed(labels_path, triangle_labels=final_win_cid)
+    print(f"Exported exact per-triangle labels: {labels_path}", flush=True)
 
     # 12. Save Comparison JSON
     comparison_summary = {
@@ -499,7 +505,6 @@ def main():
     verification_dir = out_dir / "visual_comparisons"
     verification_dir.mkdir(parents=True, exist_ok=True)
 
-    T_mesh_to_raw = np.load(t_path)
     mesh_raw = o3d.geometry.TriangleMesh()
     mesh_raw.vertices = mesh.vertices
     mesh_raw.triangles = mesh.triangles
@@ -509,7 +514,7 @@ def main():
     t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh_raw)
     scene.add_triangles(t_mesh)
 
-    all_cameras = load_cameras(workspace, resolution=1)
+    all_cameras = load_scene_cameras(workspace, resolution=1)
     num_frames = len(all_cameras)
     horse_idx = next((i for i, c in enumerate(all_cameras) if 'frame_00200' in Path(c['image_path']).name), None)
     test_indices = [0, min(90, num_frames - 1), min(180, num_frames - 1), min(270, num_frames - 1)]

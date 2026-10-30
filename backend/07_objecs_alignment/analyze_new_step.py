@@ -133,7 +133,7 @@ def analyze(input_dir, regions_dir, output_dir, max_distance=0.25):
                 "reason": "unaccepted candidate on different face topology; exact provenance to current source is unverified",
             },
             "per_class_meshes": "aggregated by class; no source face-to-instance assignment manifest is present",
-            "06c_instance_output": "no current_scene/06c_semantic_segmentation instance result is present",
+            "06c_instance_output": "no current_scene/05_semantic_segmentation instance result is present",
         },
         "instances": [],
         "reason": "No physical instance IDs aligned to this original mesh were found; proximity-only grouping would invent instance boundaries.",

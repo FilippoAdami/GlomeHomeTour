@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import open3d as o3d
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'06c_semantic_segmentation'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'05_semantic_segmentation'))
 from inspect_classes import ClassInspector,COLOR_CLAY
 
 

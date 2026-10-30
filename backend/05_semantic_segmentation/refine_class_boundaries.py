@@ -155,17 +155,44 @@ def reclaim_wall_encroached_furniture(
     tri_centroids: np.ndarray,
     wall_cid: int = 5,
     foreground_cids: List[int] | None = None,
-    **kwargs,
+    min_comp_size: int = 20,
+    min_normal_align: float = 0.70,
+    bbox_margin_m: float = 0.03,
 ) -> Tuple[np.ndarray, Dict[int, int]]:
-    """Backward compatibility wrapper delegating to reclaim_thin_wall_plates."""
-    return reclaim_thin_wall_plates(
-        labels=labels,
-        adj_u=adj_u,
-        adj_v=adj_v,
-        tri_normals=tri_normals,
-        tri_centroids=tri_centroids,
-        wall_cid=wall_cid,
-    )
+    """Reclaim bounded wall-labelled holes enclosed by a coplanar foreground part."""
+    cleaned = labels.copy()
+    wall = labels == wall_cid
+    wall_edges = wall[adj_u] & wall[adj_v]
+    graph = csr_matrix((np.ones(wall_edges.sum(), bool),
+                        (adj_u[wall_edges], adj_v[wall_edges])),
+                       shape=(len(labels), len(labels)))
+    _, components = csgraph.connected_components(graph, directed=False)
+    candidates = foreground_cids if foreground_cids is not None else np.unique(labels[~wall & (labels > 0)])
+    stats = {}
+    for cid in candidates:
+        source = np.flatnonzero(labels == cid)
+        if len(source) < min_comp_size:
+            continue
+        boundary = (labels[adj_u] == cid) & wall[adj_v]
+        for component in np.unique(components[adj_v[boundary]]):
+            faces = np.flatnonzero(wall & (components == component))
+            neighbors = (~wall[adj_v]) & np.isin(adj_u, faces)
+            if not neighbors.any() or np.any(labels[adj_v[neighbors]] != cid):
+                continue
+            points = tri_centroids[faces]
+            lower = tri_centroids[source].min(axis=0) - bbox_margin_m
+            upper = tri_centroids[source].max(axis=0) + bbox_margin_m
+            if np.any(points < lower) or np.any(points > upper):
+                continue
+            normal = tri_normals[source].mean(axis=0)
+            normal /= max(np.linalg.norm(normal), 1e-8)
+            if np.any(tri_normals[faces] @ normal < min_normal_align):
+                continue
+            if np.any(np.abs((points - tri_centroids[source].mean(axis=0)) @ normal) > bbox_margin_m):
+                continue
+            cleaned[faces] = cid
+            stats[int(cid)] = stats.get(int(cid), 0) + len(faces)
+    return cleaned, stats
 
 
 def reclaim_thin_wall_plates(
@@ -206,14 +233,17 @@ def reclaim_thin_wall_plates(
     if not np.any(cand_wall):
         return cleaned, stats
 
+    struct_arr = np.array(list(structural_cids), dtype=np.int32)
+
     # Multi-pass surface growth along smooth edges
     for it in range(max_iterations):
         is_cand = (cleaned == wall_cid) & cand_wall
         if not np.any(is_cand):
             break
 
+        is_struct = np.isin(cleaned, struct_arr)
         # Dual-graph boundary edges from foreground classes into candidate wall triangles
-        b_edges = (~is_cand[adj_u]) & (~np.isin(cleaned[adj_u], list(structural_cids))) & is_cand[adj_v]
+        b_edges = (~is_cand[adj_u]) & (~is_struct[adj_u]) & is_cand[adj_v]
         if not np.any(b_edges):
             break
 
@@ -236,10 +266,12 @@ def reclaim_thin_wall_plates(
         v_unique = v_sorted[first_occ]
         u_unique = u_sorted[first_occ]
 
-        for u_i, v_i in zip(u_unique, v_unique):
-            fg_cid = int(cleaned[u_i])
-            cleaned[v_i] = fg_cid
-            stats[fg_cid] = stats.get(fg_cid, 0) + 1
+        new_cids = cleaned[u_unique]
+        cleaned[v_unique] = new_cids
+
+        vals_c, cnts_c = np.unique(new_cids, return_counts=True)
+        for cid_val, cnt in zip(vals_c, cnts_c):
+            stats[int(cid_val)] = stats.get(int(cid_val), 0) + int(cnt)
 
     return cleaned, stats
 
@@ -291,16 +323,41 @@ def align_structural_planes(
     up_thresh = float(np.cos(np.radians(max_floor_tilt_deg)))
     up_mask = (cleaned == floor_cid) & (tri_normals[:, 1] > up_thresh)
     floor_planes = []
+    y_loft = None
     if np.any(up_mask):
-        for g_mask in [up_mask & (tri_centroids[:, 1] < 0.0), up_mask & (tri_centroids[:, 1] > 0.0)]:
-            if np.count_nonzero(g_mask) >= 1000:
-                pts = tri_centroids[g_mask]
-                A = np.column_stack([pts[:, 0], pts[:, 2], np.ones(len(pts))])
-                c, _, _, _ = np.linalg.lstsq(A, pts[:, 1], rcond=None)
-                floor_planes.append(c)
+        y_min_up = float(np.min(tri_centroids[up_mask, 1]))
+        ground_mask = up_mask & (tri_centroids[:, 1] <= y_min_up + 0.35)
+        if np.count_nonzero(ground_mask) >= 100:
+            y_ground = float(np.median(tri_centroids[ground_mask, 1]))
+        else:
+            y_ground = float(np.median(tri_centroids[up_mask, 1]))
 
-    if not floor_planes:
-        y_ground = float(np.median(tri_centroids[up_mask, 1])) if np.any(up_mask) else -1.22
+        # Fit ground plane on points strictly near y_ground (+-0.15m)
+        g_pts_mask = up_mask & (np.abs(tri_centroids[:, 1] - y_ground) <= 0.15)
+        if np.count_nonzero(g_pts_mask) >= 500:
+            pts = tri_centroids[g_pts_mask]
+            A = np.column_stack([pts[:, 0], pts[:, 2], np.ones(len(pts))])
+            c, _, _, _ = np.linalg.lstsq(A, pts[:, 1], rcond=None)
+            if np.sqrt(c[0]**2 + c[1]**2) <= 0.18:
+                floor_planes.append(c)
+            else:
+                floor_planes.append(np.array([0.0, 0.0, y_ground]))
+        else:
+            floor_planes.append(np.array([0.0, 0.0, y_ground]))
+
+        # Check for upper loft / second floor (at least 1.8m above ground)
+        loft_mask = up_mask & (tri_centroids[:, 1] >= y_ground + 1.80)
+        if np.count_nonzero(loft_mask) >= 1000:
+            pts_loft = tri_centroids[loft_mask]
+            y_loft = float(np.median(pts_loft[:, 1]))
+            A_loft = np.column_stack([pts_loft[:, 0], pts_loft[:, 2], np.ones(len(pts_loft))])
+            c_loft, _, _, _ = np.linalg.lstsq(A_loft, pts_loft[:, 1], rcond=None)
+            if np.sqrt(c_loft[0]**2 + c_loft[1]**2) <= 0.18:
+                floor_planes.append(c_loft)
+            else:
+                floor_planes.append(np.array([0.0, 0.0, y_loft]))
+    else:
+        y_ground = 0.0
         floor_planes.append(np.array([0.0, 0.0, y_ground]))
 
     # Compute distances to nearest floor plane
@@ -312,10 +369,11 @@ def align_structural_planes(
     tilt_deg = np.degrees(np.arccos(np.clip(tri_normals[:, 1], -1.0, 1.0)))
 
     # A1: Floor Leakage Reassignment
-    # Horizontal surfaces at ground floor level (Y <= -0.80 m) or loft level (0.70 <= Y <= 1.20 m)
-    # with upward tilt (tilt <= 45 deg) are PHYSICALLY FLOOR and MUST NEVER be leaked into Bed!
-    is_ground_floor_horizontal = (tri_centroids[:, 1] <= -0.80) & (tri_normals[:, 1] > up_thresh)
-    is_loft_floor_horizontal = (tri_centroids[:, 1] >= 0.70) & (tri_centroids[:, 1] <= 1.20) & (tri_normals[:, 1] > up_thresh)
+    # Horizontal surfaces at ground floor level with upward tilt are PHYSICALLY FLOOR
+    is_ground_floor_horizontal = (np.abs(tri_centroids[:, 1] - y_ground) <= 0.15) & (tri_normals[:, 1] > up_thresh)
+    is_loft_floor_horizontal = np.zeros(num_tris, dtype=bool)
+    if y_loft is not None:
+        is_loft_floor_horizontal = (np.abs(tri_centroids[:, 1] - y_loft) <= 0.15) & (tri_normals[:, 1] > up_thresh)
 
     floor_leak = (cleaned == floor_cid) & ((tilt_deg > max_floor_tilt_deg) | (floor_dists > max_floor_plane_dist_m)) & (~is_ground_floor_horizontal) & (~is_loft_floor_horizontal)
     leak_indices = np.where(floor_leak)[0]
@@ -333,11 +391,11 @@ def align_structural_planes(
         tri_comp = np.full(num_tris, -1, dtype=np.int32)
         tri_comp[leak_indices] = comp_lbls
         # Ceilings and floors cannot be vertical!
-        # Leaking floor cannot become ceiling unless downward, and can NEVER become Bed (Class 2)!
+        # Leaking floor cannot become ceiling unless downward, and can NEVER become foreground furniture!
         v_is_ceil = (cleaned[adj_v] == ceiling_cid)
         u_not_down = (tri_normals[adj_u, 1] >= -0.25)
-        v_is_bed = (cleaned[adj_v] == 2)
-        invalid_trans = (v_is_ceil & u_not_down) | v_is_bed
+        v_is_fg = (cleaned[adj_v] != wall_cid) & (cleaned[adj_v] != floor_cid)
+        invalid_trans = (v_is_ceil & u_not_down) | v_is_fg
         boundary_e = (tri_comp[adj_u] >= 0) & (cleaned[adj_v] != floor_cid) & (~m[adj_v]) & (~invalid_trans)
         if np.any(boundary_e):
             comp_u = tri_comp[adj_u[boundary_e]]
@@ -349,7 +407,7 @@ def align_structural_planes(
             pair_c = c_sorted[split_mask]
             pair_nbr = nbr_sorted[split_mask]
             run_lens = np.diff(np.concatenate([np.flatnonzero(split_mask), [len(c_sorted)]]))
-            best_nbr = np.full(n_comp, floor_cid, dtype=np.int32)
+            best_nbr = np.full(n_comp, wall_cid, dtype=np.int32)
             best_count = np.zeros(n_comp, dtype=np.int32)
             for c_id, nbr_id, count in zip(pair_c, pair_nbr, run_lens):
                 if count > best_count[c_id]:
@@ -362,24 +420,30 @@ def align_structural_planes(
                 stats["floor_leakages_reassigned"] = int(np.sum(valid_reassign_c))
                 print(f"  [Structural Align] Reassigned {np.sum(valid_reassign_c):,} floor leakage triangles to touching neighbors")
         else:
-            stats["floor_leakages_reassigned"] = 0
+            cleaned[leak_indices] = wall_cid
+            stats["floor_leakages_reassigned"] = len(leak_indices)
+            print(f"  [Structural Align] Reassigned {len(leak_indices):,} floor leakage triangles into walls")
 
     # A2: Floor Plane Reclaim (flat on floor, color match)
     is_floor = (cleaned == floor_cid)
-    floor_reclaim = (~is_floor) & (tilt_deg <= max_floor_reclaim_tilt_deg) & (floor_dists <= max_floor_reclaim_dist_m)
+    floor_reclaim = (~is_floor) & (tilt_deg <= max_floor_reclaim_tilt_deg) & (floor_dists <= max_floor_reclaim_dist_m) & is_ground_floor_horizontal
     if np.any(is_floor & (floor_dists <= max_floor_reclaim_dist_m)):
         c_mean_floor = tri_colors[is_floor & (floor_dists <= max_floor_reclaim_dist_m)].mean(axis=0)
         c_diff_floor = np.linalg.norm(tri_colors - c_mean_floor, axis=1)
-        floor_reclaim = floor_reclaim & (c_diff_floor <= max_floor_reclaim_color_diff) & (cleaned != ceiling_cid) & (cleaned != 2)
+        floor_reclaim = floor_reclaim & (c_diff_floor <= max_floor_reclaim_color_diff) & (cleaned != ceiling_cid) & (cleaned != wall_cid)
         reclaim_indices = np.where(floor_reclaim)[0]
         if len(reclaim_indices) > 0:
             cleaned[reclaim_indices] = floor_cid
             stats["floor_reclaimed"] = int(len(reclaim_indices))
             print(f"  [Structural Align] Reclaimed {len(reclaim_indices):,} flat coplanar triangles into Floor")
 
-    # B: Ceiling Non-Vertical & Low-Height Leakage Reassignment
-    # Ceilings cannot be vertical (nY >= -0.25) and cannot be near the floor (Y < min_ceiling_height_m)
-    ceil_leak = (cleaned == ceiling_cid) & ((tri_normals[:, 1] >= -0.25) | (tri_centroids[:, 1] < min_ceiling_height_m))
+    # B: Ceiling Low-Height Floor Bleed Reassignment
+    # Ceilings can have vertical sides (overhead beams and bulkheads).
+    # Ceilings only leak if located near the floor or upward-facing at ground level.
+    ceil_leak = (cleaned == ceiling_cid) & (
+        (tri_centroids[:, 1] < (y_ground + 1.20)) |
+        ((tri_centroids[:, 1] < (y_ground + 1.80)) & (tri_normals[:, 1] > 0.50))
+    )
     leak_indices_c = np.where(ceil_leak)[0]
     if len(leak_indices_c) > 0:
         inv_map = np.full(num_tris, -1, dtype=np.int32)
@@ -472,9 +536,7 @@ def align_structural_planes(
         rem_fv = (cleaned == floor_cid) & (tri_normals[:, 1] <= 0.0)
         cleaned[rem_fv] = wall_cid
 
-    # Strictly zero vertical or upward triangles on ceiling:
-    c_vert = (cleaned == ceiling_cid) & (tri_normals[:, 1] >= -0.25)
-    cleaned[c_vert] = wall_cid
+    # Ceiling membership includes beam flanks; a face normal cannot establish its role.
 
     return cleaned, stats
 
@@ -927,10 +989,10 @@ def refine_all_boundaries(
 
 def main():
     parser = argparse.ArgumentParser(description="Refine class boundaries using normals and photometric colors.")
-    parser.add_argument("--mesh", type=Path, default=Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply"))
-    parser.add_argument("--clean-mesh", type=Path, default=Path("backend/current_scene/06c_semantic_segmentation/step1_cleaned_mesh/mesh_cleaned.ply"))
-    parser.add_argument("--labels", type=Path, default=Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/triangle_class_labels.npy"))
-    parser.add_argument("--contention-mesh", type=Path, default=Path("backend/current_scene/06c_semantic_segmentation/step2_mesh_projection/mesh_projected_contention.ply"))
+    parser.add_argument("--mesh", type=Path, default=Path("backend/current_scene/05_semantic_segmentation/step2_mesh_projection/mesh_projected_refined.ply"))
+    parser.add_argument("--clean-mesh", type=Path, default=Path("backend/current_scene/scan_0/mesh.ply"))
+    parser.add_argument("--labels", type=Path, default=Path("backend/current_scene/05_semantic_segmentation/step2_mesh_projection/triangle_class_labels.npy"))
+    parser.add_argument("--contention-mesh", type=Path, default=Path("backend/current_scene/05_semantic_segmentation/step2_mesh_projection/mesh_projected_contention.ply"))
     parser.add_argument("--dry-run", action="store_true", help="Do not overwrite input labels.")
     args = parser.parse_args()
 

@@ -174,21 +174,37 @@ def test_depth_alpha_mask():
 
 
 def test_mesh_uses_new_scene_paths(tmp_path, monkeypatch):
-    model = tmp_path / "03_FastGS_DNSplatter"
-    model.mkdir()
+    scan = tmp_path / "scan_0"
+    model = scan / "gaussian_splat"
+    model.mkdir(parents=True)
+    (scan / "ingestion_results.json").write_text("{}")
     (model / "checkpoint.pt").touch()
     seen = {}
-    monkeypatch.setattr(mesh, "extract_mesh", lambda workspace, model_path, output, *args: seen.update(
-        workspace=workspace, model_path=model_path, output=output))
+    def _mock_extract(workspace, model_path, output, *args):
+        seen.update(workspace=workspace, model_path=model_path, output=output)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "mesh.work.ply").touch()
+        (output / "mesh.ply").touch()
+        return {"vertices": 10, "triangles": 10}
+    monkeypatch.setattr(mesh, "extract_mesh", _mock_extract)
+    def _mock_clean(*args, **kwargs):
+        for name in ("checkpoint_sealed.pt", "gaussian_splat_sealed.ply"):
+            (kwargs["gsplat_output_dir"] / name).touch()
+        return {"sealed_vertices": 10, "sealed_triangles": 10, "clean_triangles": 10,
+                "boundary_loops_filled": 0, "remaining_boundary_edges": 0,
+                "original_triangles_count": 10, "filled_triangles_count": 0,
+                "gsplat_sealing": {"infill_gaussians_added": 0, "total_sealed_gaussians": 10}}
+    monkeypatch.setattr(mesh, "clean_mesh_floaters", _mock_clean)
+    monkeypatch.setattr(mesh, "regularize_mesh_rgb", lambda *args: {"mean_absolute_rgb_change": 0.0})
     assert mesh.main(["--workspace", str(tmp_path)]) == 0
-    assert seen == {"workspace": tmp_path, "model_path": model,
-                    "output": tmp_path / "04_3DGS_to_mesh"}
+    assert seen == {"workspace": scan, "model_path": model,
+                    "output": scan}
 
 
 def test_force_train_preserves_existing_checkpoints(tmp_path, monkeypatch):
-    model = tmp_path / "03_FastGS_DNSplatter"
-    checkpoint = model / "checkpoint.pt"
+    model = tmp_path / "gaussian_splat"
     model.mkdir()
+    checkpoint = model / "checkpoint.pt"
     checkpoint.write_bytes(b"existing checkpoint")
     monkeypatch.setattr(train, "train", lambda **kwargs: None)
     assert train.main(["--workspace", str(tmp_path), "--force"]) == 0
@@ -247,14 +263,19 @@ def test_camera_sampling_visits_each_view_once_per_epoch():
     assert [c["id"] for c in epochs[0]] != [c["id"] for c in epochs[1]]
 
 
-def test_snapshot_uses_standard_stage04_format_and_actual_sh_degree(tmp_path):
+def test_writer_saves_only_final_model_and_checkpoint(tmp_path):
     xyz = np.eye(4, 3, dtype=np.float32)
     splats = gsplat_train._make_splats(xyz, np.full_like(xyz, .5), torch.device('cpu'))
-    output = gsplat_train._write_model(tmp_path / 'snapshots' / 'iteration_20', splats, 20, 0, 1)
-    checkpoint = torch.load(output.parents[2] / 'checkpoint.pt', weights_only=True)
+    model_dir = tmp_path / 'gaussian_splat'
+    output = gsplat_train._write_model(model_dir, splats, 0, 1)
+    assert output == model_dir / 'gaussian_splat.ply'
+    checkpoint = torch.load(model_dir / 'checkpoint.pt', weights_only=True)
     assert checkpoint['format'] == 'gsplat-stage03-v1'
-    assert (checkpoint['iteration'], checkpoint['sh_degree'], checkpoint['resolution']) == (20, 0, 1)
+    assert 'iteration' not in checkpoint
+    assert (checkpoint['sh_degree'], checkpoint['resolution']) == (0, 1)
     vertices = gsplat_train.PlyData.read(output)['vertex']
     np.testing.assert_array_equal(np.column_stack([vertices[k] for k in ('x', 'y', 'z')]), xyz)
     for name, parameter in splats.items():
         torch.testing.assert_close(checkpoint['splats'][name], parameter)
+
+    assert sorted(path.name for path in model_dir.iterdir()) == ["checkpoint.pt", "gaussian_splat.ply"]

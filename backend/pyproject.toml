@@ -48,6 +48,15 @@ dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
 ]
+3dgen = [
+    "accelerate>=1.13.0",
+    "diffusers==0.37.1",
+    "easydict>=1.13",
+    "kornia>=0.8.2",
+    "ninja>=1.11.0",
+    "timm>=1.0.22",
+    "transformers==4.57.3",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

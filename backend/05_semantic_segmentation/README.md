@@ -1,644 +1,320 @@
-# 06c: class-agnostic instance pipeline
+# Stage 05 — semantic segmentation
 
-## Frozen-input 3D panoptic reconstruction
+Stage 05 lifts class-agnostic 2-D regions from registered photographs onto the sealed Stage 04 mesh. It produces persisted face-label evidence, a geometry-aware refinement result, and downstream delivery files. Face-label IDs remain opaque; a separate final EmbeddingGemma pass maps rendered non-structural source classes to a fixed set of 28 object categories for downstream use.
 
-`run_panoptic3d.py` reads existing 2D results and geometry. It never calls a
-segmentation, embedding, depth, or normal model. Earlier commands in this
-document describe the separate 2D experiments and are **not** prerequisites
-to rerun for this 3D stage.
+The stage keeps geometry and upstream products read-only. It may assign a face an ID, leave it unknown, associate compatible labelled pieces into an instance, and derive a structural role as a separate, fallible analysis. A colour in `mesh_segmented.ply` only visualizes a face ID.
 
-From the repository root:
+## Stage files
 
-```bash
-OPENBLAS_NUM_THREADS=8 OMP_NUM_THREADS=8 backend/.venv/bin/python \
-  backend/06c_semantic_segmentation/run_panoptic3d.py \
-  --run-name panoptic3d_general
+| Component | Responsibility | Runtime status |
+| --- | --- | --- |
+| [`step_segmentation.py`](step_segmentation.py) | Discovers scans, resolves locked inputs, coordinates 2-D proposals, projection, regularization, delivery, and final object-category matching. | Production entry point. |
+| [`scene_inputs.py`](scene_inputs.py) | Shared scene discovery, input resolution and validation. | Production input boundary. |
+| [`fast_sam2_generator.py`](fast_sam2_generator.py) | SAM 2 inference, letterboxing and batched point prompts. | Production model adapter. |
+| [`run_sam2_proposals.py`](run_sam2_proposals.py) | Standalone SAM proposal experiments, archives and overlays. | Optional diagnostics; not called by the production entry point. |
+| [`run_full_scene_pipeline.py`](run_full_scene_pipeline.py) | All-frame SAM/DINO inference, appearance-based memory-bank propagation and consolidation. | Production 2-D producer; frozen archives are reused for 3-D-only reruns. |
+| [`step2_project_masks_to_3d.py`](step2_project_masks_to_3d.py) | Raycasts labelled pixels to mesh faces and writes persisted multi-view vote evidence. | Production projection worker. |
+| [`mesh_prior_refinement.py`](mesh_prior_refinement.py) | Evidence-preserving graph label refinement. | Production regularizer shared by the projection/orchestration path. |
+| [`geometric_regularization.py`](geometric_regularization.py) | Evidence refinement and compact-part association; also retains older cleanup helpers. | Production adapter; the old normal/ID-based passes are outside its production sequence. |
+| [`detect_structural_classes.py`](detect_structural_classes.py) | Gravity/geometry analysis, role inference and connected-instance extraction; also retains older cleanup helpers. | Production analysis/extraction; standalone cleanup is a separate legacy path. |
+| [`deferred_assignment.py`](deferred_assignment.py) | Reads locked infill flags/colors, fits deferred surface planes, matches neighboring RGB/geometry and records same-surface associations. | Final assignment after observed-region cleanup. |
+| [`export_delivery.py`](export_delivery.py) | Writes the segmented PLY, extracted meshes and JSON manifests. | Production delivery writer. |
+| `panoptic3d*.py`, `planar_gap_completion.py`, `surface_label_refinement.py`, `wall_orientation_refinement.py` | Frozen-prior, evaluation and optional geometry-refinement helpers. | Available only when explicitly called. |
+| Remaining `run_*`, `clean_*`, `refine_*`, `inspect_*`, `test_*` files | Earlier experiments, diagnostics, visualizers and tests. | Retained for investigation; not production prerequisites. |
 
-backend/.venv/bin/python -m pytest backend/tests/test_panoptic3d.py backend/tests/test_panoptic3d_baseline.py -q
+## Pipeline flow
+
+```text
+Stage 00–01: registered RGB images + refined COLMAP cameras
+Stage 02: optional depth maps and alignment metadata
+Stage 04: sealed mesh.ply (+ mesh.json)
+                         │
+                         ▼
+2-D proposals / opaque source IDs → per-frame full-resolution label maps
+                         │
+                         ▼
+raycast visibility + bounded per-view face votes → persisted evidence
+                         │
+                         ▼
+evidence-constrained mesh graph refinement → face IDs or unknown
+                         │
+                         ▼
+optional role analysis + physical-part association → delivery package
+                         │
+                         ▼
+render delivered non-structural classes → EmbeddingGemma fixed-category matching
+                         │
+                         ▼
+scan_N/segmentation/ → Stage 06 and inspection tools
 ```
 
-The command above uses no scene review. `--review-file` is opt-in human
-evidence; the supplied scene review includes object-specific relationships
-and a bag extent, so reviewed results are not proof of generalization.
-The inspection snapshots are research checkpoints, not an accepted release.
+The graph cannot manufacture a semantic category from geometry. Ceiling/wall orientation is evidence for a correction only where compatible persisted observations support it; unsupported faces remain unknown. This avoids normal-only reassignment of beam faces and broad infill that gave every hole an arbitrary neighbouring ID.
 
-Use a new `panoptic3d_*` run name. Outputs stay in that new direct child of
-`current_scene/06c_semantic_segmentation/`; existing inputs and the old three
-3D result directories are read-only. Collection refuses an existing run.
-`--phase evidence`, `--phase solve`, and `--phase evaluate` allow completing
-individual stages. Solve/evaluate operate on the saved evidence in the named
-run; retain separate run directories when comparing revisions.
+## Input contract
 
-The evaluated candidate is `panoptic3d_v13`. Its fixed-set source IoU improves
-0.3866 → 0.6102, with unchanged frozen inputs and no new holes. **Acceptance
-remains pending:** protected bag instance IoU declines 0.7816 → 0.7527, and
-fixed-set instance boundary F1 declines slightly. See the
-[full report](../../agents_files/artifacts/panoptic3d/FINAL_REPORT.md), including
-per-object results and the remaining contour/geometry limitations.
+The production entry writes only below each scan’s `segmentation/` directory. It never edits camera poses, images, depth maps or `mesh.ply`; Phase 04 has already aligned the COLMAP and optional depth poses in their existing files.
 
-Required frozen inputs:
+```text
+current_scene/
+└── scan_N/                         # one scan, or pass a single-scene root
+    ├── images/<COLMAP image name>  # Stage 00/01 registered RGB
+    ├── sparse/0/
+    │   ├── cameras.txt             # Stage 01 intrinsics
+    │   ├── images.txt              # poses/tracks, aligned in place by Phase 04
+    │   └── points3D.txt             # sparse points, aligned in place by Phase 04
+    ├── depth/                      # optional Stage 02 support
+    │   ├── poses_da3.npz            # camera poses aligned in place by Phase 04
+    │   ├── depth_maps/<stem>.npy
+    │   └── depth_alignment.json
+    ├── mesh.ply                    # Stage 04 sealed authoritative mesh
+    ├── mesh.json                   # Stage 04 report, if available
+    └── segmentation/               # this stage's output only
+```
 
-- `inputs/{mesh.ply,T_mesh_to_raw.npy,images/,sparse/0/}`.
-- `full362_final_pipeline/npz_data/*_final.npz`: original-resolution `labels`,
-  `masks`, `ids`, and cached `embeddings`. Repeated IDs are permitted and are
-  not semantic class names or proof that two masks are one physical object.
-- Evaluation uses the preserved `mesh_objects_step3/mesh_cleaned_no_floaters.ply`.
-- Optional `02_depth_estimation/depth/{poses_da3.npz,depth_alignment.json,depth_maps/}`.
-  Cached intrinsics/poses must match; unreliable frames are excluded. Zero
-  depth is unknown. Depth is metric camera Z. The mesh-to-raw transform is
-  applied once to raycasting geometry; exports retain native mesh coordinates.
-  A reliable registered map with positive depth on at least half a mask also
-  supplies a conservative 0.5–99.5 percentile depth extent padded by 20 cm.
-  Unknown rays outside it abstain even if mesh-based calibration fails.
-  This extent never authorizes deletion; completeness records it as uncertain
-  geometry rather than a precise missing surface.
+| Input | Required | Validation and use |
+| --- | --- | --- |
+| `mesh.ply` | Yes | Stage 04 mesh, read as indexed triangles and RGB. Face ordering is the identity of every evidence row and label array. |
+| `images/` | Yes | Registered RGB images. Paths, dimensions and unique stems must agree with COLMAP. |
+| `sparse/0/cameras.txt`, `images.txt` | Yes | Stage 01 camera intrinsics and registered poses/tracks. Phase 04 transforms poses in place to match `mesh.ply`; registered-track counts remain unchanged. |
+| 2-D label NPZ files | Produced or supplied | Map is integer, nonnegative and exactly `(camera.height, camera.width)`; `0` means uncovered/unknown. Source IDs are opaque. |
+| `depth/` | No | Optional calibrated support for visibility/conflict checks. Absence must not be replaced with invented depth. |
+| mesh-to-camera transform | No | Identity for the Stage 04 contract, or an explicit finite proper rigid `4×4` transform. |
 
-The evidence combines visible face correspondences, symmetric mask-boundary
-distance, incidence angles, competing observations, and calibrated depth
-agreement. Near-identical camera poses share a view budget. Small masks and
-boundaries receive extra rays, not a geometry deletion rule. Source masks start
-as observation hypotheses; shared visible surface and cached appearance link
-them across views, subject to co-visible separation constraints. Disconnected
-mesh pieces can retain one identity. The frozen embedding export contains
-source-level prototypes, so it cannot independently distinguish repeated
-physical objects within one source ID.
-Frames with fewer than 100 triangulated COLMAP tracks are treated as weak poses,
-using the existing pose-stage weak-support threshold. Their observations remain
-in the catalog and diagnostic projections, but provide no surface votes, region
-transfer geometry, depth calibration, or cleanup evidence. Raw detected keypoints
-are not counted as pose support. Per-frame support counts and trusted-camera
-metrics are saved separately; weak-only entries have `unreliable_pose` completeness.
+Legacy fallback paths under `05_semantic_segmentation/inputs/` are read-only compatibility inputs. They are not an upstream contract and must not be regenerated or preferred over a valid scan-local Stage 04 mesh.
 
-The optional scene review provides visually established categories, aliases,
-and part relations with anchor frames. Mesh and anchor-archive SHA-256 checks
-prevent applying it to changed inputs. Alias exceptions name exact reviewed observations and still require shared
-geometric and cached appearance evidence; other occurrences of those source IDs
-do not inherit the exception. Explicit disconnected-object associations need
-recorded visual evidence. Rejected merges remain enforced constraints. Names apply only to tracks containing the
-reviewed observation; other tracks retain their source IDs and uncertain
-category. Reviewed multi-object masks seed separate regions; shared visible
-triangles transfer these regions to other views. Unmatched regions stay separate
-and uncertain. Parts retain their track IDs beneath one physical object ID.
-An optional reviewed `object_extents` record may bound an already established
-identity using complementary views that show the complete object. Reliable
-cached points from those exact observations supply the union of native 3D
-0.5–99.5 percentile bounds padded by 20 cm. Only that object's votes outside
-the extent are withheld; competing labels and geometry remain. Partial or
-unreliable views cannot authorize this rule. The scene review uses it for the
-blue bag body, whose false floor/wall fragments otherwise survive mask voting.
+### Coordinate and label invariants
 
-A complete-object extent marked `opaque_surface: true` also permits a
-conservative silhouette check. If two independent trusted camera groups show
-that object's assigned face at least 12 pixels inside another object's mask,
-with calibrated depth placing the mesh in free space, its label becomes
-unknown. The object must be observed in each contributing frame. Resolved
-physical identity exempts aliases and parts; a reused source ID does not exempt
-a different object. This check runs after cleanup and never changes geometry
-or deletion eligibility. Conflict counts, original face indices and previous
-labels/confidence make the label abstention reversible. It is not applied to
-transparent, partially observed or unreviewed objects.
+- Cameras use COLMAP world-to-camera extrinsics. Phase 04 transforms camera poses alongside the mesh and sealed Gaussian model; Stage 05 reads aligned poses directly from `sparse/0/images.txt`. The transform in `mesh.json` lets Stage 03 recover source-frame camera views for retraining.
+- Face labels, `face_class_votes.npz`, `face_class_source_ids.npy`, face counts and vertex/triangle ordering must describe the same mesh revision.
+- Votes are accumulated per camera/view group, with unit ray directions and bounded per-face/per-frame contribution. A close camera must not win merely because its direction vector is longer or it samples more pixels.
+- Raw projection output is a local evidence argmax. It is not globally flipped to help an underrepresented ID. No-vote faces carry the unknown sentinel.
+- A source ID may be split by visibility and a physical object may contain several source IDs. Physical association requires mesh contact/seams/support evidence; numeric adjacency is insufficient.
 
-Outputs:
+## Processing
 
-| Artifact | Contract |
+1. **Resolve and validate.** `scene_inputs` accepts one scene or discovers numbered `scan_N` directories. A helper that needs one scene rejects ambiguity.
+2. **Make 2-D observations.** SAM proposes class-agnostic regions. DINO and the historical memory bank can propagate opaque IDs across views; neither produces a fixed vocabulary such as wall, ceiling or horse.
+3. **Project observations.** The worker raycasts pixels to faces, rejects invalid labels/weak views as configured, weights interior pixels and incidence, reduces each face's evidence within a view, then persists source-ID order and face-by-ID votes.
+4. **Refine from recorded evidence.** `refine_graph_labels` minimizes a graph objective over candidate IDs using multi-view unary evidence, shared edges, crease/colour/orientation terms and optional trusted references. It uses no hard-coded class IDs and does not force coverage.
+5. **Associate and describe.** Contact-compatible foreground pieces may be associated as one physical instance. Structural roles are inferred separately and remain hypotheses, particularly on noisy mesh caps, beam faces and thin mounted objects.
+6. **Enforce final constraints.** Wall owners cannot retain faces within 20° of horizontal, upward or downward: `abs(unit_normal · gravity_up) >= cos(20°)`. Forbidden wall patches first take a touching non-wall owner. Then the smallest edge-connected regions merge iteratively into eligible neighbors, preferring coherent shared boundaries. Component sizes and contacts update after each merge; touching regions of the same owner coalesce immediately. Horizontal regions cannot merge back into walls. Every exported instance must contain at least **2000 triangles**, including any explicitly associated same-surface pieces, with no evidence exception. This production constant is locked; there is no threshold override. A fragment with no eligible touching owner is deferred to the final geometry/RGB pass. This is a count policy on the existing tessellation, not a physical-size guarantee.
+7. **Assign inferred surfaces last.** Stage 04 `is_hole_fill` faces are excluded from observed refinement and role inference, even if raycasting happens to hit them. Their votes are not semantic observations. After the minimum-size cleanup, the final pass partitions deferred surfaces by creases, source-RGB edges and wall-angle eligibility. It fits area-weighted regional planes and compares boundary owners using plane residual, normal agreement and source RGB (`fill_r/g/b` on infill), then grows competing owners through the piece graph. One connected infill patch can therefore receive multiple owners on different surfaces. Accepted observed owners stay fixed. Remaining pieces can associate with a nearby accepted surface only within six median face-neighbor spacings, two spacings of its plane, 25° normal agreement and RGB distance ≤0.25. Explicit same-surface associations join the existing instance for counting; they never alter source mesh geometry. Truly incompatible/unseeded pieces remain unresolved rather than taking a distant arbitrary label.
+8. **Deliver.** The writer preserves sealed mesh geometry, stores face `class_id`/`instance_id`, emits instance submeshes and manifests, and can expose compatibility links for consumers expecting `3d_masks/`.
+9. **Name non-structural source classes.** Render each delivered object class from the sealed mesh and, when available, the Gaussian Splat model. EmbeddingGemma compares those views with the fixed 28-category vocabulary and writes class associations for Stage 06. These category labels are a separate best-match result; the face-label IDs remain opaque.
+
+## Outputs and downstream interface
+
+All produced files are under `scan_N/segmentation/`.
+
+| Output | Producer | Contents and consumer contract |
+| --- | --- | --- |
+| `panoptic_data/npz_data/*.npz` | 2-D pipeline | Per-view masks/labels and source observations. IDs are evidence, not named categories. |
+| `face_class_votes.npz` | Projection | Face-by-source-ID vote evidence plus source-ID ordering required to decode columns. |
+| `face_class_source_ids.npy` | Projection | Column-to-opaque-source-ID mapping for votes and local labels. |
+| `triangle_class_labels_raw.npy` | Projection | Face-order-aligned local evidence argmax; unknown persists where no valid vote exists. |
+| `projection_stats.json` | Projection | Input/evidence counts, settings and `projection_version`; use this to reject stale caches. |
+| `triangle_class_labels_observed.npy` | Final constraints | Accepted observed-region labels before any late patch assignment; all Stage 04 infill is unknown here. |
+| `deferred_instance_links.npy` | Late assignment | Source-face pairs recording bounded same-surface semantic instance associations across mesh seams. They are not source mesh edges. |
+| `triangle_class_labels.npy`, `regularization.json` | Regularization | Face-order-aligned refined IDs and solver/change/unknown-face metrics; unknown may remain. |
+| `mesh_segmented.ply` | Delivery | Same face positions and face order as the sealed mesh, with display vertices split at class boundaries so colours never blend across a face label. Vertex count/indices can therefore differ. Exact labels are face `class_id`/`instance_id` properties. |
+| `Instances PLYs/` | Delivery | Per-instance submeshes with original mesh RGB. Role-folder filenames are unique across all classes, preventing accidental overwrite. These are exports, not an alternative source of segmentation truth. |
+| `class_metadata.json`, `segmentation.json` | Delivery | Roles, confidence/provenance where available, bounds/counts/areas and relative paths. `segmentation.json` records `algorithm_version: evidence-geometry-v4`, locked input hashes, unknown-face count and `regularization.json`. |
+| `non_structural_similarity/valid_class_associations.json` | Category matching | Best fixed-vocabulary category association for eligible source classes; consumed by Stage 06 for door/window handling. |
+| `non_structural_similarity/` | Category matching | Category list, embedding caches, per-view top matches, specificity baseline and comparison images. |
+| `non_structural_category_frames/` | Category matching | Rendered mesh views and optional Gaussian Splat views used as classifier inputs. |
+| `3d_masks/` | Delivery | Optional compatibility links to delivered instance meshes. Its manifest uses the same class-local, one-based `instance_index` as the face metadata. |
+
+Do not infer a role from palette colour, ID value, output directory or filename. Downstream code must treat unknowns and missing confidence as meaningful data rather than filling them by nearest neighbour.
+
+## Running
+
+The production policy is fixed in `step_segmentation.py`: **2000 triangles per exported instance**, wall exclusion within **20° of horizontal**, and inferred-surface assignment after observed-region cleanup. Each discovered `scan_N` writes one package to `scan_N/segmentation/`. `MIN_INSTANCE_TRIANGLES` is the single production threshold constant.
+
+Run from `backend/` using the existing environment:
+
+```bash
+# Process every scan_N using the locked policy and standard output path
+.venv/bin/python 05_semantic_segmentation/step_segmentation.py --workspace current_scene
+
+# Rebuild the 3-D result for every scan, reusing valid 2-D/projection evidence
+.venv/bin/python 05_semantic_segmentation/step_segmentation.py \
+  --workspace current_scene --force
+
+# Rebuild one scan
+.venv/bin/python 05_semantic_segmentation/step_segmentation.py \
+  --workspace current_scene/scan_0 --force
+
+# Explicitly regenerate model observations and projection when necessary
+.venv/bin/python 05_semantic_segmentation/step_segmentation.py \
+  --workspace current_scene/scan_0 --recompute-2d --recompute-projection
+```
+
+Completed compatible scans resume automatically. `--force` reruns refinement, constraints, late assignment and delivery; it reuses valid evidence unless the corresponding recompute flag is supplied. Cache validation includes algorithm version, input hashes and the locked threshold. `--max-frames` is a diagnostic subset, not a complete scene.
+
+The production entry no longer accepts `--min-instance-size` or `--output-dir`. It does not create threshold-comparison folders. Existing `segmentation_min_*` packages from earlier manual comparisons are historical artifacts and are left untouched. Standalone research workers may retain their own diagnostic CLI options; they are not the production workflow.
+
+## Locked production policy
+
+| Policy | Enforcement |
 | --- | --- |
-| `segmented_mesh.ply` | Exact per-face physical `instance_id`, direct track/`part_id`, and RGB; vertex RGB is only a blended preview. ID 0 is unknown. |
-| `instances/*.ply`, `parts/*.ply` | Physical objects include their reviewed parts; part exports remain separate. Disconnected pieces retain identity; missing geometry produces a catalog entry without an invented mesh. |
-| `instances_manifest.json` | Stable anchor key, numeric instance ID, source IDs, observation provenance, class evidence, part relation, confidence, topology, and reprojection completeness. |
-| `evidence/`, `observation_support.npz`, `instance_votes.npz` | Sparse competing evidence, camera-group support, visibility, depth conflicts, unknown/no-hit pixels. |
-| `face_assignments.npz`, `geometry_audit.npz` | Original face indices, assignments/confidence, uncertain and removed faces; the original mesh reconstructs every edit reversibly. |
-| `object_extent_constraints.json` | Reviewed complete-object anchors, cached 3D bounds, and original face indices where one identity's votes were withheld. |
-| `removed_geometry.ply`, `floater_review.jpg`, `cleanup.json`, `unsupported_components.json` | Removal rule, supporting view counts, disagreements, new boundaries, supported-surface loss, splits, and repairs. |
-| `review_set.json`, `review/*.jpg`, `review/*.npz` | Fixed 16-camera review; frozen 2D, baseline/revised projections, disagreements, and exact mask arrays. |
-| `REPORT.md`, `metrics.json`, `frame_metrics.json`, `baseline_recovery.json`, `baseline_comparison.npz` | Per-object and macro recall/IoU/leakage/boundary scores, small-object results, missing rays, and geometry completeness. |
-| `inputs.json`, `configuration.json`, `scene_review.json` | Input hashes, pose/depth policy, numerical settings, code fingerprints, and applied review evidence. |
+| Minimum instance size | Fixed **2000 triangles**, iterative contact-based merging; no evidence bypass. |
+| Wall orientation | Neither upward nor downward faces within **20° of horizontal** can remain wall-owned. |
+| Stage 04 infill | `is_hole_fill` faces and their vote rows are excluded from observed refinement and role inference. |
+| Final patch assignment | Split deferred surfaces at geometry/RGB boundaries, fit regional planes, score neighboring owners using plane residual, normals and source RGB. |
+| Disconnected same-surface pieces | Only bounded coplanar/color-compatible associations; recorded separately from source mesh topology. |
+| Final acceptance | Verify all positive faces belong to exported instances meeting the minimum and the wall-angle rule still holds after late assignment. |
+| Unresolved geometry | Preserve explicitly unknown when no compatible owner is available; never invent distant ownership or remove source geometry. |
+| Output | Exactly `segmentation/` under each scan; no threshold-named production packages. |
 
-Cleanup checks every detached triangle centroid against calibrated cached
-depth. A whole vertex-isolated component is removable only when every face
-has repeated independent free-space evidence and none has agreeing depth.
-Labels projected onto repeatedly contradicted geometry are recorded separately
-from supported surface. Attached or conflicting geometry remains for review;
-no unsupported planar fill or hole repair is invented. New boundary edges are
-checked before export.
+## First-party callable reference
 
-Metrics measure agreement with frozen 2D observations, not independent human
-ground truth. Literal source-ID scores accompany object-scoped alias scores. The same static
-(object, source) lookup applies to reference and both predictions; an alias
-cannot turn a different object using the same source ID into a correct prediction.
-Baseline labels come from exact surviving exported triangles and the original
-per-channel palette decoder for unresolved faces; unmatched colors stay unknown.
-Instance metrics are relative to the resolved hypotheses; old components are
-matched using retained geometry, so these scores alone cannot prove physical
-identity correctness. Missing rays and depth-supported missing foreground are
-reported separately from wrong labels. Completeness checks every unambiguous
-full-resolution frozen-mask pixel, including detections missed by the metric lattice.
-Input hashes are captured before evidence accumulation and verified after it,
-before solve/evaluation, and at evaluation completion. Evaluation rejects changed
-solve code fingerprints. Unknown 2D pixels are excluded from
-negative evidence. Fixed review scores and all-camera scores are both needed:
-walls and floors must not conceal failures on small objects. Additional
-`diagnostics/` views illustrate reviewed assemblies and repeated objects without
-changing the fixed 16-camera comparison. Confidence is a weighted evidence
-fraction, not a calibrated probability. Unreviewed within-mask mixtures,
-single-view hypotheses, and missing geometry retain explicit uncertainty.
+“Returns” includes files written by CLI/orchestration functions. Underscore-prefixed functions are internal helpers documented because they affect results.
 
-Inputs are in `../current_scene/06c_semantic_segmentation/inputs/`. Keep each
-stage's outputs under `../current_scene/06c_semantic_segmentation/` in a named
-run directory. The older `06_semantic_segmentation/` is a reference, not a
-source of predefined classes.
+### Input and orchestration
 
-## DINOv2 patch-neighbor ablation
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py
-```
-
-The first ten input frames are resized without changing their aspect ratio to
-a maximum side of 896 pixels and multiples of DINOv2's 14-pixel patch size.
-The script uses `facebook/dinov2-small` (the unregistered `dinov2_vits14`
-backbone), saves 384-dimensional patch embeddings as float16 `.npy` files,
-and colors connected regions formed only by four-neighbor cosine similarities.
-The five default thresholds are the 10th, 30th, 50th, 70th, and 90th
-percentiles of neighbor similarities across the selected frames. They and
-region counts are recorded in `dinov2_patches/<run-name>/summary.json`.
-Each threshold directory has one full-resolution RGB-left / colored-patches-right
-JPG and one patch-label `.npy` per frame. Colors are local to each frame; these
-regions are not yet persistent 3D instances. PCA is omitted from this ablation
-so the sweep changes only the cosine threshold. Choose a threshold after
-visual review before adding another feature transform.
-
-### Running-mean cluster growth (0.8 and 0.9)
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py \
-  --grouping cluster-mean --thresholds 0.8 0.9 \
-  --embeddings-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first10_vits14_neighbors \
-  --run-name first10_vits14_cluster_mean_080_090
-```
-
-Each region starts at the first unassigned patch. At every step, the most
-similar unassigned four-neighbor is compared with the mean embedding of all
-current region patches; accepted patches update that mean. Candidates rejected
-earlier are reconsidered after growth. The saved embeddings are reused, with
-no PCA. Results are under `dinov2_patches/first10_vits14_cluster_mean_080_090/`.
-An exact-threshold neighbor-only baseline is saved separately under
-`dinov2_patches/first10_vits14_neighbors_080_090/` for atomic comparison.
-Mean regions per frame: 76.9 versus 234.4 at 0.8, and 400.8 versus 584.0 at
-0.9 (neighbor-only versus running mean). Region count is not an accuracy score;
-choose the next configuration by visual inspection.
-
-The same running-mean sweep at 0.7 and 0.6 is saved under
-`dinov2_patches/first10_vits14_cluster_mean_070_060/`, with exact-threshold
-neighbor-only comparisons under `first10_vits14_neighbors_070_060/`.
-Mean regions per frame are 128.0 versus 22.6 at 0.7, and 72.0 versus 9.1 at
-0.6 (running mean versus neighbor-only). These remain review candidates.
-The 0.5 run is saved under `dinov2_patches/first10_vits14_cluster_mean_050/`
-with its exact neighbor-only comparison under `first10_vits14_neighbors_050/`.
-Mean regions per frame are 41.6 versus 4.1, respectively.
-
-### Small-region cleanup at 0.55
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py \
-  --grouping cluster-mean --thresholds 0.55 --min-region-patches 4 \
-  --embeddings-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first10_vits14_neighbors \
-  --run-name first10_vits14_cluster_mean_055_min4
-```
-
-The raw 0.55 run is in `first10_vits14_cluster_mean_055_raw/`; the cleaned run
-is in `first10_vits14_cluster_mean_055_min4/`. Cleanup absorbs regions of one
-to three patches into a four-neighbor touching region. Touching regions are all
-one patch away, so ties in proximity are resolved by cosine similarity between
-current region means. Merges update those means and preserve surviving color
-IDs for visual comparison. Across ten frames, mean region count changes from
-53.0 to 12.6. Neither region count nor visual size proves object accuracy;
-review the paired images before freezing the cleanup.
-
-### One-percent cleanup sweep
-
-On the 2,304-patch images, `--min-region-patches 24` absorbs every region of
-1–23 patches (less than 1% of the image). The same rule was applied at 0.55,
-0.60, and 0.65, reusing the saved embeddings and leaving PCA off. Cleaned
-results are in `first10_vits14_cluster_mean_055_065_min24/` (0.55 and 0.65)
-and `first10_vits14_cluster_mean_060_min24/` (0.60). Exact raw comparisons
-are in `first10_vits14_cluster_mean_055_raw/`,
-`first10_vits14_cluster_mean_070_060/` (0.60), and
-`first10_vits14_cluster_mean_065_raw/`. Mean region counts change from
-53.0 to 6.0, 72.0 to 7.7, and 92.5 to 11.6, respectively. The rule and
-threshold are not frozen pending visual review.
-
-### PCA ablation
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py \
-  --grouping cluster-mean --pca-dims 64 --min-region-patches 24 \
-  --thresholds 0.5 0.55 0.6 0.65 0.7 \
-  --embeddings-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first10_vits14_neighbors \
-  --run-name first10_vits14_pca64_cluster_mean_min24_050_070
-```
-
-One 64-component PCA is fit across the same ten frames so the projection is
-consistent across views. The run saves `pca.npz`, projected patch embeddings,
-label maps, and RGB/colored-patch pairs under its named folder. The exact
-no-PCA comparison uses the prior 0.55/0.60/0.65 cleanup runs plus
-`first10_vits14_cluster_mean_050_070_min24/` for 0.50 and 0.70. Mean
-surviving regions per frame with PCA versus no PCA are 10.0/5.3 (0.50),
-13.1/6.0 (0.55), 16.0/7.7 (0.60), 19.5/11.6 (0.65), and 24.3/15.6
-(0.70). These counts describe granularity, not segmentation accuracy.
-
-The wider PCA threshold sweep at 0.55, 0.65, 0.75, 0.85, and 0.95 is in
-`first10_vits14_pca64_cluster_mean_min24_055_095/`. It keeps the same
-64-component projection, running-mean growth, and 1–23 patch cleanup. Mean
-surviving region counts are 13.1, 19.5, 28.9, 44.2, and 52.5, respectively.
-Inspect all ten RGB/colored-patch pairs per threshold before selection.
-
-### First 100 frames at 0.50 and 0.55
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py \
-  --first-frames 100 --grouping cluster-mean --pca-dims 64 \
-  --pca-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first10_vits14_pca64_cluster_mean_min24_050_070/pca.npz \
-  --thresholds 0.5 0.55 --min-region-patches 24 \
-  --run-name first100_vits14_pca64_cluster_mean_min24_050_055
-```
-
-This reuses the PCA projection fitted for the first-ten-frame review, so its
-thresholds remain comparable. The run contains 100 RGB/colored-patch pairs and
-label maps per threshold, DINO embeddings, projected embeddings, and a copy
-of the PCA coefficients. Each threshold directory also has a
-`contact_sheet_100.jpg` overview. The first ten labels exactly reproduce the
-earlier PCA run. Mean surviving regions per frame are 6.64 at 0.50 and 8.62
-at 0.55. These are local 2D regions, not persistent 3D objects.
-
-### Round-based grid merging ablation
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_patches.py \
-  --first-frames 100 --grouping grid-rounds \
-  --embeddings-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first100_vits14_pca64_cluster_mean_min24_050_055 \
-  --pca-dims 64 \
-  --pca-from backend/current_scene/06c_semantic_segmentation/dinov2_patches/first100_vits14_pca64_cluster_mean_min24_050_055/pca.npz \
-  --thresholds 0.5 0.6 0.7 --min-region-patches 24 \
-  --run-name first100_vits14_pca64_grid_rounds_min24_050_070
-```
-
-Every patch begins as a region. In each round, adjacent regions compare their
-frozen mean embeddings; mutually preferred pairs above the threshold merge
-simultaneously, and means update only between rounds. The same PCA, images,
-and 1–23 patch cleanup are used as in the sequential run. The grid results
-have mean region counts 6.27/10.57/18.88 at 0.50/0.60/0.70, versus
-6.64/11.28/20.67 for sequential growth. Exact sequential 0.60/0.70
-references are in `first100_vits14_pca64_cluster_mean_min24_060_070/`;
-0.50 is in the prior first-100 run. Each threshold directory has 100 full
-pairs, labels, and a `contact_sheet_100.jpg` overview. Counts do not indicate
-which method better isolates objects; select by visual review.
-
-## Image coverage step
-
-1. Run the existing fast SAM 2.1 Small proposal generator with aspect-preserving
-   letterbox input and an 8x8 prompt grid. Preserve all masks and confidence values;
-   measure the union of covered pixels per frame.
-2. When the grid covers less than 90% of a frame, place a positive prompt at
-   the distance-transform peak of each uncovered connected region. Reuse the
-   same frame's SAM2 image features for up to three prompted rounds, accepting
-   masks that cover new pixels. The fixed-size 16-point decoder batch avoids
-   repeated compiler specializations.
-3. Resolve overlaps into a disjoint pixel label map, prioritizing initial grid
-   masks before gap masks and sorting each by predicted IoU. Give every
-   still-uncovered connected region a **residual/unknown** label. This ensures
-   exactly 100% pixel assignment without inventing an object at a weakly
-   observed pixel. Keep a separate metric for coverage by accepted SAM2 masks.
-4. Lift only reliable object masks through mesh face-ID/depth maps. Keep
-   residual pixels and geometry misses explicit; neither is evidence of a 3D
-   object. Reconcile instances across views using 3D overlap and visibility,
-   then evaluate clone similarity only after instance IDs are stable.
-
-Run the current raw-mask review pass on the first 50 frames with:
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_sam2_proposals.py \
-  --first-frames 50 --run-name first50_grid8_letterbox_gap060_trigger90_raw
-```
-
-Each run saves per-frame `.npz` archives (`masks` for accepted SAM proposals,
-`labels` for complete pixel assignment, `residual` for unknown pixels), JSON
-metrics, overlay PNGs, and `summary.json` under
-`backend/current_scene/06c_semantic_segmentation/sam2_proposals/<run-name>/`.
-Unknown pixels are pure black in new PNG overlays. Earlier uncleaned ablation
-JPGs used red for unknown pixels. `labels` is a preview partition; 3D mesh
-visibility and instance association are later stages.
-
-The shape-cleanup script was used only in earlier ablations. It is **not** part
-of the current run; all accepted SAM masks are retained. Earlier cleaned runs
-can still be reproduced with:
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/clean_masks.py \
-  --source first50_grid10_gap060_trigger94 \
-  --run-name first50_grid10_gap060_trigger94_clean
-```
-
-That filter removes masks with at least three substantial disconnected pieces,
-very thin long ribbons, or sparse branched shapes. It preserves two-piece
-masks because an occluder can split one object. The cleaned run keeps every
-removed mask's ID and reason in its frame JSON, and assigns newly uncovered
-pixels unknown. Its PNG overlays show these pixels as exact black.
-
-Review per-frame initial, prompted, and residual overlays; compare proposal
-coverage, residual area, proposal count, runtime, and 3D consistency for each
-configuration. Save every sweep configuration separately and freeze one only
-after manual inspection. Pixel assignment coverage and correct object
-recognition are distinct metrics.
-
-The first 50 frames currently have two complete-mask runs for threshold
-ablation. With grid 10, the 0.85 gap stability threshold reached 92.2% mean
-accepted SAM coverage at 5.22 inference FPS; 0.60 reached 96.2% at 4.30 FPS.
-Both label maps assign 100% of pixels, with the remaining 7.8% and 3.8%
-respectively labeled unknown. These numbers measure pixel coverage, not
-instance correctness. Neither configuration is frozen pending visual review.
-
-Shape cleanup removed 143 of 1,846 masks on these frames. Mean accepted-mask
-coverage changed from 96.2% to 95.3%; complete pixel assignment remains 100%
-with the remainder unknown. The filter was run offline and does not change
-the recorded SAM inference FPS.
-
-In an earlier grid-10 stretch run, the 94% trigger skipped gap prompting on 18 of the first 50 frames. It changed
-accepted-mask coverage from 96.2% to 95.3% and steady inference from 4.30 to
-5.22 FPS. Shape cleanup of that gated run removes 108 masks and leaves 94.6%
-accepted-mask coverage. The other 5.4% remains explicitly unknown.
-
-### Resize comparison
-
-The earlier baseline stretched each 1080x1920 frame to 1024x1024. To preserve aspect
-ratio instead, `--resize-mode letterbox` scales it to 576x1024, pads 224 pixels
-on each horizontal side with the normalized image mean, maps prompt coordinates
-into that rectangle, and crops mask logits before returning to original size.
-The user selected letterbox as the new default after visual review. The
-stretch and letterbox results below remain available as historical ablations.
-With raw masks and letterbox input on the same 50 frames, grid 10 / trigger 94%
-reached 95.68% mean accepted-mask coverage and 5.36 steady FPS; grid 8 /
-trigger 94% reached 95.56% and 6.05 FPS; grid 8 / trigger 90% reached 93.89%
-and 8.04 FPS. The 90% trigger prompts gaps on 15 frames versus 31 at 94%.
-These are coverage and inference measurements, not object-quality scores.
-Paired sheets for each change are in `sam2_proposals/grid8_letterbox_default_ablation/`.
-
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_sam2_proposals.py \
-  --first-frames 50 --grid 10 --fill-gaps --gap-stability 0.6 \
-  --coverage-trigger 0.94 --resize-mode letterbox \
-  --run-name first50_grid10_gap060_trigger94_letterbox
-backend/.venv/bin/python backend/06c_semantic_segmentation/clean_masks.py \
-  --source first50_grid10_gap060_trigger94_letterbox \
-  --run-name first50_grid10_gap060_trigger94_letterbox_clean
-```
-
-On the same 50 frames, mean accepted-mask coverage after shape cleanup is
-94.56% for stretch and 94.86% for letterbox; letterbox gains coverage on 33
-frames and loses coverage on 16. Steady inference is 5.22 versus 5.36 FPS,
-respectively. Coverage is not object-mask accuracy: frame 00098 loses 18.3
-percentage points with letterbox, while frame 00138 gains 7.2. Inspect the
-paired contact sheet and full-resolution examples under
-`sam2_proposals/resize_comparison_stretch_vs_letterbox/` before choosing one.
-
-## Saved runs
-
-All paths below are inside `backend/current_scene/06c_semantic_segmentation/`.
-`inputs/` is the preserved scene input, including source images, supplied
-masks, COLMAP poses, mesh, and Gaussian splat. Each run below contains saved
-mask archives and per-frame metrics; colors are local proposal IDs, not
-persistent objects across frames.
-
-| Folder under `sam2_proposals/` | Purpose and what to inspect |
+| Callable | Inputs → processing → outputs |
 | --- | --- |
-| `first10_stab80_iou50_reg05pct/` | **Validated proposal & refinement candidate.** SAM2 Small with `stability_thresh=0.80`, `pred_iou_thresh=0.50`, outlier threshold $0.5\%$ frame area ($10{,}368\text{ px}$), filament filtering, hierarchical overlap subtraction ($33\%$ relative confidence), and SOR floater cleanup. Averages $90.48\%$ coverage and $11.5$ clean instance proposals per frame without spilling or dropping small furniture items. Includes side-by-side Raw vs Refined comparisons. |
+| `scene_inputs._is_scene` | Path → checks image/COLMAP layout → boolean. |
+| `discover_scans`, `resolve_scene` | Workspace → validate/sort scans or resolve exactly one → scene paths. |
+| `stage_directory`, `resolve_stage_output` | Workspace and optional child → resolve/create output path → path. |
+| `resolve_mesh`, `resolve_mesh_report`, `resolve_sparse_dir`, `resolve_images_dir`, `resolve_depth_dir` | Scene and optional override → validate locked Stage 01/02/04 locations → paths or optional value. |
+| `_camera_source_sizes`, `load_scene_cameras`, `registered_images` | COLMAP text/images/resolution → validate dimensions/stems → camera dictionaries or sorted paths. |
+| `colmap_point_counts` | COLMAP `images.txt` → parses tracks → image-to-triangulated-count map. |
+| `load_mesh_transform`, `resolve_mesh_transform` | Optional NPY/workspace → validate rigid transform → `4×4` matrix or identity. |
+| `validate_labels`, `dino_grid` | Label map/camera or image geometry → validate map / calculate ViT patch grid → map or `(rows, columns)`. |
+| `step_segmentation.run_segmentation_pipeline_for_scan`, `main` | Scan/CLI settings/context → coordinate phases and completion checks → delivery manifest/exit status. |
 
-## DINOv2 Mask Embeddings & Iterative Semantic Merging
+### 2-D proposals and propagation
 
-```bash
-backend/.venv/bin/python backend/06c_semantic_segmentation/run_dinov2_merge.py
-```
+| Callable | Inputs → processing → outputs |
+| --- | --- |
+| `FastSAM2Generator` | Stateful SAM 2 adapter. Its constructor loads/configures the model; the methods below prepare prompts and return proposals without assigning category names. |
+| `FastSAM2Generator.__init__`, `_prepare_grid`, `_transform_coords` | Model settings/image geometry → construct grid prompts/model coordinates → generator/points. |
+| `FastSAM2Generator._decode`, `_infer`, `generate`, `generate_complete`, `warmup` | Image/features/prompts → SAM decoding, optional gap prompts, filtering and compilation/cache warmup → masks/metadata/logits. |
+| `run_sam2_proposals.main` | Image workspace/settings → proposals, optional filtering/overlap resolution → NPZ/overlay/JSON/summary. |
+| `run_sam2_proposals.guided_filter_rgb`, `run_pipeline_bench_first50.guided_filter_rgb` | RGB guide and scalar/boolean mask → edge-aware local smoothing → filtered mask; benchmark copy is historical. |
+| `clean_masks.shape_reasons`, `clean_frame`, `main` | Proposal masks/labels/thresholds → identify scattered, thin or low-solidity shapes → cleaned archives/overlays/summary. |
+| `run_dinov2_patches.group_neighbors`, `adjacent_similarities`, `grow_cluster_means`, `grow_and_merge_grid_seeds`, `merge_grid_rounds`, `merge_small_regions`, `main` | Patch embeddings/threshold CLI → spatial region growth/cleanup → label grids and visual/NPY outputs. |
+| `run_dinov2_merge.main` | Historical one-frame input → DINO merge experiment → experimental outputs. |
+| `get_adaptive_gamma` | Mask area fraction → memory-bank decay → float. |
+| `get_class_color` | Opaque positive ID → deterministic display BGR/RGB → colour pair. |
+| `find_best_label_anchor`, `create_mask_overlay` | Masks/labels/image → interior label position and overlay → point/image. |
+| `GlobalMemoryBank` | Stateful historical prototype registry used by both full-scene and propagation experiments; it owns the entries updated by its methods below. |
+| `GlobalMemoryBank.__init__`, `register_initial_frame`, `get_bank_matrix`, `get_dormancy_threshold`, `update_matches`, `register_new_classes` | Embeddings/areas/frame → maintain prototype registry and claims → updated registry/matches/diagnostics. |
+| `render_and_save_frame`, `create_final_triangular_matrix`, `create_filtered_matrix_plot`, `create_end_of_pass_triangular_matrix`, `create_pre_merge_highlighted_matrix`, `create_consolidated_triangular_matrix`, `create_cross_matrix_plot` | Render/class-similarity data → overlay/archive or matrix image/PDF. |
+| `run_full_scene_pipeline.main` | Scan photographs/COLMAP support and CLI → SAM proposals, overlap cleanup, DINO pooling, within-frame merges, global-memory propagation, post-hoc merges and rare-ID cleanup → `panoptic_data` archives/overlays/summary/cache. |
+| `run_global_memory_id_propagation.main`, `run_id_propagation.main`, `run_post_hoc_memory_consolidation.main`, `run_cleanup_and_final_matrix.main`, `run_cross_frame_similarity_bench.main` | Historical CLI input → named ID/diagnostic experiment → run-specific archives/figures. |
+| `run_pipeline_staged_experiments.box_filter_gpu`, `guided_filter_gpu`, `run_experiment`, `main`; `run_pipeline_bench_first50.main`; `run_streamlined_grid12_bench.main` | Images/tensors/settings → GPU filtering or timed ablation → experiment metrics/artifacts. |
+| `run_full_scene_pipeline.clean_carved_mask`, `run_streamlined_grid12_bench.clean_carved_mask` | Binary mask and area/thickness thresholds → removes small components and ribbons → cleaned mask. |
 
-Using the validated refined SAM2 proposals (`first10_stab80_iou50_reg05pct`), DINOv2 (`facebook/dinov2-small`) computes dense spatial feature tokens across each image. For each mask proposal $M$, its semantic embedding is computed by spatially pooling the DINOv2 patch tokens covered by $M$ and L2-normalizing the resulting vector:
-$$\mathbf{e}_A = \frac{\sum_{p \in M_A} \mathbf{f}_p}{\left\| \sum_{p \in M_A} \mathbf{f}_p \right\|_2}$$
+### Projection, evidence and frozen-prior reconstruction
 
-### Iterative Merge Algorithm
-1. Construct the pairwise cosine similarity matrix $\mathbf{S}_{ij} = \mathbf{e}_i^\top \mathbf{e}_j$.
-2. Identify the pair $(i, j)$ with maximum cosine similarity $\max_{i < j} \mathbf{S}_{ij}$.
-3. If $\max \mathbf{S}_{ij} > 0.70$, merge masks $M_i$ and $M_j$ into a single mask $M_{\text{merged}} = M_i \cup M_j$, retaining the lower ID $\min(i, j)$.
-4. The semantic embedding of the merged mask is updated exactly via vector sum pooling $\mathbf{S}_{\text{merged}} = \mathbf{S}_i + \mathbf{S}_j$ (size-weighted normalized average), eliminating redundant neural re-inference.
-5. Recompute the reduced similarity matrix and repeat until all pairwise similarities are $\le 0.70$.
+| Callable | Inputs → processing → outputs |
+| --- | --- |
+| `step2_project_masks_to_3d.load_colmap_triangulated_points` | `images.txt` → strict shared parser → registered-point counts. |
+| `step2_project_masks_to_3d._sha256_file` | File path → chunked SHA-256 calculation → hexadecimal input fingerprint. |
+| `normalized_incidence_cosines` | Hit normals/ray directions → normalizes both and clamps finite cosine → weights. |
+| `reduce_view_face_votes` | Pixel face IDs/source columns/quality → sums by face/source, divides by all face hits in the view → sparse indices/bounded values. |
+| `local_evidence_labels` | Face-by-source vote matrix → local maximum where evidence exists → source-column labels or `-1`. |
+| `compute_mask_distance_weights` | Integer 2-D map → boundary distance transform, zero unknown → pixel weights. |
+| `build_dual_mesh_graph` | Triangles → shared-edge face adjacency → directed edges. |
+| `absorb_isolated_islands` | Labels/graph/minimum size → legacy neighbouring-component cleanup → labels/counts; not enough evidence for production ownership alone. |
+| `export_colored_ply`, `render_vector_pdf_matrix` | Mesh/labels or contention → diagnostic PLY/PDF. |
+| `project_masks_to_3d`, `main` | Workspace/mesh/NPZ/settings → raycast and persist multi-view evidence/raw labels/statistics → metrics/files/exit status. |
+| `run_mesh_quality_vote_step1.render_contention_matrix_image`, `render_top_contended_subset` | Vote/contention arrays and output path → full or selected contention diagnostic image → PNG. |
+| `mesh_prior_refinement._sum_block_unaries`, `_component_orientation_penalties` | Unary terms/components/geometry → aggregate energy terms → tensors. |
+| `corroborated_faces` | Final owners, sparse priors and source IDs → require matching evidence winner, ≥3 effective views and ≥75% confidence → evidence mask for optional area/span retention; it cannot bypass the hard triangle minimum. |
+| `correct_confident_faces` | Labels/priors/view counts/source IDs/thresholds → copies only corroborated source IDs → labels. |
+| `refine_graph_labels` | Labels/evidence/graph/face geometry/colour/optional reference → graph-energy updates → labels and solver diagnostics. |
+| `panoptic3d.boundary_distance`, `observation_components`, `cached_mask_extent`, `extent_conflicts` | Labels/masks/depth state → boundary, observation and conflict data → arrays/records. |
+| `view_groups`, `resolve_tracks`, `physical_ids`, `object_source_aliases` | Cameras/track support/instances → constrained correspondence/identity mapping → IDs and decisions. |
+| `dual_graph`, `assign_faces`, `balance_votes`, `restrict_instance_votes`, `safe_removal`, `boundary_edges` | Mesh/vote/geometry evidence → graph, smoothed/rebalanced/restricted labels or safe removal → arrays/records. |
+| `object_metrics`, `summarize_metrics` | Reference/prediction/visibility counts → precision, recall, IoU, leakage and boundary metrics → records. |
+| `run_panoptic3d.write_json`, `digest`, `verify_inputs`, `output_directory` | Paths/data → serialize, fingerprint and validate inputs → files/digests/path. |
+| `ray_scene`, `cast`, `cast_pixels`, `native_depth_points` | Mesh/camera/pixels/depth/transform → raycasting scene/hits/native 3-D points. |
+| `load_depth_context`, `depth_evidence`, `pose_support`, `read_scene_review`, `region_templates`, `anchored_regions` | Stage inputs/review/masks → depth/reliability/review-region structures → context/records. |
+| `collect`, `palette`, `export_mesh`, `reviewed_object_bounds`, `silhouette_conflicts`, `component_depth_evidence` | Workspace/evidence/review/mesh → persisted evidence, visual mesh and object support → files/arrays. |
+| `solve`, `dense_completeness`, `evaluate`, `run_panoptic3d.main` | Evidence run/settings → solve/evaluate frozen-prior reconstruction → labels/meshes/reports/exit status. |
 
-Outputs are saved in `dinov2_merged_070/first10_stab80_iou50_reg05pct/`:
-- `frame_XXXXX_merged.npz`: Final masks, label map, normalized embeddings, and final similarity matrix.
-- `frame_XXXXX_merged.json`: Merge trace, area, confidence, and source mask IDs.
-- `frame_XXXXX_final_similarity_matrix.png`: Upper-triangular similarity matrix where diagonal and axis ticks are color-coded to each mask's unique overlay color.
-- `frame_XXXXX_comparison_with_matrix.png`: 3-panel composite visualization `[Pre-Merge Overlay | Post-Merge Overlay | Final Triangular Matrix]`.
+### Geometry, instances and delivery
 
-### First 50 Frames Staged Benchmark & Profiling ($\ge 0.69$ Threshold)
+| Callable | Inputs → processing → outputs |
+| --- | --- |
+| `compute_mesh_derivatives`, `build_dual_graph` | Mesh arrays → face derivatives and shared-edge CSR graph → arrays. |
+| `reclaim_ceiling_bounding_slabs`, `reclaim_wall_encroached_furniture`, `reclaim_thin_wall_plates`, `align_structural_planes` | Labels/geometry/thresholds → legacy structural boundary repair → labels/counts. |
+| `absorb_enclosed_subparts`, `absorb_flush_wall_instances`, `propagate_planar_faces`, `propagate_planar_boundaries`, `propagate_cabinet_faces`, `absorb_embedded_furniture_subparts`, `refine_all_boundaries`, `refine_class_boundaries.main` | Mesh labels/candidates/settings → legacy propagation/refinement → labels/reports. |
+| `complete_planar_gaps`, `complete_geometric_regions`, `complete_bounded_gaps` | Labels/mesh graph/eligible patches/seeds → optional unknown-region completion → labels/fill report. |
+| `reclaim_compatible_surfaces` | Labels/derivatives/trusted references → geometry/colour-compatible repair → labels/support report. |
+| `wall_orientation_refinement._components`, `_nearest_nonwall`, `refine_wall_orientations` | Wall mask/graph/priors/up axis → components or cautious reassignment → labels/audit. |
+| `run_complete_geometric_regularization` | Mesh, exact raw labels, sparse votes and ordered source IDs → measured-edge-scale graph refinement to convergence, then compact-part association → revised labels and solver/association metrics. Unknown faces stay unknown. |
+| `regularize_foreground_connected_components` | Mesh derivatives/graph and structural exclusions → cut broad fitted support planes (including tilted surfaces), their lower lips and concave contacts; require compact extent and substantial contact; complete a compact source part only when ≥75% of its area joined one owner → component-local part merges/count. No proximity-only merge. |
+| `regularize_disconnected_manifold_components`, `absorb_wall_mounted_coplanar_patches`, `suppress_micro_floor_instances` | Mesh/labels/graph/rules → legacy cleanup/metrics → labels/metrics. These rules are not called by the production regularizer. |
+| `read_infill_attributes` | Sealed PLY and face count → read Stage 04 provenance and coplanar infill RGB in source order → flags and optional RGB. |
+| `assign_deferred_patches` | Accepted labels, face geometry/RGB, adjacency, gravity and wall IDs → planar/curved pieces, competing geometric/color owner growth and bounded seam associations → final labels, metrics and instance links. |
+| `enforce_instance_constraints` | Face labels, adjacency, normals, gravity, wall IDs and minimum → reject near-horizontal wall ownership, iteratively merge undersized contacting components, otherwise assign unknown → final labels and checked counts. |
+| `detect_primary_structural_cids` | Mesh derivatives and observed labels → area fractions and relative height bands identify supported floor/wall/ceiling owners → primary IDs (zero when absent) and structural exclusions. Source-ID magnitude does not determine a role. |
+| `suppress_micro_ceiling_instances`, `eliminate_horizontal_wall_triangles`, `absorb_flat_coplanar_wall_patches` | Legacy labels/mesh/graph and thresholds → reassign small/flat/horizontal structural patches → labels/counts. These are outside the production sequence. |
+| `detect_structural_classes.get_class_color`, `export_colored_ply` | IDs/mesh → palette or coloured mesh → colours/file. |
+| `create_cylinder_mesh`, `build_instance_badge_mesh` | Geometry/text/style → diagnostic primitives → vertices/faces/colours. |
+| `read_scene_sizes`, `load_canonical_dino_embeddings`, `estimate_gravity_and_scene_bands`, `build_mesh_dual_graph` | Reports/embeddings/mesh → metadata, gravity/elevation bands, adjacency → records/arrays. |
+| `absorb_structural_floaters`, `fill_unassigned_triangles`, `absorb_outlier_floaters`, `absorb_enclosed_patches`, `prune_teleported_scattered_crumbs`, `merge_proximate_components` | Labels/graph/geometry → legacy reassignment/pruning/merge → labels/counts. `fill_unassigned_triangles` conflicts with preserving unknowns. |
+| `extract_instances`, `converge_class_instances_iteratively`, `absorb_class_outliers`, `decompose_class_into_connected_pieces` | Labels/adjacency/geometry and optional `supported_faces` → component/instance records; small components survive ordinary size gates when at least 75% of their faces have independent three-view support. `absorb_class_outliers` is an alias. |
+| `fit_ransac_plane`, `analyze_class_geometry`, `classify_structural_classes` | Points or class geometry/embeddings → plane/features/role hypotheses → records. |
+| `embed_class_id_badges_on_mesh`, `export_structural_manifest`, `detect_structural_classes.main` | Mesh/role/instance data → badges and structural JSON/CSV/Markdown → files. |
+| `export_segmented_mesh_ply`, `export_single_instance_ply`, `deliver_stage05_outputs` | Sealed mesh/labels/instances/roles → PLYs, manifests and compatibility links → delivery manifest/files. |
+| `export_per_class_meshes.export_per_class_meshes`, `main` | Segmented mesh/manifests → visual meshes and Blender helper → files. |
+| `ClassInspector`, `run_inspector`, `_resolve_path`, `inspect_classes.main` | Mesh/manifests/viewer paths → interactive inspection → session. |
+| `run_3d_object_extraction_step3.get_class_color`, `create_cylinder_mesh`, `build_3d_text_mesh`, `compute_robust_obb`, `build_bounding_box_geometry`, `export_binary_rgba_ply`, `main` | Legacy mesh/classes → OBB/badge geometry/extraction package → experimental files. |
+| `clean_and_update_pipeline.absorb_disconnected_wall_crumbs`, `main`; `step1_remove_mesh_floaters.main` | Old projected mesh/compatibility CLI → historical cleaning / Stage 04 cleanup forwarding → legacy output/exit status. |
+| `panoptic3d_baseline.class_color`, `legacy_face_sources`, `_triangle_keys`, `recover_baseline_labels`; `panoptic3d_features._records`, `_int`, `_float`, `load_colmap_tracks` | Legacy mesh/manifests or JSON/COLMAP → normalized baseline labels/feature support → arrays/records. |
 
-Run script: `backend/06c_semantic_segmentation/run_pipeline_staged_experiments.py`.  
-Saved runs:
-- `backend/current_scene/06c_semantic_segmentation/first50_opt_grid8_reprompt_merge069/`
-- `backend/current_scene/06c_semantic_segmentation/first50_opt_grid12_noreprompt_merge069/`
+### Tests and executable checks
 
-The pipeline is partitioned into 4 decoupled batch stages across all images:
-1. **Stage 1 (Batch SAM2)**: Sequential GPU evaluation caching logits in VRAM.
-2. **Stage 2 (Batch GPU Refinement)**: Pre-pruning low IoU/area before refinement, batched GPU tensor guided filtering (`torch.nn.functional.avg_pool2d`), downsampled filament analysis, and hierarchical overlap carving. (Reduced refinement time from $4{,}619\text{ ms} \to 327\text{ ms}$, a **$14.1\times$ speedup**).
-3. **Stage 3 (Batch DINOv2)**: Spatial ViT token extraction and patch projection across all images.
-4. **Stage 4 (Semantic Merging)**: Pairwise cosine similarity matrix construction and iterative merging ($\ge 0.69$) via exact size-weighted feature sum updates.
+| Callable | Purpose |
+| --- | --- |
+| `test_clean_masks.test_shape_filter` | Deterministic acceptance/rejection of the 2-D shape filter. |
+| `test_dinov2_patches.test_only_neighboring_similar_patches_share_labels`, `test_running_cluster_mean_rejects_neighbor_that_only_matches_last_patch`, `test_small_region_merges_with_semantically_closer_touching_region`, `test_grid_rounds_wait_to_update_region_means`, `test_grow_and_merge_grid_seeds_mean_vs_boundary` | DINO patch adjacency, mean growth and merging rules. |
+| `test_letterbox.test_letterbox_coordinates` | Image/model coordinate round trip. |
+| `test_regularized_163.regularize_carved_mask`, `test_regularized_163` | One-off component/morphology regularization check. |
+| `test_fast_refinement`, `test_streamlined_refine` | Executable timing/visual experiments, not stable unit tests or production inputs. |
 
-#### Comparative Benchmark Results (50 Frames)
+## Quality and speed opportunities
 
-| Stage | Config A: $8\times 8$ Grid + Reprompt | Config B: $12\times 12$ Grid (No Reprompt) | Analysis |
-| :--- | :---: | :---: | :--- |
-| **SAM2 Inference** | $248.8\text{ ms} \pm 250.2\text{ ms}$ | **$287.6\text{ ms} \pm 66.5\text{ ms}$** | Config A has lower mean time but high variance ($\pm 250\text{ ms}$) due to secondary gap passes. Config B has ultra-consistent latency ($\pm 66\text{ ms}$) with no gap passes. |
-| **Mask Refinement** | **$327.2\text{ ms} \pm 99.9\text{ ms}$** | $458.5\text{ ms} \pm 184.5\text{ ms}$ | Config B processes $144$ grid points vs $64$, generating more raw candidate masks ($9.44$ vs $8.76$ survivors). |
-| **DINOv2 First Inference** | **$165.9\text{ ms} \pm 7.2\text{ ms}$** | $167.8\text{ ms} \pm 6.1\text{ ms}$ | Identical single GPU forward pass. |
-| **DINOv2 Iterative Merging** | **$0.64\text{ ms} \pm 0.63\text{ ms}$** | $0.75\text{ ms} \pm 0.55\text{ ms}$ | Microsecond vector additions. |
-| **Total Pipeline per Image** | **$742.5\text{ ms}$ ($1.35\text{ FPS}$)** | **$914.7\text{ ms}$ ($1.09\text{ FPS}$)** | **$6.8\times$ faster overall throughput** than unoptimized baseline ($5{,}022\text{ ms}$). |
-| **Final Objects & Coverage** | $6.72\text{ objects}$, $89.96\%$ coverage | **$7.00\text{ objects}$, $91.12\%$ coverage** | Config B yields slightly higher pixel coverage ($+1.16\%$) and slightly richer object separation. |
+These are candidates, not measured claims for every scene.
 
-### Streamlined $12\times 12$ Pipeline Benchmark (Two-Tier Regularization: Floater Cleanup & Chunk Preservation)
+| Opportunity | Evidence in code | Safe direction |
+| --- | --- | --- |
+| Projection throughput | Raycasting is per camera and vote reductions allocate large arrays. | Reuse one Open3D scene/BVH, batch ray rows, retain fixed-dtype tensors and persist only necessary evidence. Benchmark before changing stride. |
+| Vote quality | Pixel-distance and incidence weighting already exist. | Keep weights bounded per face/view, count independent view groups and compare raw/refined labels on held-out reviewed views. |
+| Beam/ceiling correctness | Normal-only reassignment confuses vertical beam sides with walls. | Use persisted priors plus crease/contact support; preserve unknown when evidence is mixed. |
+| Small-object integrity | A higher triangle minimum can merge a real small prop into its support. | Compare 1000 and 3000 on the same frozen evidence; choose the threshold using exported instances and representative views. |
+| 2-D memory and I/O | Full-scene experiments retain masks/embeddings and emit many overlays. | Stream NPZ evidence, make diagnostics opt-in and test float16 embeddings against a fixed review set. |
+| Structural analysis | `detect_structural_classes` has scene-scale and ID-oriented legacy heuristics. | Keep it downstream of evidence, cache one graph/derivative set, record RANSAC seeds and report roles as hypotheses. |
 
-Script: `backend/06c_semantic_segmentation/run_streamlined_grid12_bench.py`.  
-Saved outputs: `backend/current_scene/06c_semantic_segmentation/first50_streamlined_grid12_merge069/`
+## Redundant and legacy paths
 
-The refined $12\times 12$ single-pass pipeline incorporates:
-1. **GPU Tensor Hierarchical Overlap Carving**: Resolves overlapping proposals directly on GPU boolean tensors.
-2. **Two-Tier Regularization Filter**:
-   - **Tier 1 (Satellite Floater & Crumb Removal)**: Discards disconnected edge crumbs ($< 1{,}000\text{ px}$ or $< 5\%$ of mask mass), eliminating strings of pearls along high-contrast object seams (e.g. `frame_00163` mask #15 reduced from 45 components to **1 solid body**, mask #9 from 6 components to **1 solid body**).
-   - **Tier 2 (Morphological Ribbon Pruning & Chunk Retention)**: Strips border ribbons $< 7\text{ px}$ wide while preserving solid chunky objects ($\ge 0.5\%$ frame area, thickness $\ge 12\text{ px}$, e.g. `frame_00178` mask #3 chunky body retained, `frame_00189` border thread completely pruned).
-3. **DINOv2 First Inference & Iterative Semantic Merging ($\ge 0.69$)**.
+- `run_mesh_quality_vote_step1.py` and `run_mesh_dispute_resolution_step2.py` overlap projection/regularization. The supported worker persists source-ID-aligned evidence.
+- `run_*memory*`, `run_id_propagation.py`, `run_*bench*`, one-frame DINO scripts and executable refinement tests duplicate palettes, overlays and memory-bank logic. Keep them as research artefacts until contracts are consolidated.
+- Old cleanup functions that fill unknowns, use fixed IDs or delete small components cannot provide final semantic truth. They explain the former blobs, ceiling/wall bleed and fragmented-object failures.
+- Full-mesh diagnostics are costly. The delivery package needs one labelled mesh; retain evidence arrays and solver reports instead of duplicate coloured geometry.
 
-#### Timing Breakdown Across All 50 Frames:
-- **SAM2 Inference ($12\times 12$)**: $198.30\text{ ms} \pm 18.02\text{ ms}$ (steady single-pass, no logit transfers or re-prompting stalls).
-- **Initial Mask Refinement**: **$114.75\text{ ms} \pm 27.55\text{ ms}$** (a **$40.3\times$ speedup** over the initial $4{,}619\text{ ms}$ CPU baseline).
-- **DINOv2 First Inference**: $173.45\text{ ms} \pm 7.51\text{ ms}$.
-- **DINOv2 Iterative Merging**: $1.39\text{ ms} \pm 0.68\text{ ms}$.
-- **Total Pipeline per Image**: **$487.87\text{ ms}$ ($\mathbf{2.05\text{ FPS}}$)** (overall pipeline speedup is **$10.3\times$** compared to the original $5{,}022\text{ ms}$ baseline).
-- **Coverage & Object Separation**:
-  - Mean pixel coverage across all 50 frames: **$91.84\%$**.
-  - Averages $12.92$ initial refined proposals converging to **$8.46$ clean physical objects**.
+## Verification
 
+The last accepted numerical validation used **421 frozen 2-D frames** and **2796890 source faces**. It recorded **123 passing tests**, covering projection evidence, hard minimums, wall-angle limits, tilted supports, small-fragment merging, late plane/RGB assignment, bounded seam associations and delivery indexing.
 
+| Recorded result | Value |
+| --- | ---: |
+| Exported instances / classes | 66 / 41 |
+| Smallest exported instance | 2014 triangles |
+| Instances below the locked minimum | 0 |
+| Forbidden near-horizontal wall faces | 0 |
+| Stage 04 infill faces deferred | 140622 |
+| Infill ray hits ignored as semantic evidence | 40353 |
+| Deferred faces assigned at the final pass | 388140 of 398891 |
+| Bounded same-surface associations | 282 |
+| Residual unknown faces | 10751 (0.38% of the mesh) |
+| Full cached-evidence run / late assignment | 68.07s / 12.287s |
 
+These are recorded measurements, not a speedup or perfect-accuracy claim. Independent checks confirmed unchanged source hashes and geometry/face order, unchanged accepted observed owners during late assignment, all infill absent from observed labels, exact palette colors, valid instance files, matching face/manifest indices and bounded association links. Residual incompatible or unseeded faces remain explicit unknowns.
 
-
-
-| `first50_grid8_letterbox_gap060_trigger90_raw/` | **Current review candidate.** Fifty raw letterbox/grid-8 overlays with a 90% gap trigger. No shape cleanup is applied; black pixels are uncovered. |
-| `first50_grid8_letterbox_gap060_trigger94_raw/` | Same raw letterbox/grid-8 configuration with the earlier 94% trigger; isolates the trigger change. |
-| `grid8_letterbox_default_ablation/` | Paired contact sheets: grid 10 versus grid 8 with trigger 94%, then trigger 94% versus 90% with grid 8. `summary.json` lists per-frame coverage and steady FPS. |
-| `first50_grid10_gap060_trigger94_clean/` | Earlier stretch/grid-10 candidate with shape cleanup. Fifty PNG overlays with uncovered pixels in pure black; `contact_sheet.png` gives an overview and frame JSON files list removed masks and reasons. |
-| `first50_grid10_gap060_trigger94_letterbox_clean/` | Same settings and 50 frames with aspect-preserving padding and the same shape filter; compare directly with the current stretched candidate. |
-| `first50_grid10_gap060_trigger94_letterbox/` | Letterbox predictions before shape filtering, retained so removed proposals can be inspected. |
-| `resize_comparison_stretch_vs_letterbox/` | Paired overlays: stretch on the left, letterbox on the right. `all50_contact_sheet.png` covers all frames, `frame_*_pair.png` shows selected gains/losses at full resolution, and `comparison.json` lists per-frame coverage. |
-| `first50_grid10_gap060_trigger94/` | Same 50 frames before shape filtering. Compare against the clean run to judge removed masks; inspect black gaps and `gate94_comparison.png` for the coverage lost by skipping gap prompts. |
-| `first50_grid10_gap060_clean/` | Previous cleanup with gap prompts on every frame. Compare with the gated clean run when black gaps matter more than runtime. |
-| `first50_grid10_gap060/` | Raw 0.60 gap-stability run on every frame; retained as the source for the previous cleanup and a coverage ablation. Older JPG overlays mark unknown pixels red. |
-| `first50_grid10_complete/` | Raw 0.85 gap-stability run on every frame. Compare with 0.60 to see the effect of accepting less-stable gap proposals; older JPG overlays mark unknown red. |
-| `small_grid10_compiled/` | Eight spaced frames from the 10x10 grid alone, without gap prompts. Initial-proposal reference. |
-| `small_grid8_compiled_baseline/` | Eight spaced frames from the faster 8x8 compiled grid, without gap prompts. Compare proposal coverage with grid 10. |
-| `small_grid8_eager_reference/` | Same 8x8 settings without compilation; speed ablation for the compiled path. |
-| `standard_amg_grid8_reference/` | Three frames from SAM2's standard automatic generator; older implementation reference, not a full-scene result. |
-| `worst4_gap_stability060/` | Four difficult frames used to check the 0.60 gap threshold before the full run; superseded by the 50-frame runs. |
-
-`sam2_proposals/inference_profile.json` contains per-stage timing for three
-difficult frames. Grid 8 compiled reached 10.99 FPS; grid 10 alone reached
-9.01 FPS. The extra decoder passes and connected-region work explain the
-remaining drop to 4.30 FPS when gap prompting runs on every frame.
-
-Inspection snapshots (2026-10-13): [current state](../../agents_files/artifacts/panoptic3d/CURRENT_STATE.md) and [baseline/current checkpoint meshes](../../agents_files/artifacts/panoptic3d/inspection_checkpoints_2026-10-13/README.md). The bag-only snapshot has cached validation; full-scene final acceptance remains pending.
-
-## Frozen-prior 3D refinement
-
-[`mesh_prior_refinement.py`](mesh_prior_refinement.py) provides a separate refinement
-workflow for an existing sealed mesh and frozen multi-view source evidence. Source
-IDs are opaque: correction uses evidence, mesh topology, RGB, and geometry, without
-object names, coordinates, structural roles, or prescribed instance counts.
-
-The reviewed sequence is confidence correction with `correct_confident_faces`,
-graph cleanup with `refine_graph_labels`, then a second graph pass supplying the
-pre-correction labels as `geometry_reference_labels`. The reference pass learns
-separate component orientation models from corroborated surfaces; it evaluates
-whole components to preserve local roughness and differently oriented instances.
-Evidence rows and reference labels must match the exact mesh face ordering, and
-view counts must represent independent camera groups. Geometry remains unchanged.
-
-The accepted snapshot is `agents_files/artifacts/projection_refinement/generic_graph_orientations`.
-Open it from the repository with:
-
-```bash
-bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 189
-```
-
-The window title identifies the snapshot. Its source hashes, verification and
-reproduction scripts are preserved with the artifacts. The existing step2/step3
-orchestration has not been switched to this workflow. Accuracy on other scenes
-still requires empirical validation.
-
-An optional final pass, [`wall_orientation_refinement.py`](wall_orientation_refinement.py),
-excludes horizontal triangles from the wall class. Call `refine_wall_orientations`
-with the wall IDs, a gravity axis, and a length tolerance derived from reconstruction
-uncertainty. A face normal within 45 degrees of either gravity direction triggers
-exclusion, regardless of lateral support or patch size.
-
-Neighboring labels and frozen source evidence determine the non-wall owner.
-When available, only components with corroborating source evidence can supply
-new ownership, preventing unobserved remnants from growing. Without a labeled
-neighbor, the pass uses proximity along the mesh; disconnected pieces fall back
-to spatial proximity. Every excluded
-triangle receives an existing positive non-wall label. Other labels and geometry
-are preserved. Input without any existing non-wall label raises an error rather
-than inventing an identity. This pass uses the supplied wall role, with no fixed
-IDs, scene coordinates, object-specific rules, or instance-count targets.
-
-The separate inspection candidate is available with:
-
-```bash
-bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 5 generic_wall_horizontal_cut_anchored
-```
-
-This strict policy also excludes valid horizontal wall caps in other scenes;
-enable it only when that exclusion is intended. Candidate visual acceptance
-remains pending.
-
-[`planar_gap_completion.py`](planar_gap_completion.py) adds semantic labels to
-selected unknown sealing faces while preserving every existing positive label.
-It provides two conservative completion methods:
-
-- `complete_planar_gaps` uses the nearest compatible original labeled boundary.
-  All three triangle vertices must fit that reference plane within the supplied
-  reconstruction tolerance, and plane normals must agree within 20 degrees.
-  Normal signs are ignored because generated sealing fans can fold back.
-- `complete_bounded_gaps` handles folded generated patches whose local normals
-  are unreliable. A patch must be closed, with at least 95% of boundary length
-  carrying one owner and trusted seeds on at least 50%. An existing different
-  label inside the patch vetoes completion. Patch membership is separate from
-  face eligibility, so observed unknowns can remain protected inside a hole.
-
-Both methods use caller-selected masks and opaque IDs. They must receive the
-exact mesh face ordering; neither changes geometry. The ceiling experiment
-restricts eligibility to added sealing faces without frozen observations and
-uses existing ceiling components corroborated by three independent views,
-three effective views and at least 75% source evidence. Both methods evaluate
-the original labels independently, preventing inferred faces from training the
-other completion method. Unsupported or mixed patches can remain unknown.
-
-Inspect the separate candidate with:
-
-```bash
-bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_ceiling_bounded_completion
-```
-
-Its geometry, original labels, source snapshots and hashes are preserved in the
-artifact directory. This is semantic inference over existing hole fills, not
-evidence that the generated caps reconstruct the physical ceiling accurately.
-
-[`surface_label_refinement.py`](surface_label_refinement.py) corrects existing
-labels on caller-selected surface patches. `reclaim_compatible_surfaces` groups
-faces by label, normal continuity and local RGB continuity, fits an area-weighted
-plane, and checks nearby original reference triangles against that plane and
-appearance. Plane residuals use the supplied reconstruction tolerance; supported
-local roughness is retained. RGB values must use the normalized 0–1 range.
-
-The ceiling correction experiment protects reviewed non-wall objects using the
-checkpoint before wall cleanup, together with corroborated object components.
-It permits wall surfaces to move to ceiling only where geometry and appearance
-support an existing ceiling plane. References come from original mesh faces;
-inferred cap faces do not train these surface models. It then repeats the guarded
-unknown-face completion using the corrected labels. The separate candidate is:
-
-```bash
-bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_ceiling_corrected
-```
-
-Spotlight now separates display vertices along the active class boundary, so its
-color cannot interpolate onto adjacent ceiling, wall or unknown triangles. Saved
-mesh geometry, face ordering and labels are unaffected. Reopen an existing viewer
-to load this display fix. Press `S` to switch between Spotlight, Solo and Rainbow.
-
-`complete_geometric_regions` is a separate whole-region fallback for mixed-label
-boundaries. It fits each connected unknown region using exact surface-area
-moments. Neighboring triangle planes vote by shared boundary length, discounted
-by whole-region plane residual and normal disagreement (20-degree angular scale).
-The supplied reconstruction tolerance and measured region roughness set the
-distance scale. The best supported owner receives the entire eligible region;
-all positive labels and excluded faces remain fixed. Classes are opaque IDs.
-Unlike the conservative methods above, this deliberately chooses an owner even
-when the evidence is ambiguous. A region without a labeled boundary is left
-unchanged; no global owner or invented ID is used.
-
-The reversible `experiment_geometric_regions.py` applies this fallback to all
-remaining unknown faces of `generic_ceiling_corrected`. Its current-scene check
-requires zero remaining unknowns and exact preservation of existing labels:
-
-```bash
-bash agents_files/artifacts/projection_refinement/inspect_candidate.sh 1 generic_geometric_region_completion
-```
-
-Geometry remains unchanged. Whole-region ownership also retains folds in generated
-caps, so individual inferred triangles may disagree with their owner's overall
-surface orientation. This candidate does not enforce triangle-level orientation
-constraints on newly labeled caps. The user visually accepted this checkpoint for
-the current scene; it is now the inspection launcher's default. This is not
-empirical validation on other scenes or automatic integration into the pipeline.
+Local evidence: [horse and shelf](../../agents_files/artifacts/segmentation_core_fix/deferred_horse_and_shelf.png), [wall patches](../../agents_files/artifacts/segmentation_core_fix/deferred_wall_patches.png), [ceiling](../../agents_files/artifacts/segmentation_core_fix/deferred_ceiling.png), [independent acceptance](../../agents_files/artifacts/segmentation_core_fix/deferred_acceptance.json), and [residual diagnostics](../../agents_files/artifacts/segmentation_core_fix/unresolved_diagnostic.json). Images compare the earlier 1000-triangle result with the accepted 2000-triangle result from identical cameras. Earlier comparison packages and backups are historical evidence; production writes only `scan_N/segmentation/`.

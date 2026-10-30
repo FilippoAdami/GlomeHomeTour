@@ -1,0 +1,19 @@
+{
+  "model_load_seconds": 15.40405672199995,
+  "model_unload_seconds": 0.2674906499996723,
+  "total_seconds": 641.1600245379996,
+  "mean_image_seconds": 62.53958664750098,
+  "max_image_seconds": 97.58847346900075,
+  "images": [
+    "../images/bench.jpg",
+    "../images/desk_scene.jpg",
+    "../images/drawer.jpg",
+    "../images/library.jpg",
+    "../images/mirror.jpg",
+    "../images/person.jpg",
+    "../images/punchingbag.jpg",
+    "../images/puzzle.jpg",
+    "../images/radiator.jpg",
+    "../images/worldmap.jpg"
+  ]
+}

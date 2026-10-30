@@ -1,0 +1,14 @@
+{
+  "model_load_seconds": 7.88121713999999,
+  "pipeline_seconds": 47.51761943400015,
+  "end_to_end_seconds": 56.12403623399996,
+  "peak_allocated_gib": 4.753656387329102,
+  "device": "AMD Radeon RX 9060 XT",
+  "torch": "2.10.0+rocm7.0",
+  "hip": "7.0.51831",
+  "steps": 20,
+  "guidance_scale": 3.0,
+  "num_gaussians": 262144,
+  "attention_backend": "AOTriton SDPA",
+  "placement": "CPU stage offload"
+}

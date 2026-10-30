@@ -9,9 +9,9 @@ import matplotlib.patches as patches
 from pathlib import Path
 
 frames = [f'frame_{i:05d}' for i in [0, 4, 6, 12, 17, 23, 29, 33, 37, 42]]
-img_dir = Path('backend/current_scene/06c_semantic_segmentation/inputs/images')
-masks_dir = Path('backend/current_scene/06c_semantic_segmentation/sam2_proposals/first10_stab80_iou50_reg05pct')
-out_dir = Path('backend/current_scene/06c_semantic_segmentation/dinov2_merged_070/first10_stab80_iou50_reg05pct')
+img_dir = Path('backend/current_scene/05_semantic_segmentation/inputs/images')
+masks_dir = Path('backend/current_scene/05_semantic_segmentation/sam2_proposals/first10_stab80_iou50_reg05pct')
+out_dir = Path('backend/current_scene/05_semantic_segmentation/dinov2_merged_070/first10_stab80_iou50_reg05pct')
 out_dir.mkdir(parents=True, exist_ok=True)
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

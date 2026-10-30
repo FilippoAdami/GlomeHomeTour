@@ -99,9 +99,25 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     val written = AtomicInteger()
     val droppedQueue = AtomicInteger()
 
-    /** Touched on the GL thread only, until finish() hands them to the writer thread. */
-    private val keyframes = ArrayList<DatasetFormat.Keyframe>()
-    private val trajectory = StringBuilder(1 shl 16).apply { append(DatasetFormat.TRAJECTORY_HEADER).append('\n') }
+    class RoomData(
+        val roomIndex: Int,
+        val keyframes: ArrayList<DatasetFormat.Keyframe> = ArrayList(),
+        val trajectory: StringBuilder = StringBuilder(1 shl 16).apply { append(DatasetFormat.TRAJECTORY_HEADER).append('\n') },
+        var summaryJson: String? = null,
+        var fx: Float = 0f,
+        var fy: Float = 0f,
+        var cx: Float = 0f,
+        var cy: Float = 0f,
+        var width: Int = 0,
+        var height: Int = 0,
+        var k1: Float? = null,
+        var k2: Float? = null,
+    ) {
+        val folderName: String get() = "scan_$roomIndex"
+    }
+
+    private var activeRoom = RoomData(0)
+    private val completedRooms = ArrayList<RoomData>()
 
     /** Writer-thread scratch, allocated once per session. See addKeyframe. */
     private var planeY: ByteArray? = null
@@ -117,7 +133,8 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
      * scoped storage (see project_history.md). One shared folder never has that problem. */
     private val mediaAlbumPath = "Documents/$ALBUM"
 
-    val keyframeCount: Int get() = keyframes.size
+    val keyframeCount: Int get() = completedRooms.sumOf { it.keyframes.size } + activeRoom.keyframes.size
+    val currentRoomKeyframeCount: Int get() = activeRoom.keyframes.size
 
     /** Human-readable destination for the HUD; only meaningful after the probe has run. */
     val destination: String
@@ -134,7 +151,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         qx: Float, qy: Float, qz: Float, qw: Float,
         tracking: String, exported: Boolean,
     ) {
-        trajectory.append(
+        activeRoom.trajectory.append(
             DatasetFormat.trajectoryLine(timestampNs, tx, ty, tz, qx, qy, qz, qw, tracking, exported)
         ).append('\n')
     }
@@ -178,19 +195,20 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        val name = "frame_%05d.jpg".format(keyframes.size)
-        keyframes.add(
+        val name = "frame_%05d.jpg".format(activeRoom.keyframes.size)
+        activeRoom.keyframes.add(
             DatasetFormat.Keyframe(
                 name, matrix, timestampNs, fx, fy, cx, cy,
                 focusDistanceDiopters, afState, afMode, focalLengthMm, compassHeadingDeg,
                 numPoints = numPoints,
             )
         )
+        val folder = activeRoom.folderName
         queued.incrementAndGet()
         handler.post {
             try {
                 Nv21.interleave(y, u, v, width, height, uvRowStride, uvPixelStride, out)
-                openOutput("images", name, "image/jpeg")?.use { o ->
+                openOutput("$folder/images", name, "image/jpeg")?.use { o ->
                     YuvImage(out, ImageFormat.NV21, width, height, null)
                         .compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, o)
                 }
@@ -202,6 +220,27 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             }
         }
         return true
+    }
+
+    fun finishCurrentRoom(
+        fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int,
+        summaryJson: String,
+        k1: Float? = null, k2: Float? = null,
+    ) {
+        activeRoom.fx = fx
+        activeRoom.fy = fy
+        activeRoom.cx = cx
+        activeRoom.cy = cy
+        activeRoom.width = width
+        activeRoom.height = height
+        activeRoom.summaryJson = summaryJson
+        activeRoom.k1 = k1
+        activeRoom.k2 = k2
+    }
+
+    fun startNewRoom(roomIndex: Int) {
+        completedRooms.add(activeRoom)
+        activeRoom = RoomData(roomIndex)
     }
 
     /**
@@ -217,14 +256,26 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         k1: Float? = null, k2: Float? = null,
         onDone: (String) -> Unit,
     ) {
-        val transforms = DatasetFormat.transformsJson(fx, fy, cx, cy, width, height, keyframes, k1, k2)
-        val csv = trajectory.toString()
-        val focusJson = DatasetFormat.focusMetadataJson(keyframes)
+        finishCurrentRoom(fx, fy, cx, cy, width, height, summaryJson, k1, k2)
+        val allRooms = completedRooms + listOf(activeRoom)
+        val roomSnapshots = allRooms.map { room ->
+            val transforms = DatasetFormat.transformsJson(
+                room.fx, room.fy, room.cx, room.cy, room.width, room.height,
+                room.keyframes, room.k1, room.k2
+            )
+            val csv = room.trajectory.toString()
+            val focusJson = DatasetFormat.focusMetadataJson(room.keyframes)
+            val summary = room.summaryJson ?: summaryJson
+            Triple(room.folderName, Triple(transforms, csv, focusJson), summary)
+        }
         handler.post {
-            writeText("transforms.json", "application/json", transforms)
-            writeText("trajectory.csv", "text/csv", csv)
-            writeText("coverage_summary.json", "application/json", summaryJson)
-            writeText("focus_metadata.json", "application/json", focusJson)
+            for ((folder, manifests, summary) in roomSnapshots) {
+                val (transforms, csv, focusJson) = manifests
+                writeText("$folder/transforms.json", "application/json", transforms)
+                writeText("$folder/trajectory.csv", "text/csv", csv)
+                writeText("$folder/coverage_summary.json", "application/json", summary)
+                writeText("$folder/focus_metadata.json", "application/json", focusJson)
+            }
             onDone(destination)
         }
     }
@@ -246,11 +297,13 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         }
     }
 
-    private fun writeText(name: String, mime: String, body: String) {
+    private fun writeText(path: String, mime: String, body: String) {
         try {
-            openOutput(null, name, mime)?.use { it.write(body.toByteArray()) }
+            val dir = if (path.contains('/')) path.substringBeforeLast('/') else null
+            val name = if (path.contains('/')) path.substringAfterLast('/') else path
+            openOutput(dir, name, mime)?.use { it.write(body.toByteArray()) }
         } catch (e: Exception) {
-            Log.w(TAG, "manifest write failed: $name", e)
+            Log.w(TAG, "manifest write failed: $path", e)
         }
     }
 
@@ -261,7 +314,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             return FileOutputStream(File(target, name))
         }
         val uri = insert(flatName(dir, name), mime) ?: return null
-        val stream = context.contentResolver.openOutputStream(uri) ?: return null
+        val stream = context.contentResolver.openOutputStream(uri, "wt") ?: return null
         // IS_PENDING keeps half-written files hidden from other apps; clearing it is what
         // publishes them (same lesson as mobile_sphere_capture's GalleryOutput).
         return object : OutputStream() {
@@ -380,18 +433,33 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     }
 }
 
-/** "$sessionName_$name" for root files, "$sessionName_${dir}_$name" for e.g. images -- keeps
+/** "$sessionName_$name" for root files, "$sessionName_${dir}_$name" for e.g. images or scan_0/images -- keeps
  * every MediaStore file for this session unique and self-groupable under the flat album folder
  * without ever creating a per-session directory (see DatasetWriter.mediaAlbumPath). */
 internal fun flatMediaName(sessionName: String, dir: String?, name: String): String =
-    if (dir == null) "${sessionName}_$name" else "${sessionName}_${dir}_$name"
+    if (dir == null) "${sessionName}_$name" else "${sessionName}_${dir.replace('/', '_')}_$name"
 
 /** Inverse of [flatMediaName]: strips the session prefix back off a MediaStore display name so
  * it can be re-added to the zip at the same path the fallback (nested-folder) writer produces,
- * e.g. "${sessionName}_images_frame_00005.jpg" -> "images/frame_00005.jpg". */
+ * e.g. "${sessionName}_scan_0_images_frame_00005.jpg" -> "scan_0/images/frame_00005.jpg",
+ * "${sessionName}_scan_0_transforms.json" -> "scan_0/transforms.json",
+ * "${sessionName}_certificate.json" -> "certificate.json". */
 internal fun unflattenMediaName(sessionName: String, displayName: String): String {
     val rest = displayName.removePrefix("${sessionName}_")
-    return if (rest.startsWith("images_")) "images/${rest.removePrefix("images_")}" else rest
+    val scanImagesRegex = Regex("""^scan_(\d+)_images_(.*)$""")
+    val scanImagesMatch = scanImagesRegex.matchEntire(rest)
+    if (scanImagesMatch != null) {
+        return "scan_${scanImagesMatch.groupValues[1]}/images/${scanImagesMatch.groupValues[2]}"
+    }
+    val scanFileRegex = Regex("""^scan_(\d+)_(.*)$""")
+    val scanFileMatch = scanFileRegex.matchEntire(rest)
+    if (scanFileMatch != null) {
+        return "scan_${scanFileMatch.groupValues[1]}/${scanFileMatch.groupValues[2]}"
+    }
+    if (rest.startsWith("images_")) {
+        return "images/${rest.removePrefix("images_")}"
+    }
+    return rest
 }
 
 /** Deletes [dir] and then its parents, one level at a time, stopping at the first non-empty

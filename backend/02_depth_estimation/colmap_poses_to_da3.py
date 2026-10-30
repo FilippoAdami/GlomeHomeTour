@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Substep 4a -- COLMAP poses/intrinsics -> the arrays DA3 consumes.
 
-DA3 must be fed the COLMAP-refined poses from ``sparse/0/``, never the raw
-ARCore poses in ``transforms.json``: the refined ones are the corrected ones,
-and feeding ARCore poses here would reintroduce exactly the drift step 2 just
-removed.
+DA3 is fed the COLMAP poses from ``sparse/0/``. For ARCore-origin captures,
+step 01 also rewrites ``transforms.json`` from that model so its camera centers
+can validate the same coordinate frame; the raw ARCore poses are not used here.
 
 **No conversion math is required, and applying any is the bug.** COLMAP stores
 ``(qvec, tvec)`` as an OpenCV *world-to-camera* pose, which is precisely what
@@ -92,7 +91,13 @@ def build_da3_poses(
         w2c[i, :3, 3] = img.tvec
 
         cam = intrinsics[img.camera_id]
-        fx, fy, cx, cy = cam.params[:4]
+        if cam.model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
+            fx = fy = cam.params[0]
+            cx, cy = cam.params[1:3]
+        elif cam.model in ("PINHOLE", "OPENCV", "FULL_OPENCV"):
+            fx, fy, cx, cy = cam.params[:4]
+        else:
+            raise ValueError(f"Unsupported COLMAP camera model for DA3 poses: {cam.model}")
         k_mats[i] = np.array([[fx * scale, 0.0, cx * scale],
                               [0.0, fy * scale, cy * scale],
                               [0.0, 0.0, 1.0]], dtype=np.float32)
@@ -105,8 +110,7 @@ def validate_poses(w2c: np.ndarray, expected_centres: np.ndarray | None = None,
     """Assert the poses are proper rigid world-to-camera transforms.
 
     A double-applied conversion shows up here as a mirrored determinant or as
-    camera centres that do not sit near the ARCore ones, rather than as
-    plausible-but-wrong depth 20 minutes later.
+    camera centres that do not match the transforms manifest.
     """
     rot = w2c[:, :3, :3].astype(np.float64)
     dets = np.linalg.det(rot)
@@ -127,7 +131,7 @@ def validate_poses(w2c: np.ndarray, expected_centres: np.ndarray | None = None,
         if np.median(offset) > tol_m:
             raise ValueError(
                 f"recovered camera centres sit {np.median(offset):.2f} m (median) from the "
-                f"transforms.json positions, over the {tol_m} m refinement tolerance. "
+                f"transforms.json positions, over the {tol_m} m tolerance. "
                 "That is a mirrored or doubly-inverted pose, not bundle adjustment.")
     return stats
 
@@ -153,8 +157,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {len(names)} world-to-camera poses to {out}")
     print(f"  det in [{stats['det_min']:.6f}, {stats['det_max']:.6f}], "
           f"orthonormality err {stats['max_ortho_err']:.2e}")
-    print(f"  camera centres vs transforms.json: median {stats['centre_offset_median_m'] * 100:.1f} cm, "
-          f"max {stats['centre_offset_max_m'] * 100:.1f} cm")
+    print(f"  camera centres vs transforms.json: median {stats['centre_offset_median_m']:.6g} scene units, "
+          f"max {stats['centre_offset_max_m']:.6g} scene units")
     return 0
 
 

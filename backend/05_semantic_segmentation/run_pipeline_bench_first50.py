@@ -1,3 +1,4 @@
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, torch, numpy as np
@@ -9,6 +10,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 from fast_sam2_generator import FastSAM2Generator
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 def guided_filter_rgb(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps: float = 1e-3) -> np.ndarray:
     guide = guide.astype(np.float32) / 255.0
@@ -38,12 +40,14 @@ def guided_filter_rgb(guide: np.ndarray, src: np.ndarray, radius: int = 4, eps: 
     return q
 
 def main():
+    parser = argparse.ArgumentParser(description="Benchmark the first 50 registered scene frames.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
-    workspace = Path("backend/current_scene/06c_semantic_segmentation")
-    img_dir = workspace / "inputs" / "images"
-    all_images = sorted(img_dir.glob("*.jpg"))[:50]
+    workspace = stage_directory(args.workspace)
+    all_images = registered_images(args.workspace)[:50]
     print(f"Found {len(all_images)} images to process.")
 
     out_dir = workspace / "first50_stab80_iou50_reg05pct_merge069"

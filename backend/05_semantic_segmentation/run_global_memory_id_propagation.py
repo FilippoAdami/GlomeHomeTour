@@ -16,6 +16,7 @@ Global Memory Bank ID Propagation with:
    - Labels show: #ID (N_frames, avg_gap) where avg_gap is the mean interval between appearances.
 """
 
+import argparse
 import os, sys, json, time
 from pathlib import Path
 import cv2, numpy as np
@@ -23,6 +24,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from scene_inputs import DEFAULT_WORKSPACE, registered_images, stage_directory
 
 BASE_THRESHOLD = 0.690
 MAX_BASE_THRESHOLD = 0.730
@@ -408,10 +410,14 @@ class GlobalMemoryBank:
         return new_assignments
 
 def main():
-    root = Path(__file__).resolve().parent.parent
-    data_dir = root / "current_scene" / "06c_semantic_segmentation" / "first50_streamlined_grid12_merge069"
-    img_dir = root / "current_scene" / "06c_semantic_segmentation" / "inputs" / "images"
-    out_dir = root / "current_scene" / "06c_semantic_segmentation" / "first50_global_memory_bank"
+    parser = argparse.ArgumentParser(description="Propagate IDs with the global semantic memory bank.")
+    parser.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    args = parser.parse_args()
+    workspace = stage_directory(args.workspace)
+    data_dir = workspace / "first50_streamlined_grid12_merge069"
+    image_paths = registered_images(args.workspace)
+    img_dir = image_paths[0].parent
+    out_dir = workspace / "first50_global_memory_bank"
     out_dir.mkdir(parents=True, exist_ok=True)
     pair_vis_dir = out_dir / "pairwise_transitions"
     pair_vis_dir.mkdir(parents=True, exist_ok=True)

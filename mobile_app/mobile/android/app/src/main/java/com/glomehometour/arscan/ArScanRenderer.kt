@@ -212,8 +212,7 @@ class ArScanRenderer(
      * while the operator is still in pre-flight, then simply stop being called once scanning
      * starts -- the last values set are what stay locked for the session. */
     fun adjustExposure(iso: Int, shutterNanos: Long) {
-        cameraPipeline?.isoSensitivity = iso
-        cameraPipeline?.shutterNanos = shutterNanos
+        cameraPipeline?.setExposure(iso, shutterNanos)
     }
 
     val pipeline: CameraPipeline? get() = cameraPipeline

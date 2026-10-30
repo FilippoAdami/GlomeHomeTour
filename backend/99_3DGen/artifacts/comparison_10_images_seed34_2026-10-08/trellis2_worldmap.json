@@ -1,0 +1,39 @@
+{
+  "model": "microsoft/TRELLIS.2-4B",
+  "image": "/home/monday/Desktop/3DGen/images/worldmap.jpg",
+  "output": "/home/monday/Desktop/3DGen/artifacts/comparison_10_images_seed34_2026-10-08/trellis2_worldmap.glb",
+  "gpu": "AMD Radeon RX 9060 XT",
+  "hip": "7.0.51831",
+  "seed": 34,
+  "pipeline_type": "1024_cascade",
+  "resolution": 1024,
+  "low_vram": true,
+  "model_load_seconds": 61.13753428099881,
+  "gpu_resident_setup_seconds": 0.0,
+  "inference_seconds": 47.53136906800137,
+  "glb_export_seconds": 16.684130728997843,
+  "total_seconds": 125.36449604199879,
+  "peak_allocated_gib": 4.762181282043457,
+  "steps_seconds": {
+    "preprocess_image": [
+      2.781549243001791
+    ],
+    "get_cond": [
+      1.5300878080015536,
+      3.2798888060024183
+    ],
+    "sample_sparse_structure": [
+      14.536261466000724
+    ],
+    "sample_shape_slat_cascade": [
+      17.166299325999717
+    ],
+    "sample_tex_slat": [
+      6.63909027399859
+    ],
+    "decode_latent": [
+      1.5968823410003097
+    ]
+  },
+  "glb_bytes": 5835984
+}

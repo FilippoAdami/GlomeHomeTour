@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 
-DEFAULT_WORKSPACE = Path(__file__).resolve().parents[1] / "current_scene" / "06c_semantic_segmentation"
+from scene_inputs import DEFAULT_WORKSPACE, resolve_scene
 
 
 def shape_reasons(mask: np.ndarray) -> tuple[list[str], dict]:
@@ -69,7 +69,8 @@ def main() -> None:
     for value in (args.source, args.run_name):
         if Path(value).name != value or value in {".", ".."}:
             parser.error("--source and --run-name must be directory names")
-    root = args.workspace / "sam2_proposals"
+    scan = resolve_scene(args.workspace)
+    root = scan / "05_semantic_segmentation/sam2_proposals"
     source, output = root / args.source, root / args.run_name
     if source.resolve() == output.resolve():
         parser.error("Source and output must differ")
@@ -95,7 +96,7 @@ def main() -> None:
         assert np.all(labels > 0) and np.array_equal(residual, ~cleaned.any(axis=0))
         np.savez_compressed(output / f"{stem}.npz", masks=cleaned, labels=labels, residual=residual)
 
-        image = cv2.imread(str(args.workspace / "inputs" / "images" / record["image"]))
+        image = cv2.imread(str(scan / "images" / record["image"]))
         if image is None:
             raise OSError(f"Cannot read image {record['image']}")
         overlay = image.copy()

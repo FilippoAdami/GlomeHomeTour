@@ -17,7 +17,7 @@ from analyze_new_step import ROOT, closest_surface
 SCENE = ROOT / "current_scene"
 INPUT = SCENE / "06_mesh_elaboration/new_step"
 OUTPUT = INPUT / "outputs"
-RUN = OUTPUT / "panoptic3d_workspace/06c_semantic_segmentation/panoptic3d_current_source_candidate"
+RUN = OUTPUT / "panoptic3d_workspace/05_semantic_segmentation/panoptic3d_current_source_candidate"
 ROLE_COLORS = {"wall": (0.2, 0.55, 1.0), "floor": (0.2, 0.9, 0.3), "ceiling": (1.0, 0.65, 0.1)}
 MAX_PREVIEW_FACES_PER_INSTANCE = 1200
 

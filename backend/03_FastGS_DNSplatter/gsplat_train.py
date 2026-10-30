@@ -7,6 +7,7 @@ or Inria Gaussian Splatting modules.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -30,7 +31,8 @@ def _rotation(q: np.ndarray) -> np.ndarray:
                      (2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y))), dtype=np.float32)
 
 
-def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
+def load_cameras(workspace: str | Path, resolution: int = 1,
+                 sparse_dir: str | Path | None = None) -> list[dict]:
     """Read COLMAP text cameras into gsplat-ready camera dictionaries.
 
     ``viewmat`` is a world-to-camera transform and ``K`` is scaled together
@@ -39,7 +41,7 @@ def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
     if resolution < 1:
         raise ValueError("resolution must be a positive integer")
     workspace = Path(workspace)
-    sparse = workspace / "sparse" / "0"
+    sparse = Path(sparse_dir) if sparse_dir is not None else workspace / "sparse" / "0"
     cameras_file, images_file = sparse / "cameras.txt", sparse / "images.txt"
     if not cameras_file.is_file() or not images_file.is_file():
         raise FileNotFoundError("gsplat trainer requires sparse/0/cameras.txt and images.txt")
@@ -50,12 +52,17 @@ def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
         item = line.split()
         camera_id, model, width, height = int(item[0]), item[1], int(item[2]), int(item[3])
         p = [float(x) for x in item[4:]]
-        if model == "SIMPLE_PINHOLE":
+        if model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"):
             fx = fy = p[0]; cx, cy = p[1:3]
-        elif model == "PINHOLE":
+            distortion = p[3:]
+        elif model in ("PINHOLE", "OPENCV", "FULL_OPENCV"):
             fx, fy, cx, cy = p[:4]
+            distortion = p[4:]
         else:
             raise ValueError(f"unsupported COLMAP camera model {model}; undistort to PINHOLE first")
+        if any(value != 0 for value in distortion):
+            raise ValueError(f"COLMAP camera {camera_id} ({model}) has nonzero distortion; "
+                             "stage 03 requires undistorted pinhole inputs")
         intrinsics[camera_id] = width, height, fx, fy, cx, cy
     result = []
     lines = images_file.read_text(encoding="utf-8").splitlines()
@@ -68,7 +75,7 @@ def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
         if index + 1 >= len(lines):
             raise ValueError("malformed COLMAP images.txt: image header has no points line")
         index += 2  # The following line is the (possibly empty) POINTS2D list.
-        item = header.split()
+        item = header.split(maxsplit=9)
         camera_id, image_name = int(item[8]), item[9]
         width, height, fx, fy, cx, cy = intrinsics[camera_id]
         image_path = workspace / "images" / image_name
@@ -77,8 +84,9 @@ def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
         new_width, new_height = width // resolution, height // resolution
         if not new_width or not new_height:
             raise ValueError(f"resolution {resolution} is too large for {image_name}")
-        K = np.array(((fx / resolution, 0, cx / resolution),
-                      (0, fy / resolution, cy / resolution), (0, 0, 1)), dtype=np.float32)
+        sx, sy = new_width / width, new_height / height
+        K = np.array(((fx * sx, 0, cx * sx),
+                      (0, fy * sy, cy * sy), (0, 0, 1)), dtype=np.float32)
         viewmat = np.eye(4, dtype=np.float32)
         viewmat[:3, :3] = _rotation(np.asarray(item[1:5], dtype=np.float64))
         viewmat[:3, 3] = np.asarray(item[5:8], dtype=np.float32)
@@ -87,6 +95,42 @@ def load_cameras(workspace: str | Path, resolution: int = 1) -> list[dict]:
     if not result:
         raise ValueError("COLMAP reconstruction has no registered images")
     return result
+
+
+def restore_source_frame_cameras(workspace: str | Path, cameras: list[dict]) -> list[dict]:
+    """Undo Phase 04's in-place pose alignment for Stage 03 retraining."""
+    report = Path(workspace) / "mesh.json"
+    try:
+        alignment = json.loads(report.read_text(encoding="utf-8")).get("mesh_alignment", {})
+    except (OSError, ValueError):
+        return cameras
+    if not alignment.get("poses_written_in_place"):
+        return cameras
+    transform = np.asarray(alignment.get("transform_matrix"), dtype=np.float64)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError(f"Invalid Phase 04 camera transform in {report}")
+    for camera in cameras:
+        camera["viewmat"] = (camera["viewmat"].astype(np.float64) @ transform).astype(np.float32)
+    return cameras
+
+
+def _training_inputs(workspace: Path, cameras: list[dict], use_depth_cloud: bool,
+                     depth_supervision: bool, normal_supervision: bool) -> Path:
+    """Validate scan-local stage 01/02 inputs without changing upstream files."""
+    cloud = workspace / ("depth/points3D_depth.ply" if use_depth_cloud else "sparse/0/points3D.ply")
+    if not cloud.is_file():
+        raise FileNotFoundError(f"Initialization cloud missing: {cloud}")
+    if depth_supervision or normal_supervision:
+        stems = [camera["image_path"].stem for camera in cameras]
+        if len(stems) != len(set(stems)):
+            raise ValueError("COLMAP image stems must be unique to match stage 02 depth/normal maps")
+    for folder, enabled in (("depth_maps", depth_supervision), ("normal_maps", normal_supervision)):
+        if enabled:
+            for camera in cameras:
+                path = workspace / "depth" / folder / f"{camera['image_path'].stem}.npy"
+                if not path.is_file():
+                    raise FileNotFoundError(f"Requested supervision map missing: {path}")
+    return cloud
 
 
 def _load_points(path: Path, max_points: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -155,12 +199,12 @@ def _camera_tensor(camera: dict, name: str, device: torch.device) -> torch.Tenso
 
 
 def _map_tensor(root: Path, camera: dict, channels: int, device: torch.device,
-                cache: dict | None = None) -> torch.Tensor | None:
+                cache: dict | None = None, normal_model: str = "stablenormal") -> torch.Tensor | None:
     """Cache preprocessed CPU maps; training supplies shared memory ceilings."""
     if cache is None:
         cache = camera.setdefault("_maps", {"values": OrderedDict(), "bytes": 0})
     maps = cache["values"]
-    key = root, camera["image_path"], camera["height"], camera["width"], channels
+    key = root, camera["image_path"], camera["height"], camera["width"], channels, normal_model
     if key in maps:
         value = maps[key]
         maps.move_to_end(key)
@@ -169,8 +213,16 @@ def _map_tensor(root: Path, camera: dict, channels: int, device: torch.device,
         value = None
         if path.is_file():
             data = np.load(path, allow_pickle=False)
+            expected_shape = "(H, W)" if channels == 1 else f"(H, W, {channels})"
+            if (data.ndim != (2 if channels == 1 else 3)
+                    or (channels != 1 and data.shape[-1] != channels)
+                    or min(data.shape[:2]) < 1 or data.dtype.kind != "f"):
+                raise ValueError(f"{path}: expected floating-point {expected_shape}, got {data.shape} {data.dtype}")
             if channels == 1:
                 data = data[..., None]
+            elif normal_model == "depth_gradient":
+                # OpenGL normals toward the camera -> OpenCV normals with +Z orientation.
+                data = data * np.array([-1, 1, 1], dtype=data.dtype)
             value = torch.from_numpy(data)
             # Keep stage 02's float16 storage; conversion to float32 is exact.
             if value.dtype != torch.float16:
@@ -255,6 +307,100 @@ def _training_loss(colors: torch.Tensor, alphas: torch.Tensor, target: torch.Ten
     return loss
 
 
+def remove_cluster_floaters(
+    splats: torch.nn.ParameterDict,
+    min_cluster_size: int = 500,
+    min_distance: float = 0.10,
+    min_samples: int = 10,
+) -> tuple[torch.nn.ParameterDict, dict]:
+    """Remove floaters detached from any significant cluster of Gaussians using SOR.
+
+    1. Group Gaussians into spatial components using DBSCAN (eps=min_distance, min_points=min_samples).
+    2. Clusters with count >= min_cluster_size are considered significant clusters.
+    3. Any Gaussian not in a significant cluster whose distance to the nearest significant cluster
+       is >= min_distance is classified as a floater and pruned.
+    """
+    import time
+    import open3d as o3d
+
+    t0 = time.time()
+    xyz = splats["means"].detach().cpu().numpy()
+    n_total = len(xyz)
+
+    if n_total == 0:
+        return splats, {
+            "total_gaussians": 0,
+            "surviving_gaussians": 0,
+            "min_cluster_size": min_cluster_size,
+            "min_distance": min_distance,
+            "num_clusters_identified": 0,
+            "num_floaters_detected": 0,
+            "floaters_percent": 0.0,
+            "time_seconds": 0.0,
+        }
+
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(xyz))
+    labels = np.asarray(pcd.cluster_dbscan(eps=float(min_distance), min_points=int(min_samples), print_progress=False))
+
+    valid_labels = labels[labels >= 0]
+    if len(valid_labels) == 0:
+        return splats, {
+            "total_gaussians": n_total,
+            "surviving_gaussians": n_total,
+            "min_cluster_size": min_cluster_size,
+            "min_distance": min_distance,
+            "num_clusters_identified": 0,
+            "num_floaters_detected": 0,
+            "floaters_percent": 0.0,
+            "time_seconds": time.time() - t0,
+        }
+
+    unique_labels, counts = np.unique(valid_labels, return_counts=True)
+    sig_cluster_mask = counts >= min_cluster_size
+    sig_labels = unique_labels[sig_cluster_mask]
+    n_sig_clusters = len(sig_labels)
+
+    if n_sig_clusters == 0:
+        # If no cluster meets min_cluster_size, protect the single largest cluster
+        largest_label = unique_labels[np.argmax(counts)]
+        sig_labels = np.array([largest_label])
+        n_sig_clusters = 1
+
+    inlier_mask_direct = np.isin(labels, sig_labels)
+    candidate_outliers_idx = np.where(~inlier_mask_direct)[0]
+
+    if len(candidate_outliers_idx) > 0:
+        sig_pts = xyz[inlier_mask_direct]
+        tree = cKDTree(sig_pts)
+        dists, _ = tree.query(xyz[candidate_outliers_idx], workers=-1)
+        floater_sub_idx = candidate_outliers_idx[dists >= float(min_distance)]
+    else:
+        floater_sub_idx = np.array([], dtype=int)
+
+    keep_mask = np.ones(n_total, dtype=bool)
+    keep_mask[floater_sub_idx] = False
+
+    device = splats["means"].device
+    keep_tensor = torch.from_numpy(keep_mask).to(device)
+    new_splats = torch.nn.ParameterDict({
+        k: torch.nn.Parameter(v[keep_tensor]) for k, v in splats.items()
+    })
+
+    dt = time.time() - t0
+    n_floaters = len(floater_sub_idx)
+    stats = {
+        "total_gaussians": n_total,
+        "surviving_gaussians": int(keep_mask.sum()),
+        "min_cluster_size": min_cluster_size,
+        "min_distance": min_distance,
+        "num_clusters_identified": n_sig_clusters,
+        "num_floaters_detected": n_floaters,
+        "floaters_percent": float(n_floaters / n_total * 100),
+        "time_seconds": dt,
+    }
+    return new_splats, stats
+
+
 def _export_ply(path: Path, splats: torch.nn.ParameterDict) -> None:
     state = {name: value.detach().cpu().numpy() for name, value in splats.items()}
     n = len(state["means"])
@@ -336,12 +482,6 @@ def _optimizer_due(step: int, name: str) -> bool:
 
 
 def train(args: argparse.Namespace) -> Path:
-    try:
-        import gsplat
-        from fused_ssim import fused_ssim
-        from fastgs_strategy import FastGSStrategy
-    except ImportError as exc:
-        raise RuntimeError("gsplat is required; install the Apache-2.0 gsplat package in this environment") from exc
     if getattr(args, "target_cache_mb", 8192) < 0:
         raise ValueError("--target-cache-mb must be nonnegative")
     if args.iterations < 1:
@@ -351,6 +491,16 @@ def train(args: argparse.Namespace) -> Path:
         geometry_until = args.iterations
     if geometry_until < 1:
         raise ValueError("--geometry-until must be positive")
+    workspace, model_dir = Path(args.source).resolve(), Path(args.model).resolve()
+    cameras = restore_source_frame_cameras(workspace, load_cameras(workspace, args.resolution))
+    cloud = _training_inputs(workspace, cameras, not getattr(args, "no_depth_cloud", False),
+                             args.depth_supervision, args.normal_supervision)
+    try:
+        import gsplat
+        from fused_ssim import fused_ssim
+        from fastgs_strategy import FastGSStrategy
+    except ImportError as exc:
+        raise RuntimeError("gsplat and fused_ssim are required; run install_gsplat_gfx1200.sh in this environment") from exc
     torch.manual_seed(args.seed); random.seed(args.seed); np.random.seed(args.seed)
     if not torch.cuda.is_available():
         raise RuntimeError("gsplat training requires an accessible CUDA/ROCm GPU")
@@ -360,9 +510,9 @@ def train(args: argparse.Namespace) -> Path:
     from gsplat.cuda._backend import _C
     if not hasattr(_C, "rasterize_vcp_counts"):
         raise RuntimeError("install the updated gsplat_gfx1200 patch for FastGS contribution metrics")
-    workspace, model_dir = Path(args.source).resolve(), Path(args.model).resolve()
-    cameras = load_cameras(workspace, args.resolution)
-    xyz, rgb = _load_points(workspace / "sparse" / "0" / "points3D.ply", args.max_points, args.seed)
+    xyz, rgb = _load_points(cloud, args.max_points, args.seed)
+    if args.verbose:
+        print(f"Initialization: {cloud} ({len(xyz)} points); {len(cameras)} cameras", flush=True)
     splats = _make_splats(xyz, rgb, device)
     scene_scale = _scene_scale(cameras)
     rates = {"means": 1.6e-4 * scene_scale, "scales": 5e-3, "quats": 1e-3, "opacities": .025, "sh0": 2.5e-3, "shN": .00025}
@@ -370,8 +520,8 @@ def train(args: argparse.Namespace) -> Path:
     strategy = FastGSStrategy(verbose=args.verbose)
     strategy.check_sanity(splats, optimizers)
     strategy_state = strategy.initialize_state(scene_scale=scene_scale)
-    depth_root = workspace / "02_depth_estimation" / "depth" / "depth_maps"
-    normal_root = workspace / "02_depth_estimation" / "depth" / "normal_maps"
+    depth_root = workspace / "depth" / "depth_maps"
+    normal_root = workspace / "depth" / "normal_maps"
     map_cache = {"values": OrderedDict(), "bytes": 0,
                  "limit": getattr(args, "target_cache_mb", 8192) * 1024**2}
     loss_function = _training_loss if getattr(args, "eager_loss", False) else torch.compile(_training_loss, fullgraph=True)
@@ -389,7 +539,8 @@ def train(args: argparse.Namespace) -> Path:
                                         footprint_multiplier=getattr(args, "footprint_multiplier", .5))
         strategy.step_pre_backward(splats, optimizers, strategy_state, step, info)
         depth_target = _map_tensor(depth_root, camera, 1, device, map_cache) if geometry and args.depth_supervision else None
-        normal_target = _map_tensor(normal_root, camera, 3, device, map_cache) if geometry and args.normal_supervision else None
+        normal_target = _map_tensor(normal_root, camera, 3, device, map_cache,
+                                    getattr(args, "normal_model", "stablenormal")) if geometry and args.normal_supervision else None
         ssim_score = fused_ssim(colors[..., :3].permute(0, 3, 1, 2).contiguous(),
                                 target.permute(0, 3, 1, 2).contiguous())
         loss = loss_function(colors, alphas, target, K, depth_target, normal_target,
@@ -406,26 +557,39 @@ def train(args: argparse.Namespace) -> Path:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
         if args.verbose and (iteration + 1) % 100 == 0: print(f"{iteration + 1}/{args.iterations}: loss={loss.item():.5f}, splats={len(splats['means'])}", flush=True)
-        if step in getattr(args, "save_iterations", ()):
-            _write_model(model_dir / "snapshots" / f"iteration_{step}", splats, step, degree, args.resolution)
-            print(f"Saved iteration {step} snapshot", flush=True)
-    return _write_model(model_dir, splats, args.iterations, degree, args.resolution)
+    if getattr(args, "sor_floater_removal", True):
+        if getattr(args, "verbose", False):
+            print(f"Running SOR floater removal (min_cluster_size={args.sor_min_cluster_size}, min_distance={args.sor_min_distance} world units)...", flush=True)
+        splats, stats = remove_cluster_floaters(
+            splats,
+            min_cluster_size=getattr(args, "sor_min_cluster_size", 500),
+            min_distance=getattr(args, "sor_min_distance", 0.10),
+        )
+        if getattr(args, "verbose", False):
+            print(f"SOR floater removal complete: {stats['num_clusters_identified']} clusters identified, {stats['num_floaters_detected']} floaters removed ({stats['floaters_percent']:.2f}%) in {stats['time_seconds']:.3f}s", flush=True)
+    return _write_model(model_dir, splats, degree, args.resolution)
 
 
-def _write_model(model_dir: Path, splats, iteration: int, degree: int, resolution: int) -> Path:
-    output = model_dir / "point_cloud" / f"iteration_{iteration}" / "point_cloud.ply"
+def _write_model(model_dir: Path, splats, degree: int, resolution: int) -> Path:
+    output = model_dir / "gaussian_splat.ply"
     _export_ply(output, splats)
     _atomic_checkpoint(model_dir / "checkpoint.pt", {"format": "gsplat-stage03-v1",
         "splats": {k: v.detach().cpu() for k, v in splats.items()},
-        "iteration": iteration, "sh_degree": degree, "resolution": resolution})
+        "sh_degree": degree, "resolution": resolution})
     return output
 
 
-def _self_check(workspace: Path) -> None:
-    cameras = load_cameras(workspace)
+def _self_check(args: argparse.Namespace) -> None:
+    workspace = Path(args.source).resolve()
+    cameras = restore_source_frame_cameras(workspace, load_cameras(workspace, args.resolution))
+    cloud = _training_inputs(workspace, cameras, not args.no_depth_cloud,
+                             args.depth_supervision, args.normal_supervision)
+    xyz, _ = _load_points(cloud, args.max_points, args.seed)
     assert cameras and cameras[0]["K"].shape == (3, 3) and cameras[0]["viewmat"].shape == (4, 4)
     assert cameras[0]["image_path"].is_file() and cameras[0]["width"] > 0 and cameras[0]["height"] > 0
-    print(f"camera loader OK: {len(cameras)} cameras, {cameras[0]['width']}x{cameras[0]['height']}")
+    assert len(xyz) >= 4, "at least four initial points are required"
+    print(f"inputs OK: {len(cameras)} cameras, {cameras[0]['width']}x{cameras[0]['height']}; "
+          f"{len(xyz)} seed points from {cloud}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -433,15 +597,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-s", "--source", "--source-path", dest="source", required=True)
     parser.add_argument("-m", "--model", "--model-path", dest="model", required=True)
     parser.add_argument("--iterations", type=int, default=22_000)
-    parser.add_argument("--save-iterations", type=int, nargs="*", default=[],
-                        help="also export these intermediate steps under model/snapshots/iteration_<N>")
     parser.add_argument("--resolution", type=int, default=1)
     parser.add_argument("--tile-size", type=int, choices=(16,), default=16)
     parser.add_argument("--footprint-multiplier", type=float, default=.5,
                         help="FastGS compact ellipse level (0 < value <= 1; 1 keeps full gsplat support)")
     parser.add_argument("--max-points", type=int, default=300_000)
+    parser.add_argument("--no-depth-cloud", action="store_true",
+                        help="initialize from sparse/0/points3D.ply instead of depth/points3D_depth.ply")
     parser.add_argument("--depth-supervision", action="store_true")
     parser.add_argument("--normal-supervision", action="store_true")
+    parser.add_argument("--normal-model", choices=("stablenormal", "depth_gradient"), default="stablenormal",
+                        help="stage 02 normal producer; converts depth_gradient targets to the training convention")
     parser.add_argument("--geometry-until", type=int,
                         help="last step with depth/normal supervision (default: --iterations)")
     parser.add_argument("--lambda-depth", type=float, default=.15)
@@ -451,13 +617,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--target-cache-mb", type=int, default=8192, help="CPU depth/normal cache ceiling (0 disables caching)")
     parser.add_argument("--eager-loss", action="store_true", help="disable loss fusion for debugging and comparison")
+    parser.add_argument("--sor-floater-removal", action=argparse.BooleanOptionalAction, default=True,
+                        help="remove floaters detached from significant clusters at the end of training (default: True)")
+    parser.add_argument("--sor-min-cluster-size", type=int, default=500,
+                        help="minimum number of gaussians for a cluster to be considered significant (default: 500)")
+    parser.add_argument("--sor-min-distance", type=float, default=0.10,
+                        help="outlier distance in world units (metres if calibrated; default: 0.10)")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args(argv)
     if args.geometry_until is not None and args.geometry_until < 1:
         parser.error("--geometry-until must be positive")
-    if any(step < 1 or step >= args.iterations for step in args.save_iterations):
-        parser.error("--save-iterations must be positive and below --iterations")
-    if args.self_check: _self_check(Path(args.source).resolve()); return 0
+    if args.self_check: _self_check(args); return 0
     print(train(args)); return 0
 
 

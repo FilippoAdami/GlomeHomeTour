@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 backend_dir = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(backend_dir / "06c_semantic_segmentation"))
+sys.path.insert(0, str(backend_dir / "05_semantic_segmentation"))
 from step2_project_masks_to_3d import (
     absorb_isolated_islands,
     build_dual_mesh_graph,
