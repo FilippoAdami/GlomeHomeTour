@@ -22,6 +22,8 @@ from refine_class_boundaries import (
     compute_mesh_derivatives,
 )
 
+MIN_HORIZONTAL_WALL_PATCH_AREA_M2 = 2.0
+
 
 def regularize_disconnected_manifold_components(
     mesh: o3d.geometry.TriangleMesh,
@@ -703,9 +705,11 @@ def enforce_instance_constraints(
     gravity_up: np.ndarray,
     wall_cids: Set[int],
     min_triangles: int,
+    tri_areas: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Merge edge-connected fragments to a hard size floor without horizontal walls.
 
+    With face areas, connected >=2 m² upward/downward wall patches become floor/ceiling classes first.
     Regions without an eligible touching owner become unknown; geometry is retained.
     Wall eligibility includes both upward and downward faces within 20° of horizontal.
     """
@@ -720,23 +724,60 @@ def enforce_instance_constraints(
     if up.shape != (3,) or not np.isfinite(up).all() or np.linalg.norm(up) == 0:
         raise ValueError('gravity_up must be a finite nonzero 3-vector')
     up /= np.linalg.norm(up)
+    if tri_areas is not None:
+        tri_areas = np.asarray(tri_areas, dtype=float)
+        if (tri_areas.shape != (len(labels),) or not np.isfinite(tri_areas).all()
+                or np.any(tri_areas < 0)):
+            raise ValueError('tri_areas must contain one finite nonnegative area per face')
     normal_lengths = np.linalg.norm(normals, axis=1)
     alignment = np.abs(normals @ up) / np.maximum(normal_lengths, 1e-12)
     horizontal = alignment >= np.cos(np.deg2rad(20.0)) - 1e-12
+    upward = normals @ up >= 0
     wall_ids = {int(cid) for cid in wall_cids if cid > 0}
     cleaned = labels.astype(np.int32, copy=True)
     invalid_wall = np.isin(cleaned, list(wall_ids)) & horizontal
-    # First reassign each forbidden wall patch to its strongest touching non-wall owner.
+    large_horizontal_patches = []
+    large_horizontal_patch_faces = []
+    large_horizontal_class_ids = {}
+    # Promote major directional patches, then reassign the remaining forbidden wall patches.
     bad_faces = np.flatnonzero(invalid_wall)
     if len(bad_faces):
         bad_map = np.full(len(labels), -1, dtype=np.int32)
         bad_map[bad_faces] = np.arange(len(bad_faces))
         internal = invalid_wall[adj_u] & invalid_wall[adj_v]
+        if tri_areas is not None:
+            internal &= upward[adj_u] == upward[adj_v]
         graph = sp.csr_matrix((np.ones(internal.sum(), bool),
             (bad_map[adj_u[internal]], bad_map[adj_v[internal]])), shape=(len(bad_faces), len(bad_faces)))
         count, patch_ids = csgraph.connected_components(graph, directed=False)
+        patch_of_face = np.full(len(labels), -1, dtype=np.int32)
+        patch_of_face[bad_faces] = patch_ids
+        promoted_patch = np.zeros(count, dtype=bool)
+        if tri_areas is not None:
+            patch_areas = np.bincount(patch_ids, weights=tri_areas[bad_faces], minlength=count)
+            patch_order = np.argsort(patch_ids)
+            patch_offsets = np.r_[0, np.cumsum(np.bincount(patch_ids, minlength=count))]
+            next_class_id = int(cleaned[cleaned > 0].max()) + 1 if np.any(cleaned > 0) else 1
+            for patch in np.flatnonzero(patch_areas >= MIN_HORIZONTAL_WALL_PATCH_AREA_M2):
+                patch_faces = bad_faces[patch_order[patch_offsets[patch]:patch_offsets[patch + 1]]]
+                role = 'floor' if upward[patch_faces[0]] else 'ceiling'
+                if role not in large_horizontal_class_ids:
+                    if next_class_id > np.iinfo(np.int32).max:
+                        raise ValueError('no class ID available for a promoted horizontal wall patch')
+                    large_horizontal_class_ids[role] = next_class_id
+                    next_class_id += 1
+                cleaned[patch_faces] = large_horizontal_class_ids[role]
+                promoted_patch[patch] = True
+                large_horizontal_patches.append({
+                    'class_id': int(large_horizontal_class_ids[role]),
+                    'role': role,
+                    'triangle_count': int(len(patch_faces)),
+                    'area_m2': float(patch_areas[patch]),
+                })
+                large_horizontal_patch_faces.append(patch_faces)
         a, b = np.r_[adj_u, adj_v], np.r_[adj_v, adj_u]
-        boundary = invalid_wall[a] & ~invalid_wall[b] & (cleaned[b] > 0) & ~np.isin(cleaned[b], list(wall_ids))
+        boundary = (invalid_wall[a] & (patch_of_face[a] != patch_of_face[b])
+                    & (cleaned[b] > 0) & ~np.isin(cleaned[b], list(wall_ids)))
         patch_owner = np.full(count, -1, dtype=np.int32)
         if boundary.any():
             pairs = np.column_stack((patch_ids[bad_map[a[boundary]]], cleaned[b[boundary]]))
@@ -748,8 +789,10 @@ def enforce_instance_constraints(
                 patch, cid = pairs[i]
                 if patch_owner[patch] < 0:
                     patch_owner[patch] = cid
-        cleaned[bad_faces] = patch_owner[patch_ids]
+        reassign = ~promoted_patch[patch_ids]
+        cleaned[bad_faces[reassign]] = patch_owner[patch_ids[reassign]]
 
+    # Promoted patches still obey the existing per-instance triangle minimum.
     faces = np.flatnonzero(cleaned > 0)
     face_map = np.full(len(labels), -1, dtype=np.int32)
     face_map[faces] = np.arange(len(faces))
@@ -824,7 +867,15 @@ def enforce_instance_constraints(
         raise RuntimeError('undersized instance survived hard minimum cleanup')
     if np.any(np.isin(cleaned, list(wall_ids)) & horizontal):
         raise RuntimeError('horizontal wall face survived orientation cleanup')
+    for patch, patch_faces in zip(large_horizontal_patches, large_horizontal_patch_faces):
+        final_ids = np.unique(cleaned[patch_faces])
+        final_id = int(final_ids[0]) if len(final_ids) == 1 and final_ids[0] > 0 else None
+        patch['final_class_id'] = final_id
+        patch['role_retained'] = final_id == patch['class_id']
     return cleaned, dict(min_triangles=int(min_triangles), wall_horizontal_tolerance_deg=20,
+        large_horizontal_patch_min_area_m2=MIN_HORIZONTAL_WALL_PATCH_AREA_M2,
+        large_horizontal_patches=large_horizontal_patches,
+        large_horizontal_class_ids=large_horizontal_class_ids,
         forbidden_wall_faces=int(invalid_wall.sum()), fragment_merges=merges,
         unmergeable_fragment_faces=abandoned_faces,
         minimum_instance_triangles=int(sizes[surviving].min()) if surviving.any() else None,

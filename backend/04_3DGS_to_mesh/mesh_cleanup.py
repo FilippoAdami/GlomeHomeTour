@@ -3,7 +3,7 @@
 Step 1: High-Efficiency Mesh Floater Removal for 2D-to-3D Semantic Lifting.
 
 Removes disconnected airborne floaters, crumbs, wisps, and false projection phantoms
-while preserving the primary room mesh and genuine detached physical objects (e.g. boxing bag).
+while retaining the largest sealed component and components contained inside it.
 The sealed mesh replaces the extracted mesh; no intermediate geometry copies are kept.
 
 Geometric decision criteria for detached candidate components:
@@ -122,6 +122,63 @@ def profile_component_geometry(
         "hull_volume": round(hull_volume, 6),
         "centroid": [round(float(x), 3) for x in centroid],
     }
+
+
+def _keep_largest_and_contained_components(mesh: o3d.geometry.TriangleMesh):
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    component_ids, _, _ = mesh.cluster_connected_triangles()
+    component_ids = np.asarray(component_ids)
+    component_counts = np.bincount(component_ids)
+    largest_id = int(np.argmax(component_counts))
+    keep_faces = component_ids == largest_id
+    ordered_face_indices = np.argsort(component_ids, kind="stable")
+    component_offsets = np.concatenate(([0], np.cumsum(component_counts)))
+    records = []
+
+    scene = None
+    if len(component_counts) > 1:
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(
+            o3d.core.Tensor(vertices.astype(np.float32)),
+            o3d.core.Tensor(triangles[keep_faces].astype(np.uint32)),
+        )
+
+    def points_are_inside(points):
+        for start in range(0, len(points), 250_000):
+            query = o3d.core.Tensor(points[start:start + 250_000].astype(np.float32))
+            if not np.all(np.asarray(scene.compute_occupancy(query, nsamples=3))):
+                return False
+        return True
+
+    for component_id, triangle_count in enumerate(component_counts):
+        face_indices = ordered_face_indices[component_offsets[component_id]:component_offsets[component_id + 1]]
+        if component_id == largest_id:
+            contained = True
+            reason = "Largest sealed component by triangle count"
+        else:
+            component_triangles = triangles[face_indices]
+            component_vertices = vertices[np.unique(component_triangles)]
+            contained = points_are_inside(component_vertices)
+            if contained:
+                # shortcut: vertex/face-center samples can miss a triangle crossing a very narrow concavity.
+                centroids = vertices[component_triangles].mean(axis=1)
+                contained = points_are_inside(centroids)
+            if contained:
+                keep_faces[face_indices] = True
+                reason = "Contained inside the largest sealed component"
+            else:
+                reason = "Outside or crossing the largest sealed component"
+        records.append({
+            "component_id": int(component_id),
+            "triangles": int(triangle_count),
+            "is_largest": component_id == largest_id,
+            "contained": bool(contained),
+            "kept": bool(component_id == largest_id or contained),
+            "reason": reason,
+        })
+
+    return keep_faces, largest_id, records
 
 
 def clean_mesh_floaters(
@@ -357,6 +414,33 @@ def clean_mesh_floaters(
     if any(record["filled_region"] is None for record in records) or np.any(edge_counts != 2):
         raise RuntimeError("Mesh sealing left boundary or nonmanifold edges")
     timings["sealing_seconds"] = round(time.perf_counter() - t_seal, 3)
+
+    # Containment is only well-defined after the candidate shells have been sealed.
+    t_containment = time.perf_counter()
+    sealed_face_mask, largest_sealed_component_id, sealed_component_records = (
+        _keep_largest_and_contained_components(sealed_mesh)
+    )
+    timings["sealed_component_containment_seconds"] = round(time.perf_counter() - t_containment, 3)
+    prefilter_clean_num_triangles = clean_num_triangles
+    keep_original_faces = sealed_face_mask[:prefilter_clean_num_triangles]
+    keep_infill_faces = sealed_face_mask[prefilter_clean_num_triangles:]
+    all_infill_colors = derive_infilled_face_textures(sealed_mesh, prefilter_clean_num_triangles)
+    if all_infill_colors is not None and len(all_infill_colors) == len(keep_infill_faces):
+        infill_colors = all_infill_colors[keep_infill_faces]
+    else:
+        infill_colors = None
+    selected_triangles = np.concatenate((
+        np.asarray(sealed_mesh.triangles)[:prefilter_clean_num_triangles][keep_original_faces],
+        np.asarray(sealed_mesh.triangles)[prefilter_clean_num_triangles:][keep_infill_faces],
+    ))
+    sealed_mesh.triangles = o3d.utility.Vector3iVector(selected_triangles)
+    sealed_mesh.remove_unreferenced_vertices()
+    clean_num_triangles = int(np.count_nonzero(keep_original_faces))
+    clean_num_vertices = len(np.unique(selected_triangles[:clean_num_triangles]))
+    _, edge_counts = np.unique(edge_keys(np.asarray(sealed_mesh.triangles)), return_counts=True)
+    if np.any(edge_counts != 2):
+        raise RuntimeError("Contained-component filtering left boundary or nonmanifold edges")
+
     sealed_mesh_path = output_mesh_path or output_dir / "mesh.ply"
     sealed_tmp = sealed_mesh_path.with_name(f"{sealed_mesh_path.stem}.seal.tmp.ply")
     sealed_v = np.asarray(sealed_mesh.vertices)
@@ -367,7 +451,6 @@ def clean_mesh_floaters(
         is_hole_fill[clean_num_triangles:] = 1
 
     face_attributes = {"is_hole_fill": ("uchar", is_hole_fill)}
-    infill_colors = derive_infilled_face_textures(sealed_mesh, clean_num_triangles)
     if infill_colors is not None and len(infill_colors) == len(sealed_t) - clean_num_triangles and len(infill_colors) > 0:
         all_face_colors = np.zeros((len(sealed_t), 3), dtype=np.uint8)
         if sealed_c is not None and clean_num_triangles > 0:
@@ -428,6 +511,11 @@ def clean_mesh_floaters(
         "kept_components_count": len(kept_cluster_ids),
         "pruned_components_count": len(pruned_cluster_ids),
         "kept_component_ids": kept_cluster_ids,
+        "sealed_components_count": len(sealed_component_records),
+        "sealed_components_kept_count": sum(record["kept"] for record in sealed_component_records),
+        "sealed_components_pruned_count": sum(not record["kept"] for record in sealed_component_records),
+        "largest_sealed_component_id": largest_sealed_component_id,
+        "sealed_components_manifest": sealed_component_records,
         "throughput_triangles_per_second": throughput_triangles_per_sec,
         "timings_breakdown": timings,
         "components_manifest": component_records,
@@ -437,8 +525,9 @@ def clean_mesh_floaters(
     print(f"[Phase 5/5] Exported sealed mesh: {sealed_mesh_path} ({sealed_mesh_path.stat().st_size / 1e6:.1f} MB, {t_export:.3f}s)")
     print(f"=================================================================")
     print(f"TOTAL EXECUTION TIME: {t_total:.3f}s ({throughput_triangles_per_sec:,} tri/sec)")
-    print(f"Kept: Primary mesh + {len(kept_cluster_ids) - 1} valid objects")
-    print(f"Pruned: {len(pruned_cluster_ids)} floater components ({raw_num_triangles - clean_num_triangles:,} triangles)")
+    retained_sealed_components = sum(record["kept"] for record in sealed_component_records)
+    print(f"Sealed components kept: largest + {retained_sealed_components - 1} contained component(s)")
+    print(f"Exterior sealed components removed: {len(sealed_component_records) - retained_sealed_components}")
     print(f"=================================================================")
 
     return summary

@@ -248,6 +248,30 @@ def _enclose_plane(
     return offset, face_ids[~outside], face_ids[outside], side, cost, inside_fraction
 
 
+def _merge_coordinate_anchor(group: list[dict], family_planes: list[dict]) -> dict | None:
+    """Pick the group member with the most clearance from its nearest external plane."""
+    group_ids = {int(plane["region_id"]) for plane in group}
+    external = [plane for plane in family_planes if int(plane["region_id"]) not in group_ids]
+    if not external:
+        return None
+    candidates = []
+    for member in group:
+        neighbor = min(external, key=lambda plane: (
+            abs(float(member["offset"]) - float(plane["offset"])),
+            int(plane["region_id"]),
+        ))
+        clearance = abs(float(member["offset"]) - float(neighbor["offset"]))
+        candidates.append((clearance, float(member["area"]), -int(member["region_id"]),
+                           member, neighbor))
+    clearance, _, _, member, neighbor = max(candidates, key=lambda item: item[:3])
+    return {
+        "region_id": int(member["region_id"]),
+        "offset": float(member["offset"]),
+        "nearest_external_region_id": int(neighbor["region_id"]),
+        "clearance_scene_units": float(clearance),
+    }
+
+
 def _snap_and_merge_planes(
     vertices: np.ndarray,
     triangles: np.ndarray,
@@ -360,9 +384,11 @@ def _snap_and_merge_planes(
         safe_groups = []
         for group in groups:
             if len(group) == 1:
-                safe_groups.append(group)
+                safe_groups.append((group, None))
                 continue
-            _, _, proposed_offset = group_support(group)
+            _, _, support_offset = group_support(group)
+            anchor = _merge_coordinate_anchor(group, family_planes)
+            proposed_offset = anchor["offset"] if anchor else support_offset
             group_ids = {plane["region_id"] for plane in group}
             collision = next((other for other in family_planes
                               if other["region_id"] not in group_ids
@@ -370,7 +396,7 @@ def _snap_and_merge_planes(
                               and any(abs(other["offset"] - member["offset"]) > PARALLEL_MERGE_DISTANCE
                                       for member in group)), None)
             if collision is None:
-                safe_groups.append(group)
+                safe_groups.append((group, anchor))
             else:
                 merge_rejections.append({
                     "source_region_ids": sorted(group_ids),
@@ -383,23 +409,53 @@ def _snap_and_merge_planes(
                         for member in sorted(group, key=lambda item: item["region_id"])
                     ],
                 })
-                safe_groups.extend([[plane] for plane in group])
+                safe_groups.extend(([plane], None) for plane in group)
 
-        for group in safe_groups:
-            fit_face_ids, normal, initial_offset = group_support(group)
-            primary = max(group, key=lambda plane: plane["area"])
+        for group, anchor in safe_groups:
+            _, normal, support_offset = group_support(group)
+            initial_offset = anchor["offset"] if anchor else support_offset
             region_ids = sorted(plane["region_id"] for plane in group)
             support_face_ids = np.flatnonzero(np.isin(labels, region_ids))
-            offset, face_ids, outside_face_ids, outside_side, distance_cost, mesh_inside_fraction = _enclose_plane(
+            (
+                enclosure_offset, face_ids, outside_face_ids, enclosure_side,
+                distance_cost, enclosure_inside_fraction,
+            ) = _enclose_plane(
                 vertices, triangles, support_face_ids, areas, normal, initial_offset,
                 mesh_centroids, areas,
             )
+            # A nearby parallel plane defines which source plane must survive the merge;
+            # whole-mesh enclosure may otherwise pull it onto that neighboring plane.
+            offset = anchor["offset"] if anchor else enclosure_offset
+            outside_side, mesh_inside_fraction = enclosure_side, enclosure_inside_fraction
+            if anchor:
+                mesh_projections = mesh_centroids @ normal
+                boundary = -offset
+                inside_candidates = [
+                    (float(areas[mesh_projections <= boundary].sum()), "positive_normal"),
+                    (float(areas[mesh_projections >= boundary].sum()), "negative_normal"),
+                ]
+                inside_area, outside_side = max(
+                    inside_candidates,
+                    key=lambda item: (item[0], item[1] == enclosure_side),
+                )
+                mesh_inside_fraction = (
+                    inside_area / float(areas.sum()) if areas.sum() > 1e-12
+                    else inside_area / max(len(mesh_projections), 1)
+                )
+                support_points = vertices[triangles[support_face_ids]].reshape(-1, 3)
+                support_weights = np.repeat(areas[support_face_ids] / 3.0, 3)
+                distance_cost = float(np.sum(
+                    np.abs(support_points @ normal + offset) * support_weights
+                ))
             support_positive_area = support_face_ids[areas[support_face_ids] > 1e-12]
             support_points = vertices[triangles[support_positive_area]].reshape(-1, 3)
             point_area = np.repeat(areas[support_positive_area] / 3.0, 3)
             distances = np.abs(support_points @ normal + offset)
             fit_area = float(areas[support_positive_area].sum())
             mean_distance = float(np.average(distances, weights=point_area)) if point_area.sum() else None
+            anchor_plane = next((plane for plane in group
+                                 if anchor and int(plane["region_id"]) == anchor["region_id"]), None)
+            primary = anchor_plane or max(group, key=lambda plane: plane["area"])
             merged.append({
                 "region_id": int(primary["region_id"]),
                 "source_region_ids": region_ids,
@@ -410,10 +466,17 @@ def _snap_and_merge_planes(
                 "enclosed_triangle_count": int(len(face_ids)),
                 "outside_triangle_count": int(len(outside_face_ids)),
                 "outside_fraction": len(outside_face_ids) / len(support_face_ids),
+                "enclosure_candidate_enclosed_triangle_count": int(len(face_ids)),
+                "enclosure_candidate_outside_triangle_count": int(len(outside_face_ids)),
+                "enclosure_candidate_outside_fraction": len(outside_face_ids) / len(support_face_ids),
                 "enclosing_side": outside_side,
                 "whole_mesh_interior_area_fraction": mesh_inside_fraction,
                 "offset_before_enclosing": initial_offset,
+                "enclosure_candidate_offset_scene_units": enclosure_offset,
+                "enclosure_candidate_side": enclosure_side,
+                "enclosure_candidate_interior_area_fraction": enclosure_inside_fraction,
                 "enclosure_translation_scene_units": offset - initial_offset,
+                "merge_coordinate_anchor": anchor,
                 "fit_area_scene_units_squared": fit_area,
                 "area_weighted_mean_absolute_distance_scene_units": mean_distance,
                 "area_weighted_total_absolute_distance_scene_units_cubed": distance_cost,
@@ -432,6 +495,11 @@ def _snap_and_merge_planes(
         "max_snap_rotation_degrees": MAX_SNAP_ROTATION_DEGREES,
         "excluded_before_snap": excluded,
         "merge_rejections": merge_rejections,
+        "merge_coordinate_rule": (
+            "For a merged group with external planes in the same snapped parallel family, use "
+            "the member with greatest distance to its nearest such plane as the final coordinate; "
+            "otherwise use whole-mesh enclosure. The enclosure candidate is retained in diagnostics."
+        ),
     }
 
 

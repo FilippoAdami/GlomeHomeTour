@@ -435,8 +435,7 @@ def estimate_gravity_and_scene_bands(
     triangles: np.ndarray,
 ) -> Tuple[np.ndarray, Dict[str, float]]:
     """
-    Estimates the gravity up-vector and scene elevation bounds from mesh geometry.
-    Uses Extended Gaussian Image (EGI) normal covariance to find the dominant normal axis.
+    Uses the Phase 04 world-frame up-axis and estimates scene elevation bounds.
     """
     v0 = vertices[triangles[:, 0]]
     v1 = vertices[triangles[:, 1]]
@@ -444,28 +443,10 @@ def estimate_gravity_and_scene_bands(
     cross = np.cross(v1 - v0, v2 - v0)
     areas = 0.5 * np.linalg.norm(cross, axis=1)
     valid = areas > 1e-8
-    areas = areas[valid]
-    normals = cross[valid] / (2.0 * areas[:, None])
     centroids = (v0[valid] + v1[valid] + v2[valid]) / 3.0
 
-    # Normal covariance: C = sum_i A_i n_i n_i^T
-    # Horizontal surfaces (floors/ceilings) and vertical walls both align with the gravity frame
-    weighted_cov = np.zeros((3, 3), dtype=np.float64)
-    for i in range(3):
-        for j in range(3):
-            weighted_cov[i, j] = np.sum(areas * normals[:, i] * normals[:, j])
-
-    eigvals, eigvecs = np.linalg.eigh(weighted_cov)
-    up_candidate = eigvecs[:, 2]
-
-    # Snap to dominant coordinate axis
-    abs_up = np.abs(up_candidate)
-    max_axis = int(np.argmax(abs_up))
-    aligned_up = np.zeros(3, dtype=np.float32)
-    aligned_up[max_axis] = 1.0  # Positive along vertical axis (upwards)
-
-    # Project centroids along up-vector
-    h_proj = np.dot(centroids, aligned_up)
+    gravity_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    h_proj = centroids[:, 1]
 
     h_min = float(np.percentile(h_proj, 1.0))
     h_max = float(np.percentile(h_proj, 99.0))
@@ -477,10 +458,10 @@ def estimate_gravity_and_scene_bands(
         "h_max": h_max,
         "h_scene": h_scene,
         "h_ceiling_band": h_ceiling_band,
-        "up_axis_index": max_axis,
+        "up_axis_index": 1,
     }
 
-    return aligned_up, scene_bands
+    return gravity_up, scene_bands
 
 
 def build_mesh_dual_graph(

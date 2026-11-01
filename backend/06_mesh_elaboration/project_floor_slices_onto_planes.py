@@ -36,7 +36,7 @@ MIN_THIN_COMPONENT_ASPECT_RATIO = 8.0
 CLEANUP_EDGE_MARGIN_PX = 8
 NEUTRAL_BACKGROUND_MAX_SPREAD = 16
 MORPHOLOGY_COMPONENT_AREA_FRACTION = 0.005
-MORPHOLOGY_MIN_FEATURE_WIDTH_M = 0.035
+MORPHOLOGY_MIN_FEATURE_WIDTH_M = 0.05
 MORPHOLOGY_MIN_COMPONENT_AREA_M2 = 0.001
 SIGNED_DISTANCE_SMOOTH_SIGMA_M = 0.006
 WALL_CONTOUR_HEIGHT_M = 0.30
@@ -44,7 +44,7 @@ WALL_CONTOUR_COLOR = (255, 0, 0)
 WALL_CONTOUR_WIDTH_PX = 3
 HOLE_MIN_SIDE_M = 0.45
 HOLE_MIN_LONG_SIDE_M = 0.90
-HOLE_MAX_BLACK_FRACTION = 0.05
+HOLE_MAX_BLACK_FRACTION = 0.10
 WALL_CONTOUR_CLOSE_GAP_M = 0.07
 HOLE_FILL_RGBA = (20, 100, 255, 90)
 HOLE_OUTLINE_RGBA = (0, 65, 220, 235)
@@ -121,6 +121,23 @@ def _load_wall_shell(instances_dir: Path) -> trimesh.Trimesh | None:
     return mesh
 
 
+def _align_contour_to_image_axes(contour_uv: np.ndarray) -> np.ndarray:
+    edges = contour_uv[:, 1] - contour_uv[:, 0]
+    lengths = np.linalg.norm(edges, axis=1)
+    valid = lengths > 1e-12
+    if not valid.any():
+        return contour_uv
+    angles = np.arctan2(edges[valid, 1], edges[valid, 0])
+    orientation = float(np.angle(np.sum(lengths[valid] * np.exp(4j * angles))) / 4.0)
+    if abs(orientation) <= 1e-10:
+        return contour_uv
+    points = contour_uv.reshape(-1, 2)
+    center = (points.min(axis=0) + points.max(axis=0)) * 0.5
+    cosine, sine = np.cos(orientation), np.sin(orientation)
+    rotation = np.array([[cosine, sine], [-sine, cosine]])
+    return ((points - center) @ rotation.T + center).reshape(contour_uv.shape)
+
+
 def _wall_contour_uv(wall_shell: trimesh.Trimesh | None, plane: np.ndarray,
                      axis_u: np.ndarray, axis_v: np.ndarray) -> np.ndarray:
     if wall_shell is None:
@@ -131,7 +148,7 @@ def _wall_contour_uv(wall_shell: trimesh.Trimesh | None, plane: np.ndarray,
     segments = trimesh.intersections.mesh_plane(wall_shell, offset_plane[:3], origin)
     if not len(segments):
         return np.empty((0, 2, 2), dtype=np.float64)
-    return np.stack((segments @ axis_u, segments @ axis_v), axis=-1)
+    return _align_contour_to_image_axes(np.stack((segments @ axis_u, segments @ axis_v), axis=-1))
 
 
 def _blur_sharpen_plot(image: Image.Image, axis_bbox: tuple[int, int, int, int]) -> Image.Image:

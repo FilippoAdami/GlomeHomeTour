@@ -1,122 +1,82 @@
-# Stage 07 — Objects alignment & cross-sections
+# Stage 07 — object alignment
 
-Stage 07 consumes the regularized structural shell (`all_structural_regularized.ply`) and manifests from Stage 06 alongside the segmented non-structural and architectural object instances from Stage 05. It performs global rigid point-to-plane alignment of object meshes against the regularized architectural planes, groups touching instances into multi-body contact blocks, performs bounded envelope containment optimization to prevent wall/floor/ceiling collisions, and renders unobstructed orthographic interior elevation and top-down cross-section drawings.
+Stage 07 aligns Stage 05 `structural_role: object` instances to Stage 06, groups nearby instances, and snaps supported groups to floor or wall surfaces when the move does not increase surface intersections. It writes final per-instance PLYs to `<scan>/objects_alignment/aligned_instances/`. Top-down plans and elevation sections are generated in [Stage 08](../08_artifacts_generation/README.md).
 
-Geometry and products from previous stages (Stage 00–06) are treated as strictly read-only. All outputs are stored within the designated stage output directory (by default `<scan>/objects_alignment/` or explicit `--output-dir`).
+Inputs from previous stages are read-only. Stage 07 uses accepted Stage 05 category associations as weak floor/wall support preferences. It prefers role-labeled PLYs under Stage 06 `elements/`; alternate shells without those files use geometric surface classification.
 
 ## Stage files
 
 | Component | Responsibility | Runtime status |
 | --- | --- | --- |
-| [`step_objects_alignment.py`](step_objects_alignment.py) | Coordinates the end-to-end alignment pipeline: rigid baseline registration, contact grouping, envelope containment, and cross-section rendering. | Single production entry point. |
-| [`build_rigid_baseline.py`](build_rigid_baseline.py) | Robust point-to-plane global rigid alignment of mesh and object instances to regularized structural shell. | Production object alignment pass. |
-| [`group_touching_instances.py`](group_touching_instances.py) | Computes contact graphs and clusters touching object instances into rigid multi-body blocks. | Object contact helper. |
-| [`fit_contact_groups_inside.py`](fit_contact_groups_inside.py) | Fits contact blocks inside the watertight architectural shell via bounded translation/yaw search. | Containment optimization pass. |
-| [`translate_instances_inside.py`](translate_instances_inside.py) | Area-stratified triangle sampling and raycasting envelope probe evaluation. | Containment search helper. |
-| [`extract_cross_section_views.py`](extract_cross_section_views.py) | Slices watertight structural shell to render unobstructed orthographic interior elevation and top-down cross-section views. | Production rendering helper. |
-| [`analyze_new_step.py`](analyze_new_step.py), [`plot_new_step.py`](plot_new_step.py), [`view_new_step.py`](view_new_step.py) | Centroid correspondence analysis, diagnostic plotting, and interactive Open3D inspection. | Diagnostic tools. |
-| [`render_side_by_side_all.py`](render_side_by_side_all.py) | Generates side-by-side composite comparison renders of extracted meshes. | Diagnostic tool. |
-| [`test_analyze_new_step.py`](test_analyze_new_step.py) | Unit test for correspondence analysis. | Test suite. |
+| [`step_objects_alignment.py`](step_objects_alignment.py) | Runs rigid baseline registration followed by contact grouping and support fitting. | Production entry point. |
+| [`build_rigid_baseline.py`](build_rigid_baseline.py) | Estimates and confidence-gates a global rigid transform from structural anchors. | Production alignment pass. |
+| [`structural_surfaces.py`](structural_surfaces.py) | Resolves Stage 06 floor, ceiling, and wall meshes from element PLYs or shell geometry. | Shared geometry helper. |
+| [`group_touching_instances.py`](group_touching_instances.py) | Computes contact graphs and groups nearby aligned instances into multi-body blocks. | Contact helper. |
+| [`fit_contact_groups_inside.py`](fit_contact_groups_inside.py) | Fits nearby floor/wall support candidates, preferring fewer mesh-edge intersections, stronger category-compatible support, then less movement. | Production placement pass. |
+| [`translate_instances_inside.py`](translate_instances_inside.py) | Area-stratified triangle sampling and raycast envelope probe helper. | Containment helper. |
+| `analyze_new_step.py`, `plot_new_step.py`, `view_new_step.py`, `render_side_by_side_all.py` | Correspondence analysis, diagnostic plots, interactive inspection, and comparison renders. | Optional diagnostics. |
 
-## Pipeline flow
+## Inputs and outputs
 
-```text
-Stage 04: sealed mesh.ply (for unobstructed interior cross-sections)
-Stage 05: Instances PLYs/ (or 3d_masks/) + class_metadata.json
-Stage 06: all_structural_regularized.ply + plane_patterns_manifest.json
-                               │
-                               ▼
-Phase 1: build_rigid_baseline
-         (Point-to-plane translation/rotation aligning instances to regularized shell)
-                               │
-                               ▼
-Phase 2: group_touching_instances & fit_contact_groups_inside
-         (5 cm contact graph clustering, bounded ±5 cm / ±5° yaw containment optimization)
-                               │
-                               ▼
-Phase 3: extract_cross_section_views
-         (Horizontal floorplan slices at 1.2m, vertical section cuts looking +X, -X, +Z, -Z)
-```
-
-## Input contract
-
-All inputs below are generated by previous pipeline stages and locked.
-
-| File / Folder | Origin | Format | Schema / semantics |
-| --- | --- | --- | --- |
-| `mesh.ply` | Stage 04 | Binary little-endian PLY | Authoritative sealed mesh used for section slicing. |
-| `all_structural_regularized.ply` | Stage 06 | Binary little-endian PLY | Axis-aligned regularized structural shell (floors, ceilings, slabs, walls). |
-| `plane_patterns_manifest.json` | Stage 06 | JSON | Inventory of regularized structural surface units, elevations, and watertight slabs. |
-| `Instances PLYs/` or `3d_masks/` | Stage 05 | Directory of PLY files | Decomposed non-structural objects and architectural instances (furniture, columns, stairs). |
-| `class_metadata.json` | Stage 05 | JSON | Instance counts and structural roles (`object`, `columns`, `stairs`, etc.). |
-
-## Processing breakdown
-
-### 1. Rigid baseline object registration (`build_rigid_baseline.py`)
-- Ingests non-structural object instances and discrete architectural elements (such as columns, pillars, stairs) from Stage 05.
-- Computes closest-point correspondence between instance faces and regularized shell planes.
-- Solves area-weighted point-to-plane translation:
-  $$\min_{\mathbf{t}} \sum_i w_i (\mathbf{n}_i \cdot (\mathbf{p}_i + \mathbf{t} - \mathbf{q}_i))^2$$
-- When `--allow-rotation` is requested, uses deterministic RANSAC over 3-point sample triplets.
-- Applies the estimated transform to each instance, saving them under `rigid_baseline_instances/class_XXX/instance_YYY.ply`.
-- Merges transformed objects into `rigid_baseline_objects.ply` and combined scene `rigid_baseline_scene.ply`.
-
-### 2. Contact graph clustering (`group_touching_instances.py`)
-- Builds KD-trees over vertices of all aligned object instances.
-- Queries all instance pairs within a $0.05\text{ m}$ (5 cm) contact threshold.
-- Finds connected components in the contact adjacency graph, grouping touching items into rigid multi-body functional blocks (e.g., table with chairs, bed with side tables).
-- Writes grouping manifest `contact_groups.json`.
-
-### 3. Envelope containment optimization (`fit_contact_groups_inside.py`)
-- Establishes a 3D bounding envelope by raycasting from floor and ceiling scenes.
-- Computes the allowable 2D footprint polygon with an inward clearance of $0.01\text{ m}$ (1 cm).
-- Performs a bounded deterministic grid search over translation ($\pm 5\text{ cm}$) and yaw ($\pm 5^\circ$) maximizing sampled surface containment inside the room volume.
-- Applies rigid transformation only when containment improves significantly ($\ge 3$ percentage points gain).
-- Exports transformed group models to `structural_fit/contact_groups/group_XXX.ply` and overall fitted scene `structural_fit/structural_fit_scene.ply`.
-
-### 4. Unobstructed interior cross-sections (`extract_cross_section_views.py`)
-- Slices the authoritative scene mesh along canonical cutting planes:
-  - **Top-down floorplan cut**: sliced horizontally at $1.2\text{ m}$ above each floor level (or at $90\%$ of clear ceiling height).
-  - **Four elevation section cuts**: sliced through the center of the room looking West-to-East ($+X$), East-to-West ($-X$), South-to-North ($+Z$), and North-to-South ($-Z$).
-- Applies half-space plane clipping to remove foreground occluding triangles so interior arrangements and columns remain completely visible.
-- Saves high-resolution orthographic renders and camera framing metadata to `cross_sections/`.
-
-## Output contract
-
-| Artifact | Phase | Semantics |
+| Path | Producer | Use |
 | --- | --- | --- |
-| `rigid_baseline_report.json` | Registration | Registration residual metrics, translation vector, rotation angle, and inlier counts. |
-| `rigid_baseline_instances/` | Registration | Directory of individually transformed PLY meshes organized by class ID. |
-| `rigid_baseline_objects.ply` | Registration | Unified mesh containing all transformed non-structural objects. |
-| `rigid_baseline_scene.ply` | Registration | Combined mesh of the regularized structural shell plus all aligned objects. |
-| `contact_groups.json` | Clustering | Multi-body contact groups and instance member lists. |
-| `structural_fit/structural_fit_report.json` | Containment | Envelope search results, initial vs contained surface percentages, and displacement RMS. |
-| `structural_fit/structural_fit_scene.ply` | Containment | Fully collision-optimized final scene mesh. |
-| `cross_sections/cross_sections_manifest.json` | Cross-sections | Cut definitions, camera origins, view directions, and field-of-view parameters. |
-| `cross_sections/topdown_floor_*.png` | Cross-sections | Unobstructed top-down floorplan view per level. |
-| `cross_sections/elevation_*.png` | Cross-sections | Elevation section views along cardinal viewing axes. |
+| `<scan>/mesh_elaboration/complete.ply` | Stage 06 | Completed structural surfaces used for registration and containment. |
+| `<scan>/mesh_elaboration/elements/` | Stage 06 | Role-labeled floor, slab, ceiling, and wall surfaces used for registration and support detection. |
+| `<scan>/segmentation/` | Stage 05 | Instance meshes, class metadata, and category-association artifact. |
+| `<scan>/objects_alignment/aligned_instances/` | Stage 07 | Final object-only PLYs plus `manifest.json`; Stage 05 and Stage 06 files remain unchanged. |
+| `<scan>/objects_alignment/structural_fit/` | Stage 07 | Support-fit report, fitted contact groups, and combined diagnostic scene. |
 
-## CLI usage
+The current full Phase 06 runner publishes `complete.ply`; Stage 07 defaults to that file. Older standalone Phase 06 workspaces can pass an alternate shell with `--shell`.
+
+## Processing
+
+### 1. Rigid baseline registration (`build_rigid_baseline.py`)
+
+- Delivers only Stage 05 instances labeled `structural_role: object`; wall, floor, and ceiling instances provide alignment anchors, while other structural roles are excluded.
+- Finds closest-point correspondences between anchor faces and matching Stage 06 role surfaces, then estimates an area-weighted rigid correction.
+- With `--allow-rotation`, estimates rotation using deterministic RANSAC over three-point samples.
+- Applies the correction only when the full-anchor inlier fraction is at least 10%, translation is at most 5 cm, and rotation is at most 3°. Otherwise it records the proposal and applies identity; `transform` remains the applied transform for Stage 08 compatibility.
+- Fit residual metrics describe the proposed transform, including when the confidence gate rejects it.
+- Writes transformed instances to `rigid_baseline_instances/`, a combined object mesh, a combined scene mesh, and `rigid_baseline_report.json`.
+
+### 2. Contact grouping (`group_touching_instances.py`)
+
+- Builds KD-trees over vertices and sampled face centers of aligned instances.
+- Groups instances connected by pairwise proximity at the configured contact distance.
+- Writes the member lists and contact decisions to `contact_groups.json`.
+
+### 3. Support fitting (`fit_contact_groups_inside.py`)
+
+- Detects horizontal floor and parallel wall support within 5 cm, targets a 5 mm gap, and tests floor, wall, and combined translations.
+- Ranks candidates by transverse mesh-edge intersections, then category-weighted support and movement. Supported placements are eligible only when at least 95% of each member instance's area-weighted surface samples remain inside the room envelope; the unchanged baseline remains available when no supported move meets that limit.
+- Reports unresolved intersection edge hits and per-instance room-envelope containment. The edge test is a mesh-surface intersection check, not a signed penetration-depth measurement; unsupported objects are left in place.
+- Publishes one PLY per explicitly non-structural instance under `aligned_instances/`, with source mapping, global registration transform, and local support translations in its manifest.
+
+## Run
+
+From the repository root:
 
 ```bash
-# Auto-discovery mode (resolves Stage 04 mesh, Stage 05 segmentation, and Stage 06 shell)
-.venv/bin/python 07_objecs_alignment/step_objects_alignment.py --workspace current_scene/scan_0
+backend/.venv/bin/python backend/07_objecs_alignment/step_objects_alignment.py \
+  --workspace backend/current_scene/scan_1
+```
 
-# Explicit override mode
-.venv/bin/python 07_objecs_alignment/step_objects_alignment.py \
-  --mesh-path current_scene/scan_0/mesh.ply \
-  --shell current_scene/scan_0/mesh_elaboration/all_structural_regularized.ply \
-  --segmentation-output current_scene/scan_0/segmentation \
-  --output-dir current_scene/scan_0/objects_alignment
+For explicit inputs:
+
+```bash
+backend/.venv/bin/python backend/07_objecs_alignment/step_objects_alignment.py \
+  --shell backend/current_scene/scan_1/mesh_elaboration/complete.ply \
+  --segmentation-output backend/current_scene/scan_1/segmentation \
+  --output-dir backend/current_scene/scan_1/objects_alignment
 ```
 
 ## Function reference
 
-| Callable | Signature / behavior |
+| Callable | Behavior |
 | --- | --- |
-| `step_objects_alignment.run_pipeline_for_scene` | Coordinates execution of `build_rigid_baseline`, `fit_contact_groups_inside`, and `extract_cross_section_views`. |
-| `build_rigid_baseline.robust_fit` | Evaluates point-to-plane correspondences and computes area-weighted translation and optional RANSAC rotation. |
-| `group_touching_instances.build_groups` | Evaluates pairwise KD-tree distances between instances at $0.05\text{ m}$ to form connected contact groups. |
-| `fit_contact_groups_inside.fit_group` | Evaluates raycasting envelope containment across $\pm 5\text{ cm}$ and $\pm 5^\circ$ yaw to find optimal collision clearance. |
-| `extract_cross_section_views.slice_open3d_mesh_plane` | Clips mesh triangles against half-space planes with exact planar edge interpolation. |
-| `extract_cross_section_views.compute_framing_camera` | Derives tight bounding orthographic camera eye and target poses with $30\%$ visual padding. |
+| `step_objects_alignment.run_pipeline_for_scene` | Runs rigid registration and containment, writing per-pass timings. |
+| `build_rigid_baseline.robust_fit` | Computes area-weighted translation and optional RANSAC rotation. |
+| `group_touching_instances.build_groups` | Forms connected contact groups from nearby aligned instances. |
+| `fit_contact_groups_inside.build` | Fits floor/wall support candidates, reports intersection checks, and publishes final object instances. |
+
+Stage 08 uses `objects_alignment/rigid_baseline_report.json` together with the Stage 04 mesh to generate top-down and elevation views; see [`08_artifacts_generation/README.md`](../08_artifacts_generation/README.md).

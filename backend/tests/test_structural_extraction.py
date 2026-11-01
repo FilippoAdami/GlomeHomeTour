@@ -198,6 +198,57 @@ def test_extraction_exports_multiple_same_role_instances_with_stable_unique_ids(
     ]
 
 
+def test_extraction_recovers_fragmented_upper_ceiling_without_changing_lower_ceiling(tmp_path, monkeypatch):
+    vertices = [[0., 0., 0.], [2., 0., 0.], [2., 0., 2.], [0., 0., 2.]]
+    faces = [[0, 1, 2], [0, 2, 3]]
+    for x0 in (3.0, 3.7):
+        for z0 in (0.0, 0.7):
+            x1, z1 = x0 + 0.6, z0 + 0.6
+            y0, y1 = -0.15 + 0.5 * (x0 - 3.0), -0.15 + 0.5 * (x1 - 3.0)
+            start = len(vertices)
+            vertices.extend([
+                [x0, y0, z0], [x1, y1, z0], [x1, y1, z1], [x0, y0, z1],
+            ])
+            faces.extend([[start, start + 1, start + 2], [start, start + 2, start + 3]])
+
+    mesh_path = tmp_path / "source.ply"
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(faces)
+    assert o3d.io.write_triangle_mesh(str(mesh_path), mesh)
+    labels_path = tmp_path / "labels.npy"
+    np.save(labels_path, np.full(len(faces), 7))
+    structural_json = tmp_path / "structural.json"
+    structural_json.write_text(json.dumps({"classifications": {
+        "7": {"structural_role": "ceiling"},
+    }}))
+    output_dir = tmp_path / "output"
+    monkeypatch.setattr(extract, "parse_args", lambda: argparse.Namespace(
+        mesh_path=mesh_path, labels_path=labels_path, structural_json=structural_json,
+        output_dir=output_dir, min_big_area=1.0, merge_dist_thresh=0.25,
+    ))
+
+    assert extract.main() == 0
+
+    manifest = json.loads((output_dir / "structural_instances_manifest.json").read_text())
+    ceiling_role = manifest["roles"]["ceiling"]
+    assert ceiling_role["num_major_instances"] == 1
+    assert ceiling_role["recovered_fragmented_instances"] == 1
+    assert ceiling_role["recovered_fragmented_components"] == 4
+    assert ceiling_role["recovered_fragmented_triangles"] == 8
+    assert [item["file_name"] for item in manifest["instances"]] == [
+        "ceiling_inst000.ply", "ceiling_inst001.ply",
+    ]
+    lower, upper = [
+        o3d.io.read_triangle_mesh(str(output_dir / filename))
+        for filename in ("ceiling_inst000.ply", "ceiling_inst001.ply")
+    ]
+    lower_y = np.asarray(lower.vertices)[:, 1]
+    upper_y = np.asarray(upper.vertices)[:, 1]
+    assert len(np.asarray(upper.triangles)) == 8
+    assert upper_y.min() < lower_y.max() < upper_y.max()
+
+
 def test_extraction_merges_associated_doors_and_windows_to_nearest_wall(tmp_path, monkeypatch):
     mesh_path = tmp_path / "source.ply"
     mesh = o3d.geometry.TriangleMesh()
@@ -219,6 +270,7 @@ def test_extraction_merges_associated_doors_and_windows_to_nearest_wall(tmp_path
 
     segmentation_dir = tmp_path / "segmentation_output"
     metadata = {"classes": {
+        "8": {"structural_role": "wall"},
         "19": {"structural_role": "object"},
         "29": {"structural_role": "object"},
     }}
@@ -239,7 +291,7 @@ def test_extraction_merges_associated_doors_and_windows_to_nearest_wall(tmp_path
 
     associations_path = segmentation_dir / "non_structural_similarity" / "valid_class_associations.json"
     associations_path.parent.mkdir(parents=True)
-    associations_path.write_text(json.dumps({"associations": [[19, 1], [29, 2]]}))
+    associations_path.write_text(json.dumps({"associations": [[8, 1], [19, 1], [29, 2]]}))
     output_dir = tmp_path / "output"
     monkeypatch.setattr(extract, "parse_args", lambda: argparse.Namespace(
         mesh_path=mesh_path, labels_path=labels_path, structural_json=structural_json,
@@ -251,7 +303,12 @@ def test_extraction_merges_associated_doors_and_windows_to_nearest_wall(tmp_path
     manifest = json.loads((output_dir / "structural_instances_manifest.json").read_text())
     merges = {(item["text_class_id"], item["target_role"]) for item in manifest["door_window_merges"]}
     assert merges == {(1, "wall"), (2, "wall")}
-    assert len(np.asarray(o3d.io.read_triangle_mesh(str(output_dir / "wall_inst000.ply")).triangles)) == 3
+    wall_path = output_dir / "wall_inst000.ply"
+    assert len(np.asarray(o3d.io.read_triangle_mesh(str(wall_path)).triangles)) == 3
+    np.testing.assert_array_equal(
+        extract.read_ply_face_flags(wall_path, "semantic_category_id"), [1, 1, 2]
+    )
+    assert manifest["source_class_categories"]["8"] == 1
     assert len(np.asarray(o3d.io.read_triangle_mesh(str(output_dir / "ceiling_inst000.ply")).triangles)) == 1
     assert {p: p.read_bytes() for p in original_object_bytes} == original_object_bytes
 

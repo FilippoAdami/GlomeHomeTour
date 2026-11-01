@@ -2,9 +2,7 @@ import json
 import sys
 from pathlib import Path
 
-STAGE = Path(__file__).resolve().parents[1] / "07_objecs_alignment"
-if not STAGE.is_dir():
-    STAGE = Path(__file__).resolve().parents[1] / "06_mesh_elaboration"
+STAGE = Path(__file__).resolve().parents[1] / "08_artifacts_generation"
 sys.path.insert(0, str(STAGE))
 
 import numpy as np

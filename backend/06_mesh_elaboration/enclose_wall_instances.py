@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import traceback
+from datetime import datetime, timezone
 
 import numpy as np
 
@@ -73,6 +75,12 @@ def _compatibility_manifest(fit_result: dict, growth_result: dict,
         },
         "wall_planes": wall_planes,
         "total_wall_planes_count": len(wall_planes),
+        "semantic_category_color_samples_excluded": assembly_result.get(
+            "semantic_category_color_samples_excluded", 0
+        ),
+        "mesh_supported_corner_extensions": assembly_result.get(
+            "mesh_supported_corner_extensions", []
+        ),
         "wall_vertical_bounds_m": [assembly_result["floor_y"], assembly_result["ceiling_y"]],
         "horizontal_topology": topology.get("final_topology", topology),
         "inferred_floor_closure_planes": topology.get("inferred_floor_closure_planes", []),
@@ -135,11 +143,62 @@ def _atomic_json(data: dict, destination: Path) -> Path:
     return staged
 
 
+def _save_failure_diagnostics(
+    diagnostics_root: Path, regions_dir: Path, wall_paths: list[Path],
+    stage: str, error: str, traceback_text: str, events: list[str],
+) -> Path | None:
+    try:
+        diagnostics_root.mkdir(parents=True, exist_ok=True)
+        run_dir = Path(tempfile.mkdtemp(prefix="wall_enclosure_failure_", dir=diagnostics_root))
+        input_dir = run_dir / "input_wall_meshes"
+        input_dir.mkdir()
+        saved_inputs = []
+        for index, source in enumerate(wall_paths):
+            if not source.is_file():
+                continue
+            saved_name = f"{index:03d}_{source.name}"
+            shutil.copy2(source, input_dir / saved_name)
+            saved_inputs.append({"source_path": str(source), "saved_path": f"input_wall_meshes/{saved_name}"})
+
+        copied = []
+        for name in (
+            "wall_regions_colored.ply", "wall_regions_triangle_labels.npy",
+            "wall_regions_semantic_category_ids.npy",
+            "wall_regions_manifest.json", "wall_region_planes_manifest.json",
+            "wall_regions_with_planes.ply", "wall_region_planes.glb",
+            "wall_loop_topology_diagnostic.json",
+        ):
+            source = regions_dir / name
+            if source.is_file():
+                shutil.copy2(source, run_dir / name)
+                copied.append(name)
+
+        log_text = "\n".join([*events, f"FAILURE stage={stage}: {error}", traceback_text]).rstrip() + "\n"
+        (run_dir / "wall_enclosure.log").write_text(log_text)
+        (run_dir / "failure.json").write_text(json.dumps({
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "error": error,
+            "traceback": traceback_text,
+            "diagnostic_directory": str(run_dir),
+            "source_wall_meshes": saved_inputs,
+            "copied_intermediates": copied,
+            "checkpoints": events,
+        }, indent=2) + "\n")
+        return run_dir
+    except Exception as diagnostic_error:
+        print(f"[wall enclosure] Could not preserve failure diagnostics: {diagnostic_error}",
+              file=sys.stderr)
+        return None
+
+
 def build_wall_shell(instances_dir: Path, output_path: Path,
-                     manifest_path: Path | None = None) -> dict:
+                     manifest_path: Path | None = None,
+                     diagnostics_dir: Path | None = None) -> dict:
     instances_dir = instances_dir.resolve()
     output_path = output_path.resolve()
     manifest_path = manifest_path.resolve() if manifest_path else None
+    diagnostics_root = (diagnostics_dir or instances_dir / "wall_enclosure_diagnostics").resolve()
     if not instances_dir.is_dir():
         raise ValueError(f"Structural instances directory does not exist: {instances_dir}")
     if manifest_path == output_path:
@@ -169,32 +228,102 @@ def build_wall_shell(instances_dir: Path, output_path: Path,
     if not wall_paths:
         result = _empty_manifest(output_path)
     else:
+        events: list[str] = []
+
+        def checkpoint(message: str) -> None:
+            line = f"{datetime.now(timezone.utc).isoformat()} {message}"
+            events.append(line)
+            print(f"[wall enclosure] {message}", flush=True)
+
         with tempfile.TemporaryDirectory(prefix=".wall_shell_", dir=instances_dir) as temp:
             regions_dir = Path(temp)
             regions_mesh = regions_dir / "wall_regions_colored.ply"
             labels_path = regions_dir / "wall_regions_triangle_labels.npy"
             region_manifest_path = regions_dir / "wall_regions_manifest.json"
-            growth_result = grow._write_colored_regions(
-                wall_paths, regions_mesh, labels_path,
-                grow.DEFAULT_SEED_COUNT, grow.DEFAULT_RANDOM_SEED,
+            checkpoint(f"inputs: {len(wall_paths)} wall mesh(es); diagnostics root {diagnostics_root}")
+            checkpoint("region growth started")
+            try:
+                growth_result = grow._write_colored_regions(
+                    wall_paths, regions_mesh, labels_path,
+                    grow.DEFAULT_SEED_COUNT, grow.DEFAULT_RANDOM_SEED,
+                )
+                region_manifest_path.write_text(json.dumps(growth_result, indent=2) + "\n")
+            except Exception as error:
+                checkpoint(f"region growth failed: {error}")
+                saved = _save_failure_diagnostics(
+                    diagnostics_root, regions_dir, wall_paths, "region_growth", str(error),
+                    traceback.format_exc(), events,
+                )
+                if saved:
+                    print(f"[wall enclosure] diagnostics saved to {saved}", flush=True)
+                raise
+            checkpoint(
+                f"region growth complete: {growth_result['triangle_count']} triangles, "
+                f"{growth_result['region_count']} regions, "
+                f"{growth_result['degenerate_triangle_count']} degenerate triangles"
             )
-            region_manifest_path.write_text(json.dumps(growth_result, indent=2) + "\n")
-            _, _, fit_result = fit._process(regions_dir)
+
+            checkpoint("plane fitting started")
+            try:
+                _, _, fit_result = fit._process(regions_dir)
+            except Exception as error:
+                checkpoint(f"plane fitting failed: {error}")
+                saved = _save_failure_diagnostics(
+                    diagnostics_root, regions_dir, wall_paths, "plane_fitting", str(error),
+                    traceback.format_exc(), events,
+                )
+                if saved:
+                    print(f"[wall enclosure] diagnostics saved to {saved}", flush=True)
+                raise
+            checkpoint(
+                f"plane fitting complete: {fit_result['plane_count']} planes, "
+                f"{fit_result.get('unassigned_triangle_count', 0)} unassigned triangles"
+            )
 
             if fit_result["plane_count"] == 0:
+                checkpoint("no fitted planes; preserving available region-stage artifacts")
+                saved = _save_failure_diagnostics(
+                    diagnostics_root, regions_dir, wall_paths, "plane_fitting_no_planes",
+                    "Plane fitting produced no supported wall planes", "", events,
+                )
+                if saved:
+                    print(f"[wall enclosure] diagnostics saved to {saved}", flush=True)
                 result = _empty_manifest(output_path, wall_paths)
             else:
+                checkpoint("wall-shell assembly started")
+                failure_stage = "wall_shell_assembly"
                 try:
-                    _, _, assembly_result = assemble._assemble(regions_dir)
-                except ValueError as error:
-                    if "Plane manifest contains no supported wall planes" not in str(error):
-                        raise
-                    result = _empty_manifest(output_path, wall_paths)
-                else:
+                    _, _, assembly_result = assemble._assemble(
+                        regions_dir, diagnostics_path=regions_dir / "wall_loop_topology_diagnostic.json"
+                    )
+                    checkpoint(
+                        f"wall-shell assembly complete: {len(assembly_result['planes'])} panels"
+                    )
+                    failure_stage = "wall_manifest_generation"
                     result = _compatibility_manifest(
                         fit_result, growth_result, assembly_result, output_path
                     )
                     shell_source = Path(assembly_result["shell_ply"])
+                except ValueError as error:
+                    checkpoint(f"{failure_stage.replace('_', ' ')} failed: {error}")
+                    saved = _save_failure_diagnostics(
+                        diagnostics_root, regions_dir, wall_paths, failure_stage, str(error),
+                        traceback.format_exc(), events,
+                    )
+                    if saved:
+                        print(f"[wall enclosure] diagnostics saved to {saved}", flush=True)
+                    if "Plane manifest contains no supported wall planes" not in str(error):
+                        raise
+                    result = _empty_manifest(output_path, wall_paths)
+                except Exception as error:
+                    checkpoint(f"{failure_stage.replace('_', ' ')} failed: {error}")
+                    saved = _save_failure_diagnostics(
+                        diagnostics_root, regions_dir, wall_paths, failure_stage, str(error),
+                        traceback.format_exc(), events,
+                    )
+                    if saved:
+                        print(f"[wall enclosure] diagnostics saved to {saved}", flush=True)
+                    raise
             if shell_source is not None:
                 staged_shell = _atomic_copy(shell_source, output_path)
 
@@ -226,10 +355,13 @@ def main(argv: list[str] | None = None) -> int:
                         help="Final shell PLY (defaults to <instances-dir>/wall_enclosing_shell.ply)")
     parser.add_argument("--manifest-out", type=Path,
                         help="Optional wall-plane metadata for the later floor/ceiling footprint steps")
+    parser.add_argument("--diagnostics-dir", type=Path,
+                        help="Persistent directory for failure logs and intermediate wall artifacts")
     args = parser.parse_args(argv)
     output_path = args.output or args.instances_dir / "wall_enclosing_shell.ply"
     try:
-        result = build_wall_shell(args.instances_dir, output_path, args.manifest_out)
+        result = build_wall_shell(args.instances_dir, output_path, args.manifest_out,
+                                  args.diagnostics_dir)
     except (OSError, ValueError, KeyError, IndexError, json.JSONDecodeError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1

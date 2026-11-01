@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for backend/06_mesh_elaboration/match_real_captured_frames.py.
+Unit tests for backend/08_artifacts_generation/match_real_captured_frames.py.
 """
 
 from pathlib import Path
@@ -9,7 +9,7 @@ import pytest
 from PIL import Image
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "06_mesh_elaboration"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "08_artifacts_generation"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "03_FastGS_DNSplatter"))
 
 from match_real_captured_frames import (

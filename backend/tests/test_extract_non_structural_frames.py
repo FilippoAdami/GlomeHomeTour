@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for non-structural class frame extraction in 06_mesh_elaboration.
+Unit tests for non-structural class frame extraction in 05_semantic_segmentation.
 """
 
 import json
@@ -11,7 +11,7 @@ from PIL import Image
 import pytest
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "06_mesh_elaboration"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "05_semantic_segmentation"))
 from extract_non_structural_frames import (
     is_structural_role,
     identify_non_structural_classes,
@@ -65,6 +65,10 @@ def test_identify_non_structural_classes(tmp_path):
     assert classes[2]["role"] == "furniture_horizontal"
     assert classes[10]["role"] == "object"
     assert classes[99]["role"] == "object"
+
+    all_classes = identify_non_structural_classes(struct_json, labels, include_structural=True)
+    assert set(all_classes) == {1, 2, 5, 10, 14, 99}
+    assert all_classes[5]["role"] == "wall"
 
 
 def test_decompose_class_instances():

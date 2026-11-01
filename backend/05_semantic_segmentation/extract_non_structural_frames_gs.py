@@ -7,7 +7,7 @@ derived from the mesh extraction step (non_structural_frames_manifest.json) with
 occluding classes.
 
 Saves rendered frames to a dedicated comparison folder:
-  <workspace>/06_mesh_elaboration/non_structural_frames_gs/
+  <workspace>/segmentation/non_structural_category_frames/gs/
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ from PIL import Image
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
-if str(_backend_dir / "06_mesh_elaboration") not in sys.path:
-    sys.path.insert(0, str(_backend_dir / "06_mesh_elaboration"))
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from Utilities.pipeline_paths import bootstrap
 bootstrap()
@@ -247,8 +247,9 @@ def run_gs_extraction(
     if manifest_path is None:
         manifest_path = (
             workspace
-            / "06_mesh_elaboration"
-            / "non_structural_frames"
+            / "segmentation"
+            / "non_structural_category_frames"
+            / "mesh"
             / "non_structural_frames_manifest.json"
         )
 
@@ -269,7 +270,7 @@ def run_gs_extraction(
     logger.info(f"Using Gaussian Splat checkpoint: {ckpt_file}")
 
     if output_dir is None:
-        output_dir = workspace / "06_mesh_elaboration" / "non_structural_frames_gs"
+        output_dir = workspace / "segmentation" / "non_structural_category_frames" / "gs"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if discarded_dir is None:
@@ -445,8 +446,8 @@ def main():
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path("backend/current_scene"),
-        help="Scan workspace containing checkpoint.pt and 06_mesh_elaboration.",
+        default=_backend_dir / "current_scene/scan_0",
+        help="Scan workspace containing checkpoint.pt and segmentation/.",
     )
     parser.add_argument(
         "--manifest",
@@ -464,7 +465,7 @@ def main():
         "--output-dir",
         type=Path,
         default=None,
-        help="Output directory for GS frames (default: <workspace>/06_mesh_elaboration/non_structural_frames_gs).",
+        help="Output directory for GS frames (default: <workspace>/segmentation/non_structural_category_frames/gs).",
     )
     parser.add_argument(
         "--discarded-dir",

@@ -13,10 +13,12 @@ from shapely.ops import unary_union
 
 SCRIPT = Path(__file__).parents[1] / "06_mesh_elaboration" / "enclose_wall_instances.py"
 sys.path.insert(0, str(SCRIPT.parent))
+sys.path.insert(0, str(SCRIPT.parents[1] / "04_3DGS_to_mesh"))
 SPEC = importlib.util.spec_from_file_location("enclose_wall_instances", SCRIPT)
 enclose_wall_instances = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(enclose_wall_instances)
+import extract_structural_meshes
 
 
 def test_combined_builder_publishes_watertight_room_shell(tmp_path, monkeypatch):
@@ -24,17 +26,26 @@ def test_combined_builder_publishes_watertight_room_shell(tmp_path, monkeypatch)
     instances.mkdir()
     entries = []
 
-    def write_quad(name, points, role, color=(0.6, 0.6, 0.6)):
+    def write_quad(name, points, role, color=(0.6, 0.6, 0.6), semantic_categories=None):
         path = instances / f"{name}.ply"
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(points)
-        mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [0, 2, 3]])
-        mesh.paint_uniform_color(color)
-        assert o3d.io.write_triangle_mesh(str(path), mesh)
+        vertices = np.asarray(points, dtype=float)
+        triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+        if semantic_categories is not None:
+            colors = np.tile(np.asarray(color, dtype=float), (len(vertices), 1))
+            assert extract_structural_meshes.export_colored_ply(
+                path, vertices, triangles, colors,
+                {"semantic_category_id": ("uchar", np.asarray(semantic_categories, dtype=np.uint8))},
+            )
+        else:
+            mesh = o3d.geometry.TriangleMesh()
+            mesh.vertices = o3d.utility.Vector3dVector(vertices)
+            mesh.triangles = o3d.utility.Vector3iVector(triangles)
+            mesh.paint_uniform_color(color)
+            assert o3d.io.write_triangle_mesh(str(path), mesh)
         entries.append({"role": role, "file_name": path.name})
 
     write_quad("wall_inst000", [[0, 0, 0], [0, 0, 4], [0, 3, 4], [0, 3, 0]],
-               "wall", color=(0.1, 0.05, 0.05))
+               "wall", color=(0.1, 0.05, 0.05), semantic_categories=[1, 0])
     write_quad("wall_inst001", [[4, 0, 4], [4, 0, 0], [4, 3, 0], [4, 3, 4]], "wall")
     write_quad("wall_inst002", [[4, 0, 0], [0, 0, 0], [0, 3, 0], [4, 3, 0]], "wall")
     write_quad("wall_inst003", [[0, 0, 4], [4, 0, 4], [4, 2.98, 4], [0, 2.98, 4]], "wall")
@@ -46,6 +57,18 @@ def test_combined_builder_publishes_watertight_room_shell(tmp_path, monkeypatch)
     output = instances / "wall_enclosing_shell.ply"
     manifest_path = instances / "wall_planes_manifest.json"
     monkeypatch.setattr(enclose_wall_instances.grow, "MIN_REGION_TRIANGLES", 1)
+    appearance_samples = []
+    regularize = enclose_wall_instances.assemble.regularize_planar_patches
+
+    def capture_appearance_samples(patches, *args, **kwargs):
+        appearance_samples.extend(
+            np.asarray(patch["support_centers"]) for patch in patches
+        )
+        return regularize(patches, *args, **kwargs)
+
+    monkeypatch.setattr(
+        enclose_wall_instances.assemble, "regularize_planar_patches", capture_appearance_samples
+    )
     result = enclose_wall_instances.build_wall_shell(instances, output, manifest_path)
 
     assert output.is_file()
@@ -55,6 +78,13 @@ def test_combined_builder_publishes_watertight_room_shell(tmp_path, monkeypatch)
     assert vertex_colors.shape == (len(saved_shell.vertices), 3)
     assert np.ptp(vertex_colors, axis=0).max() > 0.2
     saved = json.loads(manifest_path.read_text())
+    assert saved["semantic_category_color_samples_excluded"] >= 1
+    assert "mesh_supported_corner_extensions" in saved
+    door_center = np.mean(np.asarray([[0, 0, 0], [0, 0, 4], [0, 3, 4]], dtype=float), axis=0)
+    assert not any(
+        np.any(np.all(np.isclose(samples, door_center), axis=1))
+        for samples in appearance_samples if len(samples)
+    )
     assert len(saved["wall_planes"]) >= 4
     assert all(panel["bounds_y"][0] == 0.0 for panel in saved["wall_planes"])
     assert all(panel["bounds_y"][1] == saved["wall_vertical_bounds_m"][1]
@@ -241,7 +271,84 @@ def test_junction_closure_accounts_for_existing_topology_tolerance():
     ]
     assembly._snap_panel_junctions(planes)
     assert planes[1]["span_u_m"][0] == 0.
+    assert not assembly._has_long_corner_gap(planes)
 
     planes[1]["span_u_m"][0] = assembly.JUNCTION_DISTANCE_M + 2 * assembly.TOPOLOGY_TOLERANCE_M
     assembly._snap_panel_junctions(planes)
     assert planes[1]["span_u_m"][0] > assembly.JUNCTION_DISTANCE_M
+
+
+def _corner_support_mesh(assembly):
+    along = np.repeat((np.arange(5) + 0.5) * 0.1, 6)
+    heights = np.tile((np.arange(6) + 0.5) * 0.5, 5)
+    first_wall = np.column_stack((np.zeros(30), heights, along))
+    second_wall = np.column_stack((along, heights, np.zeros(30)))
+    centers = np.vstack((first_wall, second_wall))
+    normals = np.vstack((np.tile([1.0, 0.0, 0.0], (30, 1)),
+                         np.tile([0.0, 0.0, 1.0], (30, 1))))
+    areas = np.full(len(centers), 0.05)
+    axes = np.asarray([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    return assembly._corner_mesh_support(centers, normals, areas, axes)
+
+
+def _room_with_open_corner():
+    planes = []
+    for plane_id, family, offset, span in (
+        (0, 0, 0.0, [0.5, 4.0]),
+        (1, 0, 4.0, [0.0, 4.0]),
+        (2, 1, 0.0, [0.5, 4.0]),
+        (3, 1, 4.0, [0.0, 4.0]),
+    ):
+        span_key = "span_w_m" if family == 0 else "span_u_m"
+        planes.append({
+            "id": plane_id, "family": family, "offset_m": offset,
+            "axis": "Dir A" if family == 0 else "Dir B",
+            span_key: span.copy(), "bounds_y": [0.0, 3.0],
+            "trim_regions": [{"span_m": span.copy(), "bounds_y": [0.0, 3.0]}],
+        })
+    return planes
+
+
+def test_mesh_supported_corner_extension_closes_long_gap():
+    assembly = enclose_wall_instances.assemble
+    planes = _room_with_open_corner()
+    assert assembly._has_long_corner_gap(planes)
+    extensions = assembly._snap_panel_junctions(planes, _corner_support_mesh(assembly))
+    for plane in planes:
+        span_key = "span_w_m" if plane["family"] == 0 else "span_u_m"
+        plane["trim_regions"] = [{"span_m": plane[span_key].copy(),
+                                  "bounds_y": plane["bounds_y"].copy()}]
+
+    _, topology = assembly._cross_section_cycles(planes)
+
+    assert planes[0]["span_w_m"][0] == 0.0
+    assert planes[2]["span_u_m"][0] == 0.0
+    assert len(extensions) == 1
+    assert all(item["supported"] for item in extensions[0]["mesh_support"])
+    assert not assembly._has_long_corner_gap(planes)
+    assert topology["height_bands"][0]["is_closed"]
+
+
+def test_long_corner_gap_without_mesh_evidence_stays_open():
+    assembly = enclose_wall_instances.assemble
+    planes = _room_with_open_corner()
+    original_spans = [plane["span_w_m" if plane["family"] == 0 else "span_u_m"].copy()
+                      for plane in planes]
+
+    assert assembly._snap_panel_junctions(planes) == []
+    assert [plane["span_w_m" if plane["family"] == 0 else "span_u_m"]
+            for plane in planes] == original_spans
+    with pytest.raises(ValueError, match="closed, supported horizontal loop"):
+        assembly._cross_section_cycles(planes)
+
+
+def test_wrongly_oriented_mesh_does_not_support_corner_extension():
+    assembly = enclose_wall_instances.assemble
+    planes = _room_with_open_corner()
+    support = _corner_support_mesh(assembly)
+    offsets, along, heights, _, areas = support[1]
+    support[1] = (offsets, along, heights, np.zeros_like(areas), areas)
+
+    assert assembly._snap_panel_junctions(planes, support) == []
+    assert planes[0]["span_w_m"][0] == 0.5
+    assert planes[2]["span_u_m"][0] == 0.5

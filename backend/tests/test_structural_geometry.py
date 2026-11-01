@@ -94,6 +94,22 @@ def test_slab_closes_seams_at_ply_float32_precision():
     assert roundtrip.volume > 0
 
 
+def test_slab_welds_one_ulp_boundary_sliver_before_closure():
+    x_next = np.nextafter(np.float32(1.), np.float32(2.))
+    vertices = np.array([
+        [1., 1., 0.], [2., 1., 0.], [2., 1., 1.], [1., 1., 1.],
+        [1., 1., -.001], [x_next, 1., -.001],
+    ])
+    # The tiny triangle touches the square only at one vertex; its one-ULP edge
+    # comes from clipped float32 coordinates and should collapse as numerical noise.
+    faces = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 0]])
+
+    slab, _, _ = close_slab(vertices, faces, [0., 1., 0., -2.])
+
+    assert slab.is_watertight
+    assert slab.volume > 0
+
+
 def test_small_misalignments_snap_both_ways_large_extensions_remain():
     points = np.array([[-.1, .1], [3.1, 2.9], [-1., 4.], [4., -1.]])
     result = snap_small_excursions(points, {'West Wall':0, 'East Wall':3, 'South Wall':0, 'North Wall':3})

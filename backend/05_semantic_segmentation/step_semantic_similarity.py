@@ -758,7 +758,7 @@ def main():
         description="Compute semantic similarity between classes and images with EmbeddingGemma2"
     )
     backend_root = Path(__file__).resolve().parents[1]
-    default_img_dir = backend_root / "current_scene/06_mesh_elaboration/images_for_embedding"
+    default_img_dir = backend_root / "current_scene/scan_0/segmentation/non_structural_category_frames/mesh"
 
     parser.add_argument(
         "--images-dir",

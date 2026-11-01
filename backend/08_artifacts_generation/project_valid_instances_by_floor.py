@@ -26,7 +26,7 @@ DEFAULT_CANDIDATE = SCENE_DIR / "per_level_collapse_candidate"
 DEFAULT_REFINED_STRUCTURAL_MESH = SCENE_DIR / "new_step" / "all_structural_regularized.ply"
 DEFAULT_SEGMENTATION = BACKEND_DIR / "current_scene" / "scan_0" / "segmentation"
 DEFAULT_ASSOCIATIONS = DEFAULT_SEGMENTATION / "non_structural_similarity" / "valid_class_associations.json"
-DEFAULT_OUTPUT = SCENE_DIR / "floor_instance_projections"
+DEFAULT_OUTPUT = BACKEND_DIR / "current_scene" / "scan_0" / "artifacts" / "floorplan" / "instance_projections"
 
 
 def _load_segmented_structure(segmentation_dir: Path, metadata: dict):

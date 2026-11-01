@@ -37,10 +37,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("extract_non_structural_frames")
 
 backend_dir = Path(__file__).resolve().parents[1]
+stage05_dir = Path(__file__).resolve().parent
 if str(backend_dir / "03_FastGS_DNSplatter") not in sys.path:
     sys.path.insert(0, str(backend_dir / "03_FastGS_DNSplatter"))
-if str(backend_dir / "06_mesh_elaboration") not in sys.path:
-    sys.path.insert(0, str(backend_dir / "06_mesh_elaboration"))
+if str(stage05_dir) not in sys.path:
+    sys.path.insert(0, str(stage05_dir))
 
 try:
     from gsplat_train import load_cameras
@@ -72,10 +73,11 @@ def is_structural_role(role: str) -> bool:
 def identify_non_structural_classes(
     structural_json_path: Path,
     mesh_labels: Optional[np.ndarray] = None,
+    include_structural: bool = False,
 ) -> Dict[int, Dict[str, Any]]:
     """
-    Parse structural JSON metadata and identify all non-structural classes.
-    Returns mapping from class_id to class metadata dict.
+    Parse structural metadata and return eligible source classes by ID.
+    Structural classes are included only when explicitly requested.
     """
     if not structural_json_path.exists():
         raise FileNotFoundError(f"Structural metadata JSON not found at {structural_json_path}")
@@ -89,7 +91,7 @@ def identify_non_structural_classes(
     for cid_str, info in classifications.items():
         cid = int(cid_str)
         role = info.get("structural_role", "object")
-        if not is_structural_role(role):
+        if include_structural or not is_structural_role(role):
             non_structural[cid] = {
                 "class_id": cid,
                 "role": role,
@@ -1453,19 +1455,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--mesh-path",
         type=Path,
-        default=backend_dir / "current_scene/06_mesh_elaboration/original_mesh.ply",
+        default=backend_dir / "current_scene/scan_0/mesh.ply",
         help="Path to original colored mesh PLY",
     )
     parser.add_argument(
         "--labels-path",
         type=Path,
-        default=backend_dir / "current_scene/06_mesh_elaboration/generic_graph_regions/triangle_class_labels.npy",
+        default=backend_dir / "current_scene/scan_0/segmentation/triangle_class_labels.npy",
         help="Path to triangle class labels array (.npy)",
     )
     parser.add_argument(
         "--structural-json",
         type=Path,
-        default=backend_dir / "current_scene/06_mesh_elaboration/generic_graph_regions/structural_classes.json",
+        default=backend_dir / "current_scene/scan_0/segmentation/class_metadata.json",
         help="Path to structural classes JSON metadata",
     )
     parser.add_argument(
@@ -1479,14 +1481,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--mesh-output-dir",
         type=Path,
         dest="output_dir",
-        default=backend_dir / "current_scene/06_mesh_elaboration/non_structural_frames",
+        default=backend_dir / "current_scene/scan_0/segmentation/non_structural_category_frames/mesh",
         help="Output directory for extracted mesh images and manifest",
     )
     parser.add_argument(
         "--gs-output-dir",
         type=Path,
         default=None,
-        help="Output directory for extracted Gaussian Splat images (default: <workspace>/06_mesh_elaboration/non_structural_frames_gs)",
+        help="Output directory for extracted Gaussian Splat images (default: alongside the mesh frames under segmentation/)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -1498,6 +1500,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--skip-gs",
         action="store_true",
         help="Skip rendering from Gaussian Splat (mesh only)",
+    )
+    parser.add_argument(
+        "--include-structural",
+        action="store_true",
+        help="Also render structural source classes for category matching",
     )
     parser.add_argument(
         "--device",
@@ -1551,8 +1558,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--levels-manifest",
         type=Path,
-        default=backend_dir / "current_scene/06_mesh_elaboration/extracted_structural_instances/structural_levels_manifest.json",
-        help="Path to structural levels manifest JSON",
+        default=None,
+        help="Optional structural levels manifest JSON; floor levels are otherwise detected from the scan mesh.",
     )
     parser.add_argument(
         "--human-height-offset",
@@ -1673,6 +1680,7 @@ def run_extraction(
     min_autocorr: float = 0.35,
     min_p95_grad: float = 1.25,
     min_edge_density: float = 1.0,
+    include_structural: bool = False,
 ) -> int:
     t_start = time.perf_counter()
 
@@ -1692,7 +1700,7 @@ def run_extraction(
     mesh_output_dir.mkdir(parents=True, exist_ok=True)
 
     if gs_output_dir is None:
-        gs_output_dir = workspace / "06_mesh_elaboration" / "non_structural_frames_gs"
+        gs_output_dir = mesh_output_dir.parent / "gs"
 
     if mesh_discarded_dir is None:
         mesh_discarded_dir = mesh_output_dir.parent / (mesh_output_dir.name + "_discarded")
@@ -1741,9 +1749,12 @@ def run_extraction(
         if is_structural_role(info.get("structural_role", ""))
     }
     non_structural_classes = identify_non_structural_classes(structural_json_path, labels)
-    sorted_cids = sorted(non_structural_classes.keys())
+    classes_for_matching = identify_non_structural_classes(
+        structural_json_path, labels, include_structural=include_structural
+    )
+    sorted_cids = sorted(classes_for_matching.keys())
     print(f"Identified {len(structural_cids)} structural classes: {sorted(structural_cids)}")
-    print(f"Identified {len(sorted_cids)} non-structural classes: {sorted(sorted_cids)}")
+    print(f"Identified {len(sorted_cids)} classes for category matching: {sorted(sorted_cids)}")
 
     # Detect scene floor levels
     floor_levels = detect_scene_floor_levels(
@@ -1844,6 +1855,8 @@ def run_extraction(
         if not o_insts:
             continue
         instances_by_class[o_cid] = o_insts
+        if o_cid not in non_structural_classes:
+            continue
         for o_inst in o_insts:
             o_pts = o_inst["points"]
             if len(o_pts) > 600:
@@ -1866,7 +1879,7 @@ def run_extraction(
     save_futures = []
 
     for cid in sorted_cids:
-        info = non_structural_classes[cid]
+        info = classes_for_matching[cid]
         role = info["role"]
 
         instances = instances_by_class.get(cid, [])
@@ -2184,6 +2197,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_autocorr=args.min_autocorr,
         min_p95_grad=args.min_p95_grad,
         min_edge_density=args.min_edge_density,
+        include_structural=args.include_structural,
     )
 
 

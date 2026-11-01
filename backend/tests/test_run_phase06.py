@@ -121,6 +121,27 @@ def test_runner_preserves_separate_finalized_element_boundaries(tmp_path: Path, 
     assert Path(result["complete_ply"]).is_file()
 
 
+def test_runner_stages_and_publishes_floor_opening_cache(tmp_path: Path, monkeypatch) -> None:
+    scan = tmp_path / "scan_0"
+    scan.mkdir()
+    cache = scan / run_phase06_module.CACHE_NAME
+    cache.write_text("before")
+    _stub_pipeline(monkeypatch, scan, _valid_topology())
+    rebuild = run_phase06_module.run_pipeline_for_scene
+
+    def rebuild_with_cache(**kwargs) -> int:
+        staged_cache = kwargs["output_dir"].parent / run_phase06_module.CACHE_NAME
+        assert staged_cache.read_text() == "before"
+        staged_cache.write_text("after")
+        return rebuild(**kwargs)
+
+    monkeypatch.setattr(run_phase06_module, "run_pipeline_for_scene", rebuild_with_cache)
+
+    run_phase06_module.run_phase06(scan)
+
+    assert cache.read_text() == "after"
+
+
 def test_runner_preserves_unmanaged_output_directory(tmp_path: Path, monkeypatch) -> None:
     scan = tmp_path / "scan_0"
     scan.mkdir()

@@ -10,7 +10,7 @@ import open3d as o3d
 from scipy.spatial import cKDTree
 
 
-DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "current_scene/06_mesh_elaboration/new_step/outputs/segmentation_alignment"
+DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "current_scene/scan_0/objects_alignment"
 
 
 def contact_samples(mesh, max_face_centers=20_000):

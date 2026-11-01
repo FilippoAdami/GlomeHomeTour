@@ -48,16 +48,13 @@ from export_delivery import deliver_stage05_outputs
 
 
 DEFAULT_WORKSPACE = _backend_dir / "current_scene"
-ALGORITHM_VERSION = 'evidence-geometry-v4'
+ALGORITHM_VERSION = 'evidence-geometry-v5'
 MIN_INSTANCE_TRIANGLES = 2000
 
 
 def run_final_category_classification(scan_dir: Path, mesh_path: Path, stage_out_dir: Path) -> list[tuple[int, int]]:
     """Render delivered objects and classify their source classes for downstream stages."""
     print("\n--- Final Phase: EmbeddingGemma object-category matching ---")
-    stage06_dir = _backend_dir / "06_mesh_elaboration"
-    if str(stage06_dir) not in sys.path:
-        sys.path.insert(0, str(stage06_dir))
     from extract_non_structural_frames import main as extract_frames
     from run_non_structural_category_similarity import main as classify_frames
 
@@ -77,6 +74,7 @@ def run_final_category_classification(scan_dir: Path, mesh_path: Path, stage_out
         "--structural-json", str(stage_out_dir / "class_metadata.json"),
         "--output-dir", str(mesh_frames),
         "--gs-output-dir", str(gs_frames),
+        "--include-structural",
     ])
     if rc:
         manifest_path = mesh_frames / "non_structural_frames_manifest.json"
@@ -344,8 +342,18 @@ def run_segmentation_pipeline_for_scan(
         wall_cids.add(reg_metrics['wall_cid'])
     t_constraints = time.perf_counter()
     cleaned_labels, constraints = enforce_instance_constraints(
-        cleaned_labels, adj_u, adj_v, tri_normals, gravity_up, wall_cids, MIN_INSTANCE_TRIANGLES)
+        cleaned_labels, adj_u, adj_v, tri_normals, gravity_up, wall_cids,
+        MIN_INSTANCE_TRIANGLES, tri_areas=tri_areas)
     constraints['seconds'] = round(time.perf_counter() - t_constraints, 3)
+    for role, cid in constraints['large_horizontal_class_ids'].items():
+        classifications[cid] = {
+            'class_id': cid,
+            'structural_role': role,
+            'confidence': 0.90,
+            'floor_level': None,
+            'details': 'Reclassified from a connected near-horizontal wall patch with area at least 2 m².',
+            'piece_breakdown': [],
+        }
     np.save(stage_out_dir / 'triangle_class_labels_observed.npy', cleaned_labels)
     t_deferred = time.perf_counter()
     face_rgb = np.mean(vertex_colors_np[triangles_np], axis=1) / 255.

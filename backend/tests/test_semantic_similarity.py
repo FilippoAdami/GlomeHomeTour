@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.append(str(ROOT / "06_mesh_elaboration"))
+sys.path.append(str(ROOT / "05_semantic_segmentation"))
 
 from step_semantic_similarity import (
     DEFAULT_PROMPT_TEMPLATES,

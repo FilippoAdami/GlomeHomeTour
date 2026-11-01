@@ -15,7 +15,7 @@ share `mesh.json`; standard step logs/stats follow the backend convention.
 | Component | Responsibility | Runtime status |
 | --- | --- | --- |
 | [`step_mesh.py`](step_mesh.py) | Scan discovery, expected-depth rendering, TSDF fusion, complete linear orchestration, publication, resume and removal of obsolete generated copies. | Single production entry point. |
-| [`mesh_cleanup.py`](mesh_cleanup.py) | Connected-component classification, vertex SOR, mesh sealing, face metadata and required Gaussian infill. | Called by `mesh`; explicit-input CLI for diagnostic cleanup. |
+| [`mesh_cleanup.py`](mesh_cleanup.py) | Connected-component classification, vertex SOR, mesh sealing, containment filtering, face metadata and required Gaussian infill. | Called by `mesh`; explicit-input CLI for diagnostic cleanup. |
 | [`fill_mesh_holes.py`](fill_mesh_holes.py) | Boundary tracing, triangulation, coplanar color transfer, PLY properties and inspection CLI. | Production geometry helpers; diagnostic outputs only when explicitly requested. |
 | [`infill_gsplat.py`](infill_gsplat.py) | Sample planar Gaussians on cap/coverage-deficit faces; export sealed model siblings. | Required in every reconstruction. |
 | [`regularize_mesh_rgb.py`](regularize_mesh_rgb.py) | Geometry-aware speckle cleanup, sharpening and luminance contrast; return color metrics. | Required final processing pass; no standalone CLI. |
@@ -35,7 +35,7 @@ Refined COLMAP cameras/photos + original stage 03 Gaussian model
 expected camera-Z depth → validity mask → RGB-D TSDF fusion
                               │
                               ▼
-component filtering + SOR → hole filling + face labels
+component filtering + SOR → hole filling + containment filtering + face labels
                               │
                               ▼
 Gaussian infill → RGB refinement → publish final mesh and sealed model
@@ -119,19 +119,25 @@ allocated SH slots even when short training uses fewer active bands.
 3. **Fuse RGB-D.** Integrate source RGB with rendered depth into an Open3D CPU
    `ScalableTSDFVolume`, using `depth_scale=1.0` and RGB8 color. Write a temporary
    working mesh, leaving any accepted final mesh untouched during processing.
-4. **Remove floaters.** Keep the largest connected triangle component. Other
-   components need at least 4,000 triangles, area 0.15, PCA thickness 0.04,
-   hull/OBB volume ratio 0.36 and boundary openness at most 0.065. Required SOR
-   uses 30 neighbors/std-ratio 2.0; retain a triangle with at least two inlier
-   vertices. Filtered geometry stays in memory instead of being exported again.
-5. **Seal holes.** Trace directed rims, project to fitted planes, use constrained
-   Delaunay caps, split conflicting internal edges and use fan fallbacks where
-   needed. Zero-length rim edges can move slightly; cap centers recess by at most
-   0.015 scene units. Original faces precede appended fill faces. Sample new colors
-   from nearby source faces with progressively relaxed plane/normal gates. Require
-   all loops filled and every final edge used twice; this does not establish
-   absence of self-intersections. Replace the working mesh with its sealed result.
-6. **Add Gaussian infill.** Target appended cap faces and original TSDF face
+4. **Filter component candidates.** Keep the largest raw connected triangle
+   component. Other candidates need at least 4,000 triangles, area 0.15, PCA
+   thickness 0.04, hull/OBB volume ratio 0.36 and boundary openness at most
+   0.065. Required SOR uses 30 neighbors/std-ratio 2.0; retain a triangle with
+   at least two inlier vertices. Filtered geometry stays in memory.
+5. **Seal and select components.** Trace directed rims, project to fitted planes,
+   use constrained Delaunay caps, split conflicting internal edges and use fan
+   fallbacks where needed. Zero-length rim edges can move slightly; cap centers
+   recess by at most 0.015 scene units. Original faces precede appended fill faces.
+   Sample new colors from nearby source faces with progressively relaxed
+   plane/normal gates. Require all loops filled and every final edge used twice,
+   then retain the largest sealed
+   component and other sealed components whose vertices and face centers lie inside
+   it. The largest is chosen by triangle count. Exterior detached components are
+   removed even if they passed candidate geometry checks. Occupancy uses ray casting
+   and assumes the largest shell has no self-intersections; edge validation alone
+   does not establish this. Replace the working mesh with the retained sealed
+   result.
+6. **Add Gaussian infill.** Target retained cap faces and original TSDF face
    centroids farther than 0.06 from existing Gaussian centers. Deterministic
    area-weighted sampling (seed 42) creates overlapping planar disks with thin
    normal scales, SH DC colors and zero new higher-order coefficients. Append
@@ -169,7 +175,7 @@ directory; the default is the scan root.
 | Retained artifact | Contents |
 | --- | --- |
 | `mesh.ply` | Final sealed, RGB-refined triangle mesh; raw/clean/pre-color/red copies are not retained. |
-| `mesh.json` | Rendering/valid-depth metrics, raw/final counts, source/final paths, `cleanup` component decisions/timings, `gsplat_sealing` counts/paths and `rgb_regularization` metrics. |
+| `mesh.json` | Rendering/valid-depth metrics, raw/final counts, source/final paths, pre-seal cleanup decisions, `cleanup.sealed_components_manifest` containment decisions and `sealed_component_containment_seconds`, `gsplat_sealing` counts/paths and `rgb_regularization` metrics. |
 | `mesh_log.txt`, `mesh_stats.json` | Standard phase log and metrics, matching other backend steps. Helper stdout remains on the console. |
 | `gaussian_splat/checkpoint_sealed.pt` | Complete original-plus-infill tensor model, retaining checkpoint format and adding sealing metadata. |
 | `gaussian_splat/gaussian_splat_sealed.ply` | Matching original-plus-infill Gaussian PLY, beside the unchanged original PLY. |
@@ -303,7 +309,7 @@ produce selected/automatic/all-hole and red diagnostic meshes outside production
 | Function | Inputs → outputs; processing |
 | --- | --- |
 | `mesh_cleanup.profile_component_geometry(component_tris, all_vertices, tri_areas, comp_tri_indices)` | One component's faces/area indices → counts, area, PCA thickness, hull/OBB solidity, open-edge fraction, centroid and extents; handles insufficient/degenerate points. |
-| `clean_mesh_floaters(input_mesh_path, output_dir, gsplat_model_path, thresholds, ..., output_mesh_path, gsplat_output_dir)` | Raw triangle PLY and cleanup/infill settings → one sealed mesh and a report dictionary; filters components/SOR, caps boundaries, validates edge counts, exports the required Gaussian derivative beside the original model, or in the caller's temporary model directory. The source checkpoint is required; missing input fails explicitly. |
+| `clean_mesh_floaters(input_mesh_path, output_dir, gsplat_model_path, thresholds, ..., output_mesh_path, gsplat_output_dir)` | Raw triangle PLY and cleanup/infill settings → one sealed mesh and a report dictionary; filters components/SOR, caps boundaries, keeps the largest sealed component plus contained components, validates edge counts, and exports the required Gaussian derivative beside the original model or in the caller's temporary model directory. The source checkpoint is required; missing input fails explicitly. |
 | `mesh_cleanup.main(argv)` | CLI → diagnostic cleanup and `0`; requires an explicit raw input, resolves the source checkpoint, writes mesh.json and invalidates full completion. Does not discover a parent of multiple scans. |
 | `fill_mesh_holes.export_ply_with_face_attributes(file_path, vertices, triangles, vertex_colors, face_attributes)` | Arrays plus named `uchar`/`int` face properties → binary little-endian triangular PLY and `True`; converts normalized RGB to uint8. I/O/unsupported-property errors propagate. |
 | `read_ply_face_flags(ply_path, property_name)` | ASCII/binary triangle PLY → copied face-property array; returns `None` for absent file/face/property, rejects malformed PLY through the existing plyfile reader. Fixed three-index faces permit memory mapping for binary meshes. |
@@ -412,8 +418,10 @@ establish full-resolution quality or throughput improvements.
   openings. Doors, windows and genuinely unobserved regions can acquire
   invented surfaces. The standalone selective modes support inspection, but
   view-based evidence would be needed for safer production hole classification.
-- **Detached-object pruning:** size/thickness/solidity/open-edge gates can remove
-  real thin or partially observed objects. Inspect the final mesh and component manifest in `mesh.json` before tuning thresholds.
+- **Detached-object policy:** every component outside the largest sealed shell is
+  removed, even if it passed the size/thickness/solidity gates. Those gates can
+  also remove thin or partially observed components that are inside. Inspect the
+  final `sealed_components_manifest` in `mesh.json` when reviewing selections.
 - **Coverage is approximate:** centroid distance to Gaussian **centers** ignores
   Gaussian extent, alpha and visibility. It can classify broad existing splats
   as deficient, while a global area budget gives larger regions more samples.

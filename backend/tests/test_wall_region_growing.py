@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
@@ -14,6 +15,8 @@ SPEC = importlib.util.spec_from_file_location("grow_wall_regions", MODULE)
 grow_wall_regions = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(grow_wall_regions)
+sys.path.insert(0, str(Path(__file__).parents[1] / "06_mesh_elaboration"))
+from extract_structural_meshes import export_colored_ply
 
 
 def test_region_growing_splits_turns_and_keeps_horizontal_triangles():
@@ -91,6 +94,27 @@ def test_disconnected_wall_patches_start_in_separate_regions():
 
     assert labels[0] != labels[1]
     assert black.all()
+
+
+def test_region_growth_preserves_face_aligned_semantic_category_ids(tmp_path):
+    source = tmp_path / "wall_inst000.ply"
+    vertices = np.asarray([[0, 0, 0], [0, 1, 0], [0, 1, 1], [0, 0, 1]], dtype=float)
+    triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    colors = np.full((len(vertices), 3), 0.5, dtype=float)
+    assert export_colored_ply(
+        source, vertices, triangles, colors,
+        {"semantic_category_id": ("uchar", np.asarray([1, 0], dtype=np.uint8))},
+    )
+
+    output = tmp_path / "wall_regions_colored.ply"
+    labels = tmp_path / "wall_regions_triangle_labels.npy"
+    manifest = grow_wall_regions._write_colored_regions(
+        [source], output, labels, seed_count=1, random_seed=42
+    )
+
+    category_ids = np.load(tmp_path / manifest["semantic_category_ids_file"])
+    np.testing.assert_array_equal(category_ids, [1, 0])
+    assert manifest["semantic_category_triangle_count"] == 1
 
 
 def test_large_detached_regions_do_not_merge_when_their_planes_align(monkeypatch):

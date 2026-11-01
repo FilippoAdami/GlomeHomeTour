@@ -127,9 +127,9 @@ def main():
                 package = SCENE / "05_semantic_segmentation/mesh_objects_step3/segmentation_output"
                 if mode == "structural_fit":
                     raise SystemExit("Fitted blocks are missing. Build them first with:\n"
-                                     "  backend/.venv/bin/python backend/06_mesh_elaboration/fit_contact_groups_inside.py")
+                                     "  backend/.venv/bin/python backend/07_objecs_alignment/fit_contact_groups_inside.py")
                 raise SystemExit("Alignment output is missing. Build it first with:\n"
-                                 "  backend/.venv/bin/python backend/06_mesh_elaboration/build_rigid_baseline.py\n"
+                                 "  backend/.venv/bin/python backend/07_objecs_alignment/build_rigid_baseline.py\n"
                                  f"Required Stage 05 instance package: {package}\n"
                                  "Generate that package with the 3D object extraction step, then rerun this viewer.")
             report = json.loads(report_path.read_text())
@@ -145,10 +145,12 @@ def main():
             if not group_report_path.is_file():
                 raise SystemExit(
                     "Contact groups are missing. Build them with:\n"
-                    "  backend/.venv/bin/python backend/06_mesh_elaboration/group_touching_instances.py"
+                    "  backend/.venv/bin/python backend/07_objecs_alignment/group_touching_instances.py"
                 )
             unresolved = ({item["group_id"] for item in report["groups"]
-                           if item.get("contained_surface_percent", 100.0) < 99.99}
+                           if item.get("surface_intersection_edge_hits_after", 0) > 0
+                           or item.get("minimum_instance_contained_surface_percent",
+                                       item.get("contained_surface_percent", 100.0)) < 95.0}
                           if mode == "structural_fit" else ())
             group_report, group_meshes = load_contact_group_meshes(group_report_path, ALIGNMENT_OUTPUT, unresolved)
             geometries = (shell, *group_meshes)
@@ -162,12 +164,12 @@ def main():
                       f"{group_report['contact_pair_count']} touching pairs at "
                       f"{group_report['contact_distance_m']:.3f} m tolerance.")
             else:
-                title = "Bounded rigid fit of contact blocks inside the regularized shell"
+                title = "Support fitting of contact blocks inside the regularized shell"
                 print(f"Fitted blocks: {report['group_count']}; transformed: {report['transformed_groups']}; "
-                      f"left unchanged for insignificant gain: {report['unchanged_insignificant_gain_groups']}; "
+                      f"unresolved intersections: {report['unresolved_intersection_groups']}; "
                       f"partial: {report['partial_groups']}; mean contained surface: "
                       f"{report['mean_contained_surface_percent']:.2f}%.")
-                print("Blocks use at most 5 cm translation per axis and 5 degrees of vertical-axis yaw; there is no tilt. Partial blocks are red.")
+                print("Nearby floor and wall contacts are fitted by translation only. Blocks with more than 5% of any instance outside are red.")
             print("Each color is one rigid block. Near-side shell triangles are hidden from the current view.")
             fallback = report_path
         if mode == "instance_translated":

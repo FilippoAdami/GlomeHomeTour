@@ -14,14 +14,112 @@ STAGE_DIR = Path(__file__).parents[1] / "06_mesh_elaboration"
 sys.path.insert(0, str(STAGE_DIR))
 from assemble_final_regularized_mesh import (
     assemble_final_regularized_mesh,
+    _ceiling_patch_max_y,
     _clip_wall_to_floor_and_ceiling,
     _extend_wall_top_to_ceiling,
     _clip_surface_to_footprint,
+    _wall_face_floor_planes,
     _wall_footprint_at_y,
     _wall_support_over_y_range,
 )
 from fill_mesh_holes import boundary_loops, export_ply_with_face_attributes, read_ply_face_flags
 from structural_geometry import close_slab
+
+
+def test_upper_ceiling_selection_uses_highest_y_on_tilted_patches() -> None:
+    vertices = np.array([
+        [-1., 1.2, 0.], [1., .8, 0.], [0., 1., 1.],
+        [-1., 1.1, 0.], [1., 1.1, 0.], [0., 1.1, 1.],
+        [-1., 2., 0.], [1., 2., 0.], [0., 2., 1.],
+        [-1., 3., 0.], [1., 3., 0.], [0., 3., 1.],
+    ])
+    faces = np.arange(12).reshape(-1, 3)
+    ceiling = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    groups = np.array([10, 20, 10, 10])
+    associations = np.array([-1, -1, 0, -1])
+    areas = np.full(4, -1)
+    junctions = np.array([0, 0, 0, 1])
+
+    tilted_patch_y = _ceiling_patch_max_y(
+        ceiling, groups, associations, areas, junctions,
+        {"group_id": 10, "support_area_id": None},
+    )
+    flatter_patch_y = _ceiling_patch_max_y(
+        ceiling, groups, associations, areas, junctions,
+        {"group_id": 20, "support_area_id": None},
+    )
+
+    assert vertices[:3, 1].mean() < vertices[3:6, 1].mean()
+    assert tilted_patch_y == pytest.approx(1.2)
+    assert tilted_patch_y > flatter_patch_y
+    assert max((tilted_patch_y, 10), (flatter_patch_y, 20))[1] == 10
+    associated_patch_y = _ceiling_patch_max_y(
+        ceiling, groups, associations, areas, junctions,
+        {"group_id": 10, "support_area_id": None, "associated_floor_level": 0},
+    )
+    assert associated_patch_y == pytest.approx(2.0)
+
+
+def test_wall_bottom_uses_local_lowest_floor_planes() -> None:
+    wall = trimesh.Trimesh(
+        vertices=[[-2., -.5, 0.], [-1., 1., 0.], [-1., 1., 1.],
+                  [1., -.5, 0.], [2., 1., 0.], [1., 1., 1.]],
+        faces=[[0, 1, 2], [3, 4, 5]],
+        process=False,
+    )
+    supports = [
+        {"area_id": 0, "polygon": Polygon([(-3., -1.), (0., -1.), (0., 2.), (-3., 2.)]),
+         "equation": np.array([0., 1., 0., 0.])},
+        {"area_id": 1, "polygon": Polygon([(0., -1.), (3., -1.), (3., 2.), (0., 2.)]),
+         "equation": np.array([0., 1., 0., -.5])},
+    ]
+
+    lower_planes, selection = _wall_face_floor_planes(wall, supports, -1.0)
+    clipped, _ = _clip_wall_to_floor_and_ceiling(wall, lower_planes, [0., 1., 0., -2.])
+
+    assert selection["area_ids_used"] == [0, 1]
+    assert selection["wall_face_count_using_fitted_floor_area"] == 2
+    assert clipped.vertices[clipped.vertices[:, 0] < 0, 1].min() == pytest.approx(0.)
+    assert clipped.vertices[clipped.vertices[:, 0] > 0, 1].min() == pytest.approx(.5)
+
+
+def test_wall_face_crossing_floor_area_boundary_uses_lowest_y_fallback() -> None:
+    wall = trimesh.Trimesh(
+        vertices=[[-1., -.5, 0.], [1., .5, 0.], [0., 1., 1.]],
+        faces=[[0, 1, 2]],
+        process=False,
+    )
+    supports = [
+        {"area_id": 0, "polygon": Polygon([(-3., -1.), (0., -1.), (0., 2.), (-3., 2.)]),
+         "equation": np.array([0., 1., 0., 0.])},
+        {"area_id": 1, "polygon": Polygon([(0., -1.), (3., -1.), (3., 2.), (0., 2.)]),
+         "equation": np.array([0., 1., 0., -.5])},
+    ]
+
+    lower_planes, selection = _wall_face_floor_planes(wall, supports, -1.0)
+
+    np.testing.assert_array_equal(lower_planes[0], [0., 1., 0., 1.])
+    assert selection["wall_face_count_using_lowest_y_fallback"] == 1
+
+
+def test_orphan_ceiling_clip_follows_wall_contour_and_preserves_hole() -> None:
+    outer = [(-1., -1.), (1., -1.), (1., 1.), (-1., 1.)]
+    support = Polygon(outer, holes=[[(-.25, -.25), (.25, -.25), (.25, .25), (-.25, .25)]])
+    ring = np.array([[-1.5, -1.5], [1.5, -1.5], [1.5, 1.5], [-1.5, 1.5]])
+    roof_vertices = np.column_stack((ring[:, 0], 2.0 + .1 * ring[:, 0], ring[:, 1]))
+    roof = trimesh.Trimesh(vertices=roof_vertices, faces=[[0, 1, 2], [0, 2, 3]], process=False)
+    roof.visual.vertex_colors = np.tile([120, 90, 70, 255], (4, 1))
+
+    clipped, stats = _clip_surface_to_footprint(
+        roof, support, retain_degenerate_inside=True,
+    )
+
+    projected = shapely.polygons(np.concatenate((clipped.vertices[clipped.faces][:, :, [0, 2]],
+                                                  clipped.vertices[clipped.faces][:, :1, [0, 2]]), axis=1))
+    assert stats["removed_projected_area_m2"] > 0
+    assert float(shapely.area(projected).sum()) == pytest.approx(support.area)
+    assert np.all(shapely.covers(support, projected))
+    assert np.allclose(clipped.vertices[:, 1], 2.0 + .1 * clipped.vertices[:, 0], atol=1e-6)
 
 
 def test_floor_is_lowered_clipped_to_wall_footprint_and_keeps_colors() -> None:
@@ -212,7 +310,7 @@ def test_paired_slab_is_clipped_to_wall_support_before_being_closed() -> None:
 @pytest.mark.parametrize("roof_equation", [
     [0., 1., 0., -1.4], [0., 1., 0., -.9], [.1, 1., 0., -.9],
 ])
-def test_final_assembly_preserves_finalized_walls_and_roof(tmp_path, roof_equation) -> None:
+def test_final_assembly_trims_walls_and_orphan_roof_to_structural_envelope(tmp_path, roof_equation) -> None:
     ring = np.array([[-1., -1.], [1., -1.], [1., 1.], [-1., 1.]])
     waist = ring * .7
     wall_vertices = np.concatenate((
@@ -246,9 +344,12 @@ def test_final_assembly_preserves_finalized_walls_and_roof(tmp_path, roof_equati
         )
         roof_y = -(roof_equation[0] * ring[:, 0] + roof_equation[2] * ring[:, 1]
                    + roof_equation[3]) / roof_equation[1]
+        orphan_ring = ring * 1.5
+        orphan_y = -(roof_equation[0] * orphan_ring[:, 0] + roof_equation[2] * orphan_ring[:, 1]
+                     + roof_equation[3]) / roof_equation[1]
         ceiling_vertices = np.concatenate((
             np.column_stack((ring[:, 0], np.full(4, ceiling_y), ring[:, 1])),
-            np.column_stack((ring[:, 0], roof_y, ring[:, 1])),
+            np.column_stack((orphan_ring[:, 0], orphan_y, orphan_ring[:, 1])),
         ))
         ceiling_faces = np.vstack((cap_faces, cap_faces + 4))
         ceiling_colors = np.column_stack((
@@ -293,6 +394,11 @@ def test_final_assembly_preserves_finalized_walls_and_roof(tmp_path, roof_equati
         final_triangles = final_walls.vertices[final_walls.faces]
         wall_clip = result["wall_ceiling_alignment"]["wall_clipping"]
         wall_gap_fill = result["wall_ceiling_alignment"]["wall_gap_fill"]
+        ceiling_source = result["wall_ceiling_alignment"]["wall_ceiling_plane"]
+        assert ceiling_source["ceiling_group_id"] == 1
+        assert ceiling_source["highest_surface_y_m"] == pytest.approx(float(orphan_y.max()))
+        assert wall_clip["lowest_floor_level"] == 0
+        assert wall_clip["lowest_floor_surface_y_m"] == pytest.approx(0.)
         roof_plane = np.asarray(roof_equation, dtype=float)
         roof_plane /= np.linalg.norm(roof_plane[:3])
         assert final_triangles[:, :, 1].min() == pytest.approx(wall_clip["lowest_floor_y_m"])
@@ -308,13 +414,19 @@ def test_final_assembly_preserves_finalized_walls_and_roof(tmp_path, roof_equati
             np.testing.assert_array_equal(final_walls.visual.vertex_colors[final_walls.faces][:len(source_triangles)],
                                           original_wall.visual.vertex_colors[original_wall.faces])
         final_roof = trimesh.load(elements / "ceiling_group_001.ply", force="mesh", process=False)
-        np.testing.assert_array_equal(final_roof.triangles,
-                                      ceiling_vertices[ceiling_faces[2:]].astype(np.float32))
-        np.testing.assert_array_equal(final_roof.visual.vertex_colors[final_roof.faces],
-                                      ceiling_colors[ceiling_faces[2:]])
+        roof_projection = shapely.polygons(np.concatenate((final_roof.triangles[:, :, [0, 2]],
+                                                            final_roof.triangles[:, :1, [0, 2]]), axis=1))
+        wall_footprint = Polygon(ring)
+        assert np.all(shapely.covers(wall_footprint, roof_projection))
+        assert float(shapely.area(roof_projection).sum()) == pytest.approx(wall_footprint.area)
+        assert np.allclose(final_roof.vertices[:, 1],
+                           -(roof_equation[0] * final_roof.vertices[:, 0]
+                             + roof_equation[2] * final_roof.vertices[:, 2]
+                             + roof_equation[3]) / roof_equation[1], atol=1e-6)
+        assert len(final_roof.visual.vertex_colors) == len(final_roof.vertices)
         np.testing.assert_array_equal(combined.vertices[combined.faces[roles == 2]], final_roof.triangles)
         slab_element = trimesh.load(elements / "slab_level_000_area_000.ply", force="mesh", process=False)
         np.testing.assert_array_equal(combined.vertices[combined.faces[roles == 3]], slab_element.triangles)
         assert result["counts"]["boundary_fill_faces"] == 0
         assert result["slabs"][0]["is_watertight"]
-        assert wall_clip["applied"] is True
+        assert wall_clip["applied"] is (bool(np.min(roof_y) < 1.0))

@@ -68,7 +68,7 @@ def _polygon_with_holes(rings: list) -> Polygon:
         containers = [
             other for other, candidate in enumerate(ring_polygons)
             if other != index and candidate.area > polygon.area
-            and candidate.contains(polygon.representative_point())
+            and candidate.contains(polygon)
         ]
         parents.append(min(containers, key=lambda other: ring_polygons[other].area)
                        if containers else None)

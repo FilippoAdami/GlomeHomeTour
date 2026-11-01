@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for backend/06_mesh_elaboration/extract_non_structural_frames_gs.py.
+Unit tests for backend/05_semantic_segmentation/extract_non_structural_frames_gs.py.
 """
 
 import json
@@ -10,7 +10,7 @@ import pytest
 import torch
 
 import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "06_mesh_elaboration"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "05_semantic_segmentation"))
 
 from extract_non_structural_frames_gs import (
     compute_w2c_and_intrinsics,
@@ -135,7 +135,7 @@ def test_render_gs_frame_synthetic():
 
 
 def test_run_gs_extraction_discard_routing(monkeypatch, tmp_path: Path):
-    manifest_dir = tmp_path / "06_mesh_elaboration" / "non_structural_frames"
+    manifest_dir = tmp_path / "segmentation" / "non_structural_category_frames" / "mesh"
     manifest_dir.mkdir(parents=True)
     manifest_path = manifest_dir / "non_structural_frames_manifest.json"
 
@@ -167,8 +167,8 @@ def test_run_gs_extraction_discard_routing(monkeypatch, tmp_path: Path):
     flat_render = np.full((256, 256, 3), [48, 19, 12], dtype=np.uint8)
     monkeypatch.setattr("extract_non_structural_frames_gs.render_gs_frame", lambda **kwargs: flat_render)
 
-    output_dir = tmp_path / "06_mesh_elaboration" / "non_structural_frames_gs"
-    discarded_dir = tmp_path / "06_mesh_elaboration" / "non_structural_frames_gs_discarded"
+    output_dir = tmp_path / "segmentation" / "non_structural_category_frames" / "gs"
+    discarded_dir = tmp_path / "segmentation" / "non_structural_category_frames" / "gs_discarded"
 
     res = run_gs_extraction(
         workspace=tmp_path,

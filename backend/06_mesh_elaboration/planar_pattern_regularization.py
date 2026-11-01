@@ -985,9 +985,10 @@ def regularize_planar_patches(
         centers, areas, colors = centers[valid], areas[valid], np.clip(colors[valid], 0.0, 1.0)
         uv = np.column_stack((centers @ axis_u, centers @ axis_v)) if len(centers) else np.empty((0, 2))
         pattern = _periodic_relief(centers, areas, normal, offset, uv)
-        prepared.append((patch, mesh, normal, axis_u, axis_v, centers, areas, colors, uv, pattern))
+        prepared.append((patch, mesh, normal, axis_u, axis_v, offset,
+                         centers, areas, colors, uv, pattern))
 
-    for patch, mesh, normal, axis_u, axis_v, centers, areas, colors, uv, pattern in prepared:
+    for patch, mesh, normal, axis_u, axis_v, offset, centers, areas, colors, uv, pattern in prepared:
         colors = _preserve_color_highlights(colors * white_balance)
         reg_colors, lighting = _regularize_lighting(colors, uv, areas) if len(colors) else (colors, {})
         visual = _visual_model(uv, reg_colors, areas) if len(reg_colors) else None

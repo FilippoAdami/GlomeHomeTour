@@ -21,6 +21,7 @@ from fit_floor_projection_contours_to_black import (
     _remove_short_polygon_edges,
 )
 from project_floor_slices_onto_planes import _plane_frame
+from floor_opening_constraints import CACHE_NAME, apply_saved_openings, update_opening_cache
 
 SHARED_EDGE_TOLERANCE_M = 0.03
 PARALLEL_TOLERANCE_DEG = 2.0
@@ -171,12 +172,48 @@ def _area_record(level_id: int, area: dict, fitted: dict, level_dir: Path) -> di
 
     return {
         "area_id": int(area["area_id"]),
+        "_floor_plane_equation_world": area["plane_equation"],
         "minimum_floor_polygon_segment_length_m": MIN_FLOOR_POLYGON_SEGMENT_M,
         "regularized_wall_contour_world_xz_m": wall_xyz[:, [0, 2]].tolist(),
         "floor_polygon_rings_world_xz_m": [ring[:, [0, 2]].tolist() for ring in rings_xyz],
         "shared_floor_segments_measured_once": omitted_shared,
         "dimensions": measurements,
     }
+
+
+def _refresh_floor_boundary_dimensions(area: dict) -> None:
+    equation = np.asarray(area.pop("_floor_plane_equation_world"), dtype=float)
+    if equation.shape != (4,) or not np.isfinite(equation).all():
+        raise ValueError("Could not refresh dimensions for a floor polygon without a valid plane")
+    norm = float(np.linalg.norm(equation[:3]))
+    if norm <= 1e-10:
+        raise ValueError("Could not refresh dimensions for a floor polygon without a valid plane")
+    normal, offset = equation[:3] / norm, float(equation[3] / norm)
+    if abs(normal[1]) <= 1e-8:
+        raise ValueError("Could not refresh floor dimensions on a vertical plane")
+
+    def to_world(xz: np.ndarray) -> np.ndarray:
+        y = -(xz[:, 0] * normal[0] + xz[:, 1] * normal[2] + offset) / normal[1]
+        return np.column_stack((xz[:, 0], y, xz[:, 1]))
+
+    wall_edges = to_world(np.asarray(area["regularized_wall_contour_world_xz_m"], dtype=float))
+    walls = [(wall_edges[index], wall_edges[(index + 1) % len(wall_edges)])
+             for index in range(len(wall_edges))]
+    dimensions = [item for item in area["dimensions"] if item["source"] != "floor_polygon_boundary"]
+    shared_count = 0
+    for ring_index, ring_xz in enumerate(area["floor_polygon_rings_world_xz_m"], start=1):
+        ring = to_world(np.asarray(ring_xz, dtype=float))
+        for edge_index, (start, end) in enumerate(zip(ring, np.roll(ring, -1, axis=0)), start=1):
+            fragments, shared = _unshared_floor_fragments(start, end, walls)
+            shared_count += int(shared)
+            for fragment_index, (a, b) in enumerate(fragments, start=1):
+                if np.linalg.norm(b - a) < MIN_MEASUREMENT_LENGTH_M:
+                    continue
+                suffix = chr(96 + fragment_index) if len(fragments) > 1 else ""
+                dimensions.append(_dimension(a, b, f"P{ring_index:02d}.{edge_index:02d}{suffix}",
+                                             "floor_polygon_boundary"))
+    area["dimensions"] = dimensions
+    area["shared_floor_segments_measured_once"] = shared_count
 
 
 def _ring_area(points: np.ndarray) -> float:
@@ -279,6 +316,14 @@ def _place_dimension_labels(ax, figure, entries: list[tuple[dict, tuple[float, f
 def run(instances_dir: Path) -> Path:
     level_dir = instances_dir / "intermediate_floor_levels"
     records = _collect_floor_records(level_dir)
+    cache_path = instances_dir.parent / CACHE_NAME
+    changed_areas = apply_saved_openings(records, cache_path)
+    for level in records:
+        for area in level["areas"]:
+            if (level["level"], area["area_id"]) in changed_areas:
+                _refresh_floor_boundary_dimensions(area)
+            else:
+                area.pop("_floor_plane_equation_world", None)
     count = sum(len(level["areas"]) for level in records)
     cmap = plt.get_cmap("tab10" if count <= 10 else "tab20")
     colors = [tuple(float(c) for c in cmap(i % cmap.N)[:3]) for i in range(count)]
@@ -365,6 +410,10 @@ def run(instances_dir: Path) -> Path:
     for path in level_dir.glob("floor_level_*_polygons.json"):
         if path.name not in current_jsons:
             path.unlink()
+    try:
+        update_opening_cache(records, cache_path)
+    except OSError as exc:
+        print(f"Warning: could not update floor opening cache {cache_path}: {exc}", file=sys.stderr)
     return output_image
 
 

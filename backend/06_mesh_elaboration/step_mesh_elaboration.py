@@ -54,10 +54,8 @@ def run_pipeline_for_scene(
     labels_path: Path,
     structural_json: Path,
     output_dir: Path,
-    cross_section_mesh: Optional[Path] = None,
     segmentation_output: Optional[Path] = None,
     scene_size_file: Optional[Path] = None,
-    skip_cross_sections: bool = False,
     skip_texture: bool = False,
     enhance_textures: bool = False,
     only_step: Optional[str] = None,
@@ -65,10 +63,6 @@ def run_pipeline_for_scene(
     source = Path(__file__).resolve().parent
     output = output_dir.absolute()
     output.mkdir(parents=True, exist_ok=True)
-    sealed_mesh = cross_section_mesh.absolute() if cross_section_mesh else scene_mesh.absolute()
-    if not sealed_mesh.is_file():
-        sealed_mesh = scene_mesh.absolute()
-
     extraction_flags = [
         "--mesh-path", str(scene_mesh.absolute()),
         "--labels-path", str(labels_path.absolute()),
@@ -79,7 +73,11 @@ def run_pipeline_for_scene(
         extraction_flags.extend(["--segmentation-output", str(segmentation_output.absolute())])
     wall_fit_flags = ["--instances-dir", str(output),
                       "--output", str(output / "wall_enclosing_shell.ply"),
-                      "--manifest-out", str(output / "wall_planes_manifest.json")]
+                      "--manifest-out", str(output / "wall_planes_manifest.json"),
+                      # "--diagnostics-dir", str(
+                      #     Path(scene_mesh).resolve().parent / "mesh_elaboration_diagnostics" / "wall_enclosure"
+                      # )]
+                      ]
 
     stages = [
         ("extract_structural_meshes", [("extract_structural_meshes", extraction_flags)]),
@@ -180,8 +178,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="Workspace or scan directory (auto-resolves Stage 04 mesh and Stage 05 segmentation inputs)")
     parser.add_argument("--mesh-path", type=Path,
                         help="Explicit path to authoritative sealed mesh.ply (defaults to <scan>/mesh.ply)")
-    parser.add_argument("--cross-section-mesh-path", type=Path,
-                        help="Sealed colored mesh for cross-section views (defaults to mesh-path)")
     parser.add_argument("--labels-path", type=Path,
                         help="Explicit path to triangle_class_labels.npy (defaults to <scan>/segmentation/triangle_class_labels.npy)")
     parser.add_argument("--structural-json", type=Path,
@@ -192,8 +188,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="Optional scene_size.txt or scene_size.json consistency reference")
     parser.add_argument("--segmentation-output", type=Path,
                         help="Optional Stage 05 segmentation output directory for mesh object alignment")
-    parser.add_argument("--skip-cross-sections", action="store_true",
-                        help="Skip generating unobstructed cross-section views")
     parser.add_argument("--skip-texture", action="store_true",
                         help="Skip texture pattern synthesis on structural planes")
     parser.add_argument("--enhance-textures", action="store_true",
@@ -229,7 +223,6 @@ def main(argv: list[str] | None = None) -> int:
                 seg_output = resolve_segmentation_output(scan, args.segmentation_output)
                 scene_size = resolve_scene_size_file(scan, args.scene_size_file)
                 output_dir = resolve_output_dir(scan, args.output_dir, subdir="mesh_elaboration_steps")
-                cross_mesh = args.cross_section_mesh_path or mesh_path
             except Exception as exc:
                 print(f"Error resolving inputs for scan {scan}: {exc}", file=sys.stderr)
                 return 1
@@ -249,10 +242,8 @@ def main(argv: list[str] | None = None) -> int:
                 labels_path=labels_path,
                 structural_json=structural_json,
                 output_dir=output_dir,
-                cross_section_mesh=cross_mesh,
                 segmentation_output=seg_output,
                 scene_size_file=scene_size,
-                skip_cross_sections=args.skip_cross_sections,
                 skip_texture=args.skip_texture,
                 enhance_textures=args.enhance_textures,
                 only_step=args.only_step,
@@ -293,10 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         labels_path=args.labels_path,
         structural_json=args.structural_json,
         output_dir=args.output_dir,
-        cross_section_mesh=args.cross_section_mesh_path,
         segmentation_output=args.segmentation_output,
         scene_size_file=args.scene_size_file,
-        skip_cross_sections=args.skip_cross_sections,
         skip_texture=args.skip_texture,
         enhance_textures=args.enhance_textures,
         only_step=args.only_step,

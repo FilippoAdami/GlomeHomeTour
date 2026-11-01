@@ -7,7 +7,7 @@ import open3d as o3d
 import pytest
 
 pytest.importorskip("open3d")
-MODULE = Path(__file__).parents[1] / "06_mesh_elaboration" / "extract_floor_ceiling_residual.py"
+MODULE = Path(__file__).parents[1] / "08_artifacts_generation" / "extract_floor_ceiling_residual.py"
 SPEC = importlib.util.spec_from_file_location("extract_floor_ceiling_residual", MODULE)
 projection = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader

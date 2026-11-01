@@ -25,11 +25,12 @@ from step_semantic_similarity import (
 )
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
-SCENE_DIR = BACKEND_DIR / "current_scene" / "06_mesh_elaboration"
-OUTPUT_DIR = SCENE_DIR / "non_structural_similarity"
+SEGMENTATION_DIR = BACKEND_DIR / "current_scene" / "scan_0" / "segmentation"
+FRAME_DIR = SEGMENTATION_DIR / "non_structural_category_frames"
+OUTPUT_DIR = SEGMENTATION_DIR / "non_structural_similarity"
 INPUT_DIRS = {
-    "mesh": SCENE_DIR / "non_structural_frames",
-    "gs": SCENE_DIR / "non_structural_frames_gs",
+    "mesh": FRAME_DIR / "mesh",
+    "gs": FRAME_DIR / "gs",
 }
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 TOP_K = 10
@@ -67,7 +68,7 @@ CATEGORY_GROUPS = [
 CATEGORIES = [words[0] for words in CATEGORY_GROUPS]
 CATEGORY_WORDS = [word for group in CATEGORY_GROUPS for word in group]
 WORD_CATEGORY_IDS = [category_id for category_id, group in enumerate(CATEGORY_GROUPS, 1) for _ in group]
-ASSOCIATION_EXCLUDED_CLASS_IDS = {3, 4, 6}
+ASSOCIATION_EXCLUDED_CLASS_IDS: set[int] = set()
 ASSOCIATION_MIN_MARGIN_CLASSES = 5
 ASSOCIATION_MARGIN = 0.02
 ASSOCIATION_MIN_SPECIFICITY = 0.025

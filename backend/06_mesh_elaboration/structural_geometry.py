@@ -1,6 +1,9 @@
 """Shared geometry constraints for structural regularization (metres, Y up)."""
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import trimesh
 from shapely import constrained_delaunay_triangles
@@ -168,11 +171,57 @@ def beam_surface(normal, offset, inward, transverse, period, width, depth, phase
     return mesh.vertices.copy(), mesh.faces.copy()
 
 
-def close_slab(bottom_vertices, bottom_faces, floor_equation):
+def weld_float32_boundary_edges(mesh: trimesh.Trimesh) -> tuple[int, int]:
+    """Collapse one-ULP boundary edges left by float32 clipping intersections."""
+    mesh.process()
+    if not len(mesh.faces):
+        return 0, 0
+
+    edge_counts = np.bincount(mesh.edges_unique_inverse, minlength=len(mesh.edges_unique))
+    boundary = mesh.edges_unique[edge_counts == 1]
+    vertices = mesh.vertices.astype(np.float32)
+    endpoints = vertices[boundary]
+    delta = np.abs(endpoints[:, 0] - endpoints[:, 1])
+    resolution = np.maximum(np.spacing(np.abs(endpoints[:, 0])),
+                            np.spacing(np.abs(endpoints[:, 1])))
+    weld = np.any(delta > 0, axis=1) & np.all(delta <= resolution, axis=1)
+    if not np.any(weld):
+        return 0, 0
+
+    parent = np.arange(len(vertices), dtype=np.int64)
+
+    def root(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for a, b in boundary[weld]:
+        root_a, root_b = root(int(a)), root(int(b))
+        if root_a != root_b:
+            parent[max(root_a, root_b)] = min(root_a, root_b)
+
+    roots = np.arange(len(parent))
+    while not np.array_equal(roots, parent[roots]):
+        roots = parent[roots]
+    keep, inverse = np.unique(roots, return_inverse=True)
+    mesh.update_vertices(keep, inverse)
+    faces = mesh.faces
+    noncollapsed = np.all(faces != np.roll(faces, 1, axis=1), axis=1)
+    collapsed_face_count = int(np.count_nonzero(~noncollapsed))
+    if collapsed_face_count:
+        mesh.update_faces(noncollapsed)
+        mesh.remove_unreferenced_vertices()
+    return int(np.count_nonzero(weld)), collapsed_face_count
+
+
+def close_slab(bottom_vertices, bottom_faces, floor_equation,
+               diagnostics_dir: Path | None = None, diagnostic_context: dict | None = None):
     """Use the actual relief boundary for the skirt and a conforming projected top."""
     # Match PLY's float32 coordinates before topology construction so export cannot collapse seams later.
     bottom = trimesh.Trimesh(vertices=np.asarray(bottom_vertices, dtype=np.float32),
-                             faces=bottom_faces, process=True)
+                             faces=bottom_faces, process=False)
+    precision_edge_count, precision_face_count = weld_float32_boundary_edges(bottom)
     top = bottom.vertices.copy()
     peq = np.array(floor_equation, dtype=float, copy=True)
     top[:, 1] = -(peq[0]*top[:, 0] + peq[2]*top[:, 2] + peq[3])/peq[1]
@@ -183,11 +232,13 @@ def close_slab(bottom_vertices, bottom_faces, floor_equation):
     unique, count = np.unique(bottom.edges_sorted, axis=0, return_counts=True)
     boundary = unique[count == 1]
     side_vertices, side_faces = [], []
+    skipped_vertical_boundary_edge_count = 0
     boundary_vertices = bottom.vertices[np.unique(boundary)]
     for a, b in boundary:
         pa, pb = bottom.vertices[[a, b]]
         length = np.linalg.norm((pb-pa)[[0, 2]])
         if length < 1e-8:
+            skipped_vertical_boundary_edge_count += 1
             continue
         # Include relief corners on vertical skirt edges to avoid T junctions.
         ring = [[0., pa[1]], [length, pb[1]]]
@@ -210,8 +261,90 @@ def close_slab(bottom_vertices, bottom_faces, floor_equation):
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.remove_unreferenced_vertices()
     mesh.fix_normals()
-    if not mesh.is_watertight or mesh.volume <= 0:
-        raise ValueError("Slab boundary did not produce a watertight positive solid")
+    watertight = bool(mesh.is_watertight)
+    volume = float(mesh.volume) if watertight else None
+    if not watertight or volume <= 0:
+        diagnostic_path = None
+        if diagnostics_dir is not None:
+            try:
+                diagnostics_dir = Path(diagnostics_dir)
+                diagnostics_dir.mkdir(parents=True, exist_ok=True)
+                bottom.export(diagnostics_dir / "clipped_ceiling_surface.ply")
+                mesh.export(diagnostics_dir / "attempted_slab.ply")
+                input_edge_counts = np.bincount(
+                    bottom.edges_unique_inverse, minlength=len(bottom.edges_unique)
+                )
+                input_boundary_edges = bottom.edges_unique[input_edge_counts == 1]
+                input_nonmanifold_edges = bottom.edges_unique[input_edge_counts > 2]
+                input_boundary_points = bottom.vertices[input_boundary_edges]
+                input_boundary_xz_lengths = np.linalg.norm(
+                    (input_boundary_points[:, 1] - input_boundary_points[:, 0])[:, [0, 2]], axis=1
+                ) if len(input_boundary_edges) else np.empty(0)
+                edge_counts = np.bincount(
+                    mesh.edges_unique_inverse, minlength=len(mesh.edges_unique)
+                )
+                boundary_edges = mesh.edges_unique[edge_counts == 1]
+                nonmanifold_edges = mesh.edges_unique[edge_counts > 2]
+                boundary_points = mesh.vertices[boundary_edges]
+                boundary_xz_lengths = np.linalg.norm(
+                    (boundary_points[:, 1] - boundary_points[:, 0])[:, [0, 2]], axis=1
+                ) if len(boundary_edges) else np.empty(0)
+                np.savez_compressed(
+                    diagnostics_dir / "edge_diagnostics.npz",
+                    input_boundary_edges_xyz=input_boundary_points,
+                    input_nonmanifold_edges_xyz=bottom.vertices[input_nonmanifold_edges],
+                    input_nonmanifold_edge_use_counts=input_edge_counts[input_edge_counts > 2],
+                    input_vertical_boundary_edges_xyz=(
+                        input_boundary_points[input_boundary_xz_lengths < 1e-8]
+                    ),
+                    output_boundary_edges_xyz=boundary_points,
+                    output_nonmanifold_edges_xyz=mesh.vertices[nonmanifold_edges],
+                    output_nonmanifold_edge_use_counts=edge_counts[edge_counts > 2],
+                    output_vertical_boundary_edges_xyz=boundary_points[boundary_xz_lengths < 1e-8],
+                )
+                report = {
+                    "context": diagnostic_context or {},
+                    "floor_equation": np.asarray(floor_equation, dtype=float).tolist(),
+                    "clearance_lift_m": lift,
+                    "raw_clipped_surface_vertex_count": int(len(bottom_vertices)),
+                    "raw_clipped_surface_face_count": int(len(bottom_faces)),
+                    "processed_clipped_surface_vertex_count": int(len(bottom.vertices)),
+                    "processed_clipped_surface_face_count": int(len(bottom.faces)),
+                    "float32_ulp_boundary_edge_candidate_count": int(
+                        (diagnostic_context or {}).get("float32_ulp_boundary_edge_candidate_count",
+                                                       precision_edge_count)
+                    ),
+                    "float32_ulp_collapsed_face_count": int(
+                        (diagnostic_context or {}).get("float32_ulp_collapsed_face_count",
+                                                       precision_face_count)
+                    ),
+                    "slab_side_face_count": int(len(side_faces)),
+                    "skipped_vertical_boundary_edge_count": skipped_vertical_boundary_edge_count,
+                    "attempted_slab_vertex_count": int(len(mesh.vertices)),
+                    "attempted_slab_face_count": int(len(mesh.faces)),
+                    "is_watertight": watertight,
+                    "is_winding_consistent": bool(mesh.is_winding_consistent),
+                    "volume_m3": volume,
+                    "input_boundary_edge_count": int(len(input_boundary_edges)),
+                    "input_nonmanifold_edge_count": int(len(input_nonmanifold_edges)),
+                    "input_vertical_boundary_edge_count": int(
+                        np.count_nonzero(input_boundary_xz_lengths < 1e-8)
+                    ),
+                    "boundary_edge_count": int(len(boundary_edges)),
+                    "nonmanifold_edge_count": int(len(nonmanifold_edges)),
+                    "vertical_boundary_edge_count": int(np.count_nonzero(boundary_xz_lengths < 1e-8)),
+                    "euler_number": int(mesh.euler_number),
+                }
+                (diagnostics_dir / "slab_closure_report.json").write_text(
+                    json.dumps(report, indent=2) + "\n", encoding="utf-8"
+                )
+                diagnostic_path = diagnostics_dir
+            except Exception as error:
+                print(f"Could not save slab-closure diagnostics: {error}")
+        message = "Slab boundary did not produce a watertight positive solid"
+        if diagnostic_path is not None:
+            message += f"; diagnostics saved to {diagnostic_path}"
+        raise ValueError(message)
     return mesh, peq, lift
 
 

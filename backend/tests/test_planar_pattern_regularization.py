@@ -120,6 +120,52 @@ def test_periodic_relief_stays_inside_its_observed_support_band():
     assert result["pattern_classification"]["parameters"]["primitive_shape"] == "parallelepiped"
 
 
+def test_relief_primitives_use_each_patch_plane_offset(monkeypatch):
+    def repeated_pattern(*args, **kwargs):
+        return {
+            "pattern_type": "periodic_relief",
+            "confidence": 1.0,
+            "parameters": {
+                "axis": "u",
+                "period_scene_units": 0.5,
+                "pattern_region_uv_bounds": [-1.0, 1.0, -1.0, 1.0],
+                "amplitude_scene_units": 0.02,
+                "primitive_width_fraction": 0.4,
+                "regularized_peak_positions": [-0.5, 0.0, 0.5],
+            },
+        }
+
+    monkeypatch.setattr("planar_pattern_regularization._periodic_relief", repeated_pattern)
+    xz = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+    support_xz = np.array([[x, z] for x in np.linspace(0.05, 0.95, 8)
+                           for z in np.linspace(0.05, 0.95, 8)])
+    patches = []
+    elevations = [-1.0, 1.25, 5.0]
+    for index, elevation in enumerate(elevations):
+        mesh = trimesh.Trimesh(
+            vertices=np.column_stack((xz[:, 0], np.full(len(xz), elevation), xz[:, 1])),
+            faces=np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32), process=False,
+        )
+        centers = np.column_stack((support_xz[:, 0],
+                                   np.full(len(support_xz), elevation), support_xz[:, 1]))
+        patches.append({
+            "name": f"ceiling_{index}",
+            "mesh": mesh,
+            "plane_equation": [0.0, 1.0, 0.0, -elevation],
+            "relief_direction": [0.0, -1.0, 0.0],
+            "support_centers": centers,
+            "support_areas": np.ones(len(centers)),
+            "support_colors": np.full((len(centers), 3), 0.5),
+        })
+
+    result = regularize_planar_patches(patches, max_edge=0.5)
+
+    for patch, elevation in zip(result, elevations):
+        assert patch["pattern_classification"]["pattern_type"] == "periodic_relief"
+        assert patch["mesh"].vertices[:, 1].min() >= elevation - 0.021
+        assert patch["mesh"].vertices[:, 1].max() <= elevation + 0.003
+
+
 def test_sparse_repetition_across_only_six_of_thirty_two_bands_is_rejected():
     x = np.linspace(0.01, 2.4, 500)
     y = np.linspace(0.01, 2.4, 32)

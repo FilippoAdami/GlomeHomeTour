@@ -6,7 +6,8 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / '06_mesh_elaboration/generate_floorplan_symbols.py'
+MODULE_PATH = Path(__file__).resolve().parents[1] / '08_artifacts_generation/generate_floorplan_symbols.py'
+CATEGORY_MODULE_PATH = Path(__file__).resolve().parents[1] / '05_semantic_segmentation/run_non_structural_category_similarity.py'
 spec = importlib.util.spec_from_file_location('floorplan_symbols', MODULE_PATH)
 symbols = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(symbols)
@@ -92,7 +93,7 @@ def test_cli_writes_numbered_class(tmp_path):
 
 
 def test_numbered_class_names_match_current_ontology():
-    source = MODULE_PATH.with_name('run_non_structural_category_similarity.py').read_text()
+    source = CATEGORY_MODULE_PATH.read_text()
     tree = ast.parse(source)
     groups = next(ast.literal_eval(node.value) for node in tree.body
                   if isinstance(node, ast.Assign)

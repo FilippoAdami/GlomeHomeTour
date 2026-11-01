@@ -164,7 +164,7 @@ def test_snaps_wall_directions_and_merges_only_close_parallel_planes():
     assert info["parallel_merge_distance_scene_units"] == 0.15
 
 
-def test_merge_is_blocked_when_it_would_collapse_a_previously_separate_gap():
+def test_merge_uses_the_member_furthest_from_its_nearest_external_plane():
     vertices, triangles, labels, fitted = [], [], [], []
 
     def add_x_square(region_id: int, x: float, width: float):
@@ -191,17 +191,79 @@ def test_merge_is_blocked_when_it_would_collapse_a_previously_separate_gap():
         vertices, triangles, labels, np.ones(len(triangles), dtype=bool), fitted
     )
 
-    assert {tuple(plane["source_region_ids"]) for plane in planes} == {(1,), (2,), (3,)}
-    assert info["merge_rejections"] == [{
-        "source_region_ids": [2, 3],
-        "nearby_region_id": 1,
-        "proposed_offset": pytest.approx(-0.14),
-        "proposed_distance_scene_units": pytest.approx(0.14),
-        "previous_distances_scene_units": [
-            {"region_id": 2, "distance": pytest.approx(0.14)},
-            {"region_id": 3, "distance": pytest.approx(0.28)},
-        ],
-    }]
+    assert {tuple(plane["source_region_ids"]) for plane in planes} == {(1,), (2, 3)}
+    merged = next(plane for plane in planes if plane["source_region_ids"] == [2, 3])
+    assert merged["offset"] == pytest.approx(-0.28)
+    assert merged["offset_before_enclosing"] == pytest.approx(-0.28)
+    assert merged["merge_coordinate_anchor"] == {
+        "region_id": 3,
+        "offset": pytest.approx(-0.28),
+        "nearest_external_region_id": 1,
+        "clearance_scene_units": pytest.approx(0.28),
+    }
+    assert info["merge_rejections"] == []
+
+
+def test_merge_coordinate_uses_parallel_family_anchor_not_nearby_perpendicular_plane():
+    vertices, triangles, labels, fitted = [], [], [], []
+
+    def add_square(region_id: int, coordinate: float, axis: str):
+        start = len(vertices)
+        if axis == "x":
+            vertices.extend([[coordinate, 0, 0], [coordinate, 1, 0],
+                             [coordinate, 1, 1], [coordinate, 0, 1]])
+            normal = [1.0, 0.0, 0.0]
+        else:
+            vertices.extend([[0, 0, coordinate], [1, 0, coordinate],
+                             [1, 1, coordinate], [0, 1, coordinate]])
+            normal = [0.0, 0.0, 1.0]
+        triangles.extend([[start, start + 1, start + 2], [start, start + 2, start + 3]])
+        labels.extend([region_id, region_id])
+        fitted.append({
+            "region_id": region_id,
+            "normal": normal,
+            "fit_area_scene_units_squared": 1.0,
+            "color_rgb": [region_id * 20, 100, 200],
+        })
+
+    add_square(1, 0.16, "x")
+    add_square(2, 0.0, "x")
+    add_square(3, -0.14, "x")
+    add_square(4, -0.35, "x")
+    add_square(5, -0.145, "z")
+    vertices = np.asarray(vertices, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int32)
+    labels = np.asarray(labels, dtype=np.int32)
+
+    _, planes, _ = fit_wall_region_planes._snap_and_merge_planes(
+        vertices, triangles, labels, np.ones(len(triangles), dtype=bool), fitted
+    )
+
+    merged = next(plane for plane in planes if plane["source_region_ids"] == [2, 3])
+    assert merged["orientation_family"] == 0
+    assert merged["merge_coordinate_anchor"]["region_id"] == 3
+    assert merged["merge_coordinate_anchor"]["nearest_external_region_id"] == 4
+    assert merged["offset"] == pytest.approx(0.14)
+    assert merged["color_rgb"] == [60, 100, 200]
+
+
+def test_merge_anchor_uses_each_member_nearest_neighbor_before_comparing_clearance():
+    group = [
+        {"region_id": 1, "offset": 0.0, "area": 1.0},
+        {"region_id": 2, "offset": 0.14, "area": 1.0},
+    ]
+    family = [*group,
+              {"region_id": 3, "offset": -0.16, "area": 1.0},
+              {"region_id": 4, "offset": 0.35, "area": 1.0}]
+
+    anchor = fit_wall_region_planes._merge_coordinate_anchor(group, family)
+
+    assert anchor == {
+        "region_id": 2,
+        "offset": pytest.approx(0.14),
+        "nearest_external_region_id": 4,
+        "clearance_scene_units": pytest.approx(0.21),
+    }
 
 
 def test_enclosing_translation_limits_outside_triangles_to_one_percent():

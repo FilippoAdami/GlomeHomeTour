@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "06_mesh_elaboration"))
+sys.path.append(str(Path(__file__).resolve().parents[1] / "05_semantic_segmentation"))
 
 from run_non_structural_category_similarity import (
     CATEGORIES,
@@ -17,6 +17,7 @@ from run_non_structural_category_similarity import (
     _load_word_embeddings,
     _load_image_embeddings,
     _save_npz,
+    aggregate_valid_class_associations,
     main,
     specificity_matrices,
     top_rows,
@@ -29,6 +30,16 @@ def test_categories_keep_words_grouped_into_28_classes():
     assert CATEGORY_GROUPS[12] == ("chair", "office chair", "bench")
     assert "deckchair" not in CATEGORY_WORDS
     assert len(CATEGORY_WORDS) == len(WORD_CATEGORY_IDS) == 66
+
+
+def test_all_28_categories_can_be_assigned_to_a_source_class(tmp_path):
+    frame = tmp_path / "class_71_inst_0.png"
+    scores = np.zeros((len(CATEGORIES), 1), dtype=np.float32)
+    scores[2, 0] = 0.10
+
+    assert aggregate_valid_class_associations(
+        {"mesh": [frame]}, {"mesh": scores}
+    ) == [(71, 3)]
 
 
 def test_top_rows_rank_by_shared_baseline_specificity_and_keep_raw_cosine():

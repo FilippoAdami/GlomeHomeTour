@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import time
@@ -20,7 +21,9 @@ bootstrap()
 
 from assemble_final_regularized_mesh import assemble_final_regularized_mesh
 from finalize_single_elements import finalize_single_elements
+from floor_opening_constraints import CACHE_NAME
 from mesh_elaboration_inputs import (
+    discover_scans,
     resolve_labels,
     resolve_mesh,
     resolve_scene,
@@ -62,6 +65,29 @@ def _publish_delivery(delivery: Path, destination: Path, backup: Path) -> None:
         raise
 
 
+def _publish_opening_cache(source: Path, destination: Path) -> None:
+    if not source.is_file():
+        return
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    try:
+        shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _preserve_floor_projection_images(stage_output: Path, scan: Path, run_id: str) -> Path | None:
+    source = stage_output / "intermediate_floor_levels"
+    images = sorted(source.glob("*.png"))
+    if not images:
+        return None
+    destination = scan / "mesh_elaboration_diagnostics" / "floor_projection" / run_id
+    destination.mkdir(parents=True, exist_ok=False)
+    for image in images:
+        shutil.copy2(image, destination / image.name)
+    return destination
+
+
 def run_phase06(workspace: Path) -> dict:
     scan = resolve_scene(workspace).resolve()
     mesh_path = resolve_mesh(scan)
@@ -76,7 +102,13 @@ def run_phase06(workspace: Path) -> dict:
 
     with tempfile.TemporaryDirectory(prefix=".phase06_build_", dir=scan) as temp_name:
         temporary = Path(temp_name)
+        run_id = temporary.name.removeprefix(".phase06_build_")
         staged_scan = temporary / "scan"
+        staged_scan.mkdir()
+        opening_cache = scan / CACHE_NAME
+        staged_opening_cache = staged_scan / CACHE_NAME
+        if opening_cache.is_file():
+            shutil.copy2(opening_cache, staged_opening_cache)
         stage_output = staged_scan / "mesh_elaboration_steps"
 
         print("Steps 1–3: rebuilding structural instances, walls, floors, and ceilings")
@@ -90,6 +122,11 @@ def run_phase06(workspace: Path) -> dict:
             scene_size_file=scene_size,
         )
         print(f"Steps 1–3: {time.perf_counter() - started:.1f}s")
+        # diagnostics = _preserve_floor_projection_images(
+        #     stage_output, scan, run_id
+        # )
+        # if diagnostics is not None:
+        #     print(f"Floor projection images -> {diagnostics}")
         if code:
             raise RuntimeError(f"Phase 06 Steps 1–3 failed with exit code {code}")
 
@@ -98,7 +135,11 @@ def run_phase06(workspace: Path) -> dict:
         print(f"Step 4: finalize walls and ceilings: {time.perf_counter() - started:.1f}s")
         elements_dir = stage_output / "elements"
         started = time.perf_counter()
-        assembly = assemble_final_regularized_mesh(staged_scan, elements_dir=elements_dir)
+        assembly = assemble_final_regularized_mesh(
+            staged_scan,
+            elements_dir=elements_dir,
+            # diagnostics_dir=(scan / "mesh_elaboration_diagnostics" / "slab_closure" / run_id),
+        )
         print(f"Step 5: assemble final elements: {time.perf_counter() - started:.1f}s")
 
         topology = assembly["topology"]
@@ -117,6 +158,7 @@ def run_phase06(workspace: Path) -> dict:
         delivery.mkdir()
         os.replace(final_ply, delivery / "complete.ply")
         os.replace(elements_dir, delivery / "elements")
+        _publish_opening_cache(staged_opening_cache, opening_cache)
         _publish_delivery(delivery, destination, temporary / "previous_delivery")
 
     return {
@@ -132,16 +174,31 @@ def run_phase06(workspace: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True,
-                        help="Phase 04/05 scan directory, or a root containing exactly one scan")
+                        help="Phase 04/05 scan directory or a workspace containing scan_N folders")
     args = parser.parse_args(argv)
+    started = time.perf_counter()
     try:
-        result = run_phase06(args.workspace)
+        scans = discover_scans(args.workspace)
     except (OSError, ValueError, KeyError, RuntimeError) as error:
         print(f"Error: Could not run complete Phase 06: {error}", file=sys.stderr)
+        print(f"Phase 06 total time: {time.perf_counter() - started:.1f}s")
         return 1
-    print(f"Complete PLY -> {result['complete_ply']}")
-    print(f"Element PLYs -> {result['elements_dir']} ({result['element_ply_count']} files)")
-    print(f"Topology -> {result['topology']}")
+
+    failures = []
+    for scan in scans:
+        try:
+            result = run_phase06(scan)
+        except Exception as error:
+            failures.append(scan.name)
+            print(f"Error: Could not run Phase 06 for {scan.name}: {error}", file=sys.stderr)
+            continue
+        print(f"{scan.name} complete PLY -> {result['complete_ply']}")
+        print(f"{scan.name} element PLYs -> {result['elements_dir']} ({result['element_ply_count']} files)")
+        print(f"{scan.name} topology -> {result['topology']}")
+    print(f"Phase 06 total time: {time.perf_counter() - started:.1f}s")
+    if failures:
+        print(f"Phase 06 failed for scans: {', '.join(failures)}", file=sys.stderr)
+        return 1
     return 0
 
 

@@ -23,6 +23,13 @@ MIN_CARVE_LONG_DIMENSION_M = 1.0
 FLOOR_CEILING_SEARCH_DISTANCE_M = 1.0
 TOPOLOGY_TOLERANCE_M = 0.01
 FLOOR_CONTOUR_HEIGHT_M = 0.30
+CORNER_EXTENSION_SUPPORT_DISTANCE_M = 0.05
+CORNER_EXTENSION_MIN_AREA_COVERAGE = 0.35
+CORNER_EXTENSION_MIN_LENGTH_COVERAGE = 0.75
+CORNER_EXTENSION_MIN_HEIGHT_COVERAGE = 0.50
+CORNER_EXTENSION_CELL_LENGTH_M = 0.10
+CORNER_EXTENSION_CELL_HEIGHT_M = 0.50
+CORNER_EXTENSION_NORMAL_COS = float(np.cos(np.deg2rad(35.0)))
 
 
 def _triangle_areas(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
@@ -33,6 +40,36 @@ def _triangle_areas(vertices: np.ndarray, triangles: np.ndarray) -> np.ndarray:
 
 def _plane_regions(plane: dict) -> list[dict]:
     return plane["trim_regions"]
+
+
+def _write_cycle_failure_diagnostic(
+    path: Path | None, planes: list[dict], vertical_bounds: tuple[float, float] | None,
+    bands: list[dict], reason: str,
+) -> None:
+    if path is None:
+        return
+    report = {
+        "failure": reason,
+        "topology_tolerance_m": TOPOLOGY_TOLERANCE_M,
+        "vertical_bounds_m": list(map(float, vertical_bounds)) if vertical_bounds else None,
+        "planes": [{
+            "plane_id": int(plane.get("id", index)),
+            "name": plane.get("name"),
+            "axis": plane.get("axis"),
+            "offset_m": float(plane["offset_m"]),
+            "source_region_ids": list(map(int, plane.get("source_region_ids", []))),
+            "trim_regions": [{
+                "span_m": list(map(float, region["span_m"])),
+                "bounds_y_m": list(map(float, region["bounds_y"])),
+            } for region in _plane_regions(plane)],
+        } for index, plane in enumerate(planes)],
+        "height_bands": bands,
+    }
+    try:
+        path.write_text(json.dumps(report, indent=2) + "\n")
+    except OSError as error:
+        print(f"[wall enclosure] Could not save topology diagnostics to {path}: {error}",
+              file=sys.stderr)
 
 
 def _rect_intersection(a: dict, b: dict) -> tuple[float, float, float, float] | None:
@@ -122,9 +159,91 @@ def _make_horizontal_transition(transition: dict, axes: np.ndarray) -> trimesh.T
                            process=False)
 
 
-def _snap_panel_junctions(planes: list[dict]) -> None:
-    """Close near corner gaps without propagating a tall panel's full height to neighbors."""
+def _mesh_supports_panel_extension(
+    plane: dict, extension: tuple[float, float], bounds_y: tuple[float, float],
+    support: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> tuple[bool, dict]:
+    """Measure mesh support across the proposed strip beyond the fitted panel span."""
+    low, high = sorted(map(float, extension))
+    y0, y1 = map(float, bounds_y)
+    length, height = high - low, y1 - y0
+    if length <= TOPOLOGY_TOLERANCE_M or height <= TOPOLOGY_TOLERANCE_M:
+        return True, {"area_coverage": 1.0, "length_coverage": 1.0, "height_coverage": 1.0}
+
+    offsets, along, heights, normal_alignment, areas = support
+    selected = (
+        (along >= low) & (along <= high) & (heights >= y0) & (heights <= y1)
+        & (np.abs(offsets - float(plane["offset_m"])) <= CORNER_EXTENSION_SUPPORT_DISTANCE_M)
+        & (normal_alignment >= CORNER_EXTENSION_NORMAL_COS) & (areas > 1e-12)
+    )
+
+    expected_area = length * height
+    if not np.any(selected):
+        return False, {"area_coverage": 0.0, "length_coverage": 0.0, "height_coverage": 0.0}
+
+    along_bins = max(1, min(32, int(np.ceil(length / CORNER_EXTENSION_CELL_LENGTH_M))))
+    height_bins = max(1, min(32, int(np.ceil(height / CORNER_EXTENSION_CELL_HEIGHT_M))))
+    bins = np.histogram2d(
+        along[selected], heights[selected],
+        bins=(np.linspace(low, high, along_bins + 1), np.linspace(y0, y1, height_bins + 1)),
+        weights=areas[selected],
+    )[0]
+    cell_area = expected_area / (along_bins * height_bins)
+    covered = bins >= 0.20 * cell_area
+    length_coverage = float(np.mean(np.any(covered, axis=1)))
+    height_coverage = float(np.mean(np.any(covered, axis=0)))
+    area_coverage = float(areas[selected].sum() / expected_area)
+    endpoints_supported = bool(np.any(covered[0]) and np.any(covered[-1]))
+    metrics = {
+        "area_coverage": area_coverage,
+        "length_coverage": length_coverage,
+        "height_coverage": height_coverage,
+    }
+    supported = (
+        area_coverage >= CORNER_EXTENSION_MIN_AREA_COVERAGE
+        and length_coverage >= CORNER_EXTENSION_MIN_LENGTH_COVERAGE
+        and height_coverage >= CORNER_EXTENSION_MIN_HEIGHT_COVERAGE
+        and endpoints_supported
+    )
+    return supported, metrics
+
+
+def _corner_mesh_support(
+    centers: np.ndarray, normals: np.ndarray, areas: np.ndarray, axes: np.ndarray,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    return [
+        (centers @ axes[family], centers @ axes[1 - family], centers[:, 1],
+         np.abs(normals @ axes[family]), areas)
+        for family in range(2)
+    ]
+
+
+def _has_long_corner_gap(planes: list[dict]) -> bool:
+    limit = JUNCTION_DISTANCE_M + TOPOLOGY_TOLERANCE_M
+    for first in (plane for plane in planes if plane["family"] == 0):
+        for second in (plane for plane in planes if plane["family"] == 1):
+            y_overlap = min(first["bounds_y"][1], second["bounds_y"][1]) - max(
+                first["bounds_y"][0], second["bounds_y"][0]
+            )
+            if y_overlap <= TOPOLOGY_TOLERANCE_M:
+                continue
+            x, z = first["offset_m"], second["offset_m"]
+            first_span, second_span = first["span_w_m"], second["span_u_m"]
+            dist_first = max(first_span[0] - z, 0.0, z - first_span[1])
+            dist_second = max(second_span[0] - x, 0.0, x - second_span[1])
+            if max(dist_first, dist_second) > limit:
+                return True
+    return False
+
+
+def _snap_panel_junctions(
+    planes: list[dict],
+    corner_mesh_support: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None = None,
+) -> list[dict]:
+    """Close near corners; require mesh support for extensions beyond the legacy snap range."""
     changed = True
+    extensions = []
+    extension_keys = set()
     while changed:
         changed = False
         for first in (p for p in planes if p["family"] == 0):
@@ -145,14 +264,51 @@ def _snap_panel_junctions(planes: list[dict]) -> None:
                 x, z = first["offset_m"], second["offset_m"]
                 dist_first = max(first_span[0] - z, 0.0, z - first_span[1])
                 dist_second = max(second_span[0] - x, 0.0, x - second_span[1])
-                if max(dist_first, dist_second) > JUNCTION_DISTANCE_M + TOPOLOGY_TOLERANCE_M:
-                    continue
+                existing_limit = JUNCTION_DISTANCE_M + TOPOLOGY_TOLERANCE_M
+                needs_mesh_support = max(dist_first, dist_second) > existing_limit
+                evidence = []
+                if needs_mesh_support:
+                    if corner_mesh_support is None:
+                        continue
+                    y_overlap = (max(first_y[0], second_y[0]), min(first_y[1], second_y[1]))
+                    if y_overlap[1] <= y_overlap[0] + TOPOLOGY_TOLERANCE_M:
+                        continue
+                    for plane, coordinate, span, distance in (
+                        (first, z, first_span, dist_first),
+                        (second, x, second_span, dist_second),
+                    ):
+                        if distance <= existing_limit:
+                            continue
+                        endpoint = span[0] if coordinate < span[0] else span[1]
+                        supported, metrics = _mesh_supports_panel_extension(
+                            plane, (endpoint, coordinate), y_overlap,
+                            corner_mesh_support[int(plane["family"])],
+                        )
+                        evidence.append({"plane_id": int(plane.get("id", -1)),
+                                         "supported": bool(supported), **metrics})
+                    if len(evidence) != sum(
+                        distance > existing_limit for distance in (dist_first, dist_second)
+                    ) or not all(item["supported"] for item in evidence):
+                        continue
                 new_first = [min(first_span[0], z), max(first_span[1], z)]
                 new_second = [min(second_span[0], x), max(second_span[1], x)]
+                changed_first, changed_second = new_first != first_span, new_second != second_span
+                if needs_mesh_support and (changed_first or changed_second):
+                    key = (int(first.get("id", -1)), int(second.get("id", -1)),
+                           round(float(x), 5), round(float(z), 5))
+                    if key not in extension_keys:
+                        extensions.append({
+                            "plane_ids": [key[0], key[1]],
+                            "intersection_xz_m": [float(x), float(z)],
+                            "extensions_m": [float(dist_first), float(dist_second)],
+                            "mesh_support": evidence,
+                        })
+                        extension_keys.add(key)
                 if new_first != first_span:
                     first[first_key] = new_first; changed = True
                 if new_second != second_span:
                     second[second_key] = new_second; changed = True
+    return extensions
 
 
 def _add_parallel_carves(planes: list[dict], owner: np.ndarray, vertices: np.ndarray,
@@ -243,12 +399,14 @@ def _add_parallel_carves(planes: list[dict], owner: np.ndarray, vertices: np.nda
 
 def _cross_section_cycles(
     planes: list[dict], vertical_bounds: tuple[float, float] | None = None,
+    diagnostics_path: Path | None = None,
 ) -> tuple[list[dict], dict]:
     """Keep only panel intervals that belong to a closed loop at each height band."""
     events = sorted({float(y) for plane in planes for region in _plane_regions(plane)
                      for y in region["bounds_y"]})
     kept: dict[int, list[dict]] = {i: [] for i in range(len(planes))}
     band_reports = []
+    diagnostic_bands = []
     for y0, y1 in zip(events, events[1:]):
         if y1 - y0 <= 1e-8:
             continue
@@ -324,8 +482,40 @@ def _cross_section_cycles(
         band_reports.append({"y_bounds": [y0, y1], "cycle_edge_count": len(cycle_edges),
                              "closed_component_count": component_count if cycle_edges else 0,
                              "cycle_rank": max(0, cycle_rank), "is_closed": bool(cycle_edges)})
+        diagnostic_bands.append({
+            "y_bounds_m": [float(y0), float(y1)],
+            "sample_y_m": float(y),
+            "segments": [{
+                "plane_index": int(segment["plane"]),
+                "plane_id": int(planes[segment["plane"]].get("id", segment["plane"])),
+                "axis": segment["axis"],
+                "offset_m": float(segment["offset"]),
+                "span_m": list(map(float, segment["span"])),
+                "corner_crossings": [{
+                    "coordinate_m": float(coordinate),
+                    "point_xz_m": list(map(float, point)),
+                } for coordinate, point in segment["crossings"]],
+            } for segment in segments],
+            "candidate_edges": [{
+                "a_xz_m": list(map(float, edge["a"])),
+                "b_xz_m": list(map(float, edge["b"])),
+                "plane_index": int(edge["plane"]),
+                "span_m": list(map(float, edge["span"])),
+            } for edge in edges],
+            "cycle_edge_indices": sorted(map(int, cycle_edges)),
+            "cycle_edge_count": len(cycle_edges),
+            "closed_component_count": component_count if cycle_edges else 0,
+            "cycle_rank": max(0, cycle_rank),
+        })
 
     if not any(band["cycle_edge_count"] for band in band_reports):
+        reason = "Fitted planes do not contain a closed, supported horizontal loop"
+        _write_cycle_failure_diagnostic(
+            diagnostics_path, planes, vertical_bounds, diagnostic_bands, reason
+        )
+        print(f"[wall enclosure] {reason}; height bands={len(band_reports)}, "
+              f"segments={sum(len(band['segments']) for band in diagnostic_bands)}, "
+              f"candidate edges={sum(len(band['candidate_edges']) for band in diagnostic_bands)}")
         raise ValueError("Fitted planes do not contain a closed, supported horizontal loop")
     active_bands = [i for i, band in enumerate(band_reports) if band["cycle_edge_count"]]
     participating = [i for i, regions in kept.items() if regions]
@@ -346,6 +536,10 @@ def _cross_section_cycles(
                           if run[0][0] <= floor_y + 0.10 and run[-1][1] > floor_y + 1e-4]
         if not supported_runs:
             bands = [(item["y_bounds"], item["is_closed"]) for item in band_reports]
+            reason = f"No closed wall run reaches fitted floor height {floor_y:.4f} m"
+            _write_cycle_failure_diagnostic(
+                diagnostics_path, planes, vertical_bounds, diagnostic_bands, reason
+            )
             raise ValueError(
                 f"Wall planes do not form a closed loop at the fitted floor height {floor_y:.4f}; "
                 f"height bands: {bands}"
@@ -375,7 +569,7 @@ def _cross_section_cycles(
             if not regions:
                 continue
             extended.append(plane)
-        final, final_topology = _cross_section_cycles(extended)
+        final, final_topology = _cross_section_cycles(extended, diagnostics_path=diagnostics_path)
         open_bands = [band["y_bounds"] for band in final_topology["height_bands"]
                       if not band["is_closed"]]
         if open_bands:
@@ -595,8 +789,22 @@ def _build_planes(regions_dir: Path) -> tuple[list[dict], np.ndarray, np.ndarray
     if not planes:
         raise ValueError("Plane manifest contains no supported wall planes")
     # The region labels are already a one-owner partition; retained owners are audited again after carving.
+    mesh_supported_corner_extensions = []
     if len(planes) > 1:
         _snap_panel_junctions(planes)
+    if _has_long_corner_gap(planes):
+        triangle_normals = np.cross(
+            vertices[triangles[:, 1]] - vertices[triangles[:, 0]],
+            vertices[triangles[:, 2]] - vertices[triangles[:, 0]],
+        )
+        normal_lengths = np.linalg.norm(triangle_normals, axis=1)
+        triangle_normals = np.divide(
+            triangle_normals, normal_lengths[:, None], out=np.zeros_like(triangle_normals),
+            where=normal_lengths[:, None] > 1e-12,
+        )
+        corner_mesh_support = _corner_mesh_support(centers, triangle_normals, areas, axes)
+        mesh_supported_corner_extensions = _snap_panel_junctions(planes, corner_mesh_support)
+    if len(planes) > 1:
         for plane in planes:
             span_key = "span_w_m" if plane["family"] == 0 else "span_u_m"
             plane["trim_regions"] = [{"span_m": list(plane[span_key]),
@@ -605,6 +813,7 @@ def _build_planes(regions_dir: Path) -> tuple[list[dict], np.ndarray, np.ndarray
         "axes": axes, "mesh": mesh, "source_mesh": source_mesh, "centers": centers,
         "floor_y": float(floor_y), "ceiling_y": float(ceiling_y),
         "floor_center_xz": floor_center_xz.tolist(),
+        "mesh_supported_corner_extensions": mesh_supported_corner_extensions,
         "excluded_small_support": excluded_small_support,
         "excluded_nonvertical": excluded_nonvertical,
         "black_region_ids": [int(region["region_id"]) for region in region_manifest.get("regions", [])
@@ -678,7 +887,9 @@ def _source_triangle_colors(region_manifest: dict) -> np.ndarray:
     return np.vstack(colors) if colors else np.empty((0, 3), dtype=np.float64)
 
 
-def _assemble(regions_dir: Path) -> tuple[Path, Path, dict]:
+def _assemble(
+    regions_dir: Path, diagnostics_path: Path | None = None,
+) -> tuple[Path, Path, dict]:
     planes, owner, vertices, triangles, labels, areas, info = _build_planes(regions_dir)
     axes, source_mesh = info["axes"], info["source_mesh"]
     connectors, transitions = _add_parallel_carves(
@@ -690,7 +901,7 @@ def _assemble(regions_dir: Path) -> tuple[Path, Path, dict]:
         planes, info["floor_y"]
     )
     planes, topology = _cross_section_cycles(
-        planes, (info["floor_y"], info["ceiling_y"])
+        planes, (info["floor_y"], info["ceiling_y"]), diagnostics_path
     )
     topology["inferred_floor_closure_planes"] = inferred_floor_closures
     info["floor_y"], info["ceiling_y"] = topology["extended_to_floor_ceiling"]
@@ -742,6 +953,15 @@ def _assemble(regions_dir: Path) -> tuple[Path, Path, dict]:
     support_centers = info["centers"]
     if len(support_colors) != len(final_owner):
         raise ValueError("Original wall colors are not aligned with assembled support triangles")
+    category_ids_file = region_manifest.get("semantic_category_ids_file")
+    if category_ids_file:
+        category_ids_path = regions_dir / category_ids_file
+        semantic_category_ids = np.load(category_ids_path)
+        if semantic_category_ids.shape != (len(final_owner),):
+            raise ValueError("Semantic category IDs are not aligned with assembled wall triangles")
+    else:
+        semantic_category_ids = np.zeros(len(final_owner), dtype=np.uint8)
+    wall_color_support = semantic_category_ids == 0
 
     patches = []
     for index, (plane, mesh) in enumerate(zip(planes, plane_meshes)):
@@ -753,13 +973,14 @@ def _assemble(regions_dir: Path) -> tuple[Path, Path, dict]:
         inward_hint = np.array([floor_center_xz[0] - panel_center[0], 0.0,
                                 floor_center_xz[1] - panel_center[2]])
         relief_direction = wall_normal * (1.0 if inward_hint @ wall_normal >= 0 else -1.0)
+        color_support = owned & wall_color_support
         patches.append({
             "name": plane["name"], "mesh": mesh,
             "plane_equation": [*equation["normal"], equation["constant"]],
             "relief_direction": relief_direction.tolist(),
-            "support_centers": support_centers[owned],
-            "support_areas": areas[owned],
-            "support_colors": support_colors[owned],
+            "support_centers": support_centers[color_support],
+            "support_areas": areas[color_support],
+            "support_colors": support_colors[color_support],
         })
 
     transition_meshes = [_make_horizontal_transition(transition, axes) for transition in transitions]
@@ -814,7 +1035,9 @@ def _assemble(regions_dir: Path) -> tuple[Path, Path, dict]:
             "support_trimmed_outside_closed_panel": int(trimmed_mask.sum()),
             "no_fitted_plane": int(fit_unassigned_mask.sum()),
         },
+        "semantic_category_color_samples_excluded": int(np.count_nonzero(semantic_category_ids)),
         "junction_extension_distance_m": JUNCTION_DISTANCE_M,
+        "mesh_supported_corner_extensions": info["mesh_supported_corner_extensions"],
         "topology_tolerance_m": TOPOLOGY_TOLERANCE_M,
         "parallel_carve_distance_m": PARALLEL_CARVE_DISTANCE_M,
         "floor_ceiling_search_distance_m": FLOOR_CEILING_SEARCH_DISTANCE_M,

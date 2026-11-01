@@ -13,14 +13,14 @@ import numpy as np
 import shapely
 import trimesh
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Point, Polygon
 
 STAGE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(STAGE_DIR))
 sys.path.insert(0, str(STAGE_DIR.parent / "04_3DGS_to_mesh"))
 from fill_mesh_holes import boundary_loops, export_ply_with_face_attributes, read_ply_face_flags
 from mesh_elaboration_inputs import resolve_elaboration_output_dir
-from structural_geometry import close_slab
+from structural_geometry import close_slab, weld_float32_boundary_edges
 
 WALL_NAME = "wall_enclosing_planes_fitted_to_regularized_contours.ply"
 CEILING_NAME = "ceiling_planes_fitted_to_support_contours_regularized.ply"
@@ -54,6 +54,124 @@ def _face_property(path: Path, name: str, count: int, default: int | None = None
     return values
 
 
+def _ceiling_patch_max_y(ceiling: trimesh.Trimesh, groups: np.ndarray,
+                         associations: np.ndarray, areas: np.ndarray,
+                         junctions: np.ndarray, patch: dict) -> float:
+    area_id = -1 if patch.get("support_area_id") is None else int(patch["support_area_id"])
+    association = (-1 if patch.get("associated_floor_level") is None
+                   else int(patch["associated_floor_level"]))
+    patch_mask = (
+        (groups == int(patch["group_id"]))
+        & (associations == association)
+        & (areas == area_id)
+        & (junctions == 0)
+    )
+    patch_faces = ceiling.faces[patch_mask]
+    if not len(patch_faces):
+        raise ValueError(f"No finalized ceiling faces found for upper ceiling patch {patch}")
+    return float(ceiling.vertices[patch_faces, 1].max())
+
+
+def _floor_area_supports(levels_dir: Path, level: dict, floor_path: Path,
+                         floor: trimesh.Trimesh) -> list[dict]:
+    """Return the lowest level's fitted floor planes and their projected supports."""
+    level_id = int(level["level"])
+    face_areas = _face_property(floor_path, "floor_area_id", len(floor.faces))
+    polygons_path = levels_dir / f"floor_level_{level_id:03d}_polygons.json"
+    polygon_areas = {}
+    if polygons_path.is_file():
+        polygon_areas = {
+            int(area["area_id"]): area
+            for area in json.loads(polygons_path.read_text(encoding="utf-8")).get("areas", [])
+        }
+
+    supports = []
+    for area in level.get("floor_areas", []):
+        area_id = int(area["area_id"])
+        if not np.any(face_areas == area_id):
+            continue
+        equation = np.asarray(area.get("plane_equation"), dtype=np.float64)
+        if equation.shape != (4,) or not np.isfinite(equation).all():
+            raise ValueError(f"Invalid fitted floor plane for level {level_id}, area {area_id}")
+        length = float(np.linalg.norm(equation[:3]))
+        if length <= 1e-10:
+            raise ValueError(f"Invalid fitted floor plane for level {level_id}, area {area_id}")
+        equation /= length
+        if equation[1] < 0:
+            equation = -equation
+        if equation[1] < 0.7:
+            raise ValueError(f"Fitted floor plane is too vertical for level {level_id}, area {area_id}")
+
+        record = polygon_areas.get(area_id, {})
+        rings = record.get("floor_polygon_rings_world_xz_m", [])
+        support = None
+        for ring in rings:
+            polygon = Polygon(np.asarray(ring, dtype=np.float64))
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if not polygon.is_empty and shapely.area(polygon) > 1e-8:
+                support = polygon if support is None else support.symmetric_difference(polygon)
+        if support is None:
+            contour = np.asarray(record.get("regularized_wall_contour_world_xz_m", []), dtype=np.float64)
+            if contour.ndim == 2 and contour.shape[0] >= 3 and contour.shape[1] == 2:
+                support = Polygon(contour)
+        if support is None or support.is_empty:
+            continue
+        if not support.is_valid:
+            support = support.buffer(0)
+        if support.is_empty:
+            continue
+        supports.append({
+            "area_id": area_id,
+            "equation": equation,
+            "polygon": support.buffer(BASE_FLOOR_ALIGNMENT_TOLERANCE_M),
+        })
+    return supports
+
+
+def _wall_face_floor_planes(wall: trimesh.Trimesh, supports: list[dict],
+                            fallback_y: float) -> tuple[np.ndarray, dict]:
+    """Assign a floor plane only when it supports the wall face's full X/Z projection."""
+    if not np.isfinite(fallback_y):
+        raise ValueError("The fallback floor elevation must be finite")
+    fallback = np.array([0.0, 1.0, 0.0, -fallback_y], dtype=np.float64)
+    triangles = np.asarray(wall.vertices, dtype=np.float64)[wall.faces]
+    centers = triangles.mean(axis=1)
+    equations = np.tile(fallback, (len(triangles), 1))
+    selected = np.full(len(triangles), -1, dtype=np.int32)
+    for face_id, center in enumerate(centers):
+        projected_face = Polygon(triangles[face_id][:, [0, 2]]).convex_hull
+        candidates = [support for support in supports
+                      if support["polygon"].covers(projected_face)]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda support: (
+            -float(support["equation"][0] * center[0]
+                   + support["equation"][2] * center[2]
+                   + support["equation"][3]) / float(support["equation"][1]),
+            int(support["area_id"]),
+        ))
+        equations[face_id] = candidates[0]["equation"]
+        selected[face_id] = int(candidates[0]["area_id"])
+    return equations, {
+        "area_ids_used": sorted(int(value) for value in np.unique(selected) if value >= 0),
+        "wall_face_count": int(len(triangles)),
+        "wall_face_count_using_fitted_floor_area": int(np.count_nonzero(selected >= 0)),
+        "wall_face_count_using_lowest_y_fallback": int(np.count_nonzero(selected < 0)),
+    }
+
+
+def _floor_height_at_xz(x: float, z: float, supports: list[dict], fallback_y: float) -> tuple[float, bool]:
+    point = Point(float(x), float(z))
+    candidates = [support for support in supports if support["polygon"].covers(point)]
+    if not candidates:
+        return float(fallback_y), False
+    heights = [-(support["equation"][0] * x + support["equation"][2] * z
+                 + support["equation"][3]) / support["equation"][1]
+               for support in candidates]
+    return float(min(heights)), True
+
+
 def _subset(mesh: trimesh.Trimesh, mask: np.ndarray) -> trimesh.Trimesh:
     if len(mask) != len(mesh.faces) or not np.any(mask):
         raise ValueError("Cannot build a mesh subset from an empty or mismatched face selection")
@@ -71,21 +189,44 @@ def _rgb(mesh: trimesh.Trimesh) -> np.ndarray:
     return colors[:, :3].astype(np.uint8, copy=False)
 
 
-def _clip_wall_to_floor_and_ceiling(wall: trimesh.Trimesh, lower_y: float,
+def _clip_wall_to_floor_and_ceiling(wall: trimesh.Trimesh, lower_y: float | np.ndarray,
                                     ceiling_plane: np.ndarray) -> tuple[trimesh.Trimesh, dict]:
-    """Trim walls below a horizontal floor and above the fitted ceiling plane."""
+    """Trim walls below their assigned floor plane and above the fitted ceiling plane."""
     ceiling_plane = np.asarray(ceiling_plane, dtype=np.float64).reshape(4)
     normal_length = float(np.linalg.norm(ceiling_plane[:3]))
-    if (not np.isfinite(lower_y) or not np.isfinite(ceiling_plane).all()
+    if (not np.isfinite(ceiling_plane).all()
             or normal_length <= 1e-10 or abs(ceiling_plane[1]) <= 1e-8):
         raise ValueError("Invalid wall floor/ceiling clipping planes")
     ceiling_plane = ceiling_plane / normal_length
     if ceiling_plane[1] < 0:
         ceiling_plane = -ceiling_plane
+
+    lower = np.asarray(lower_y, dtype=np.float64)
+    if lower.ndim == 0:
+        if not np.isfinite(lower):
+            raise ValueError("Invalid wall floor/ceiling clipping planes")
+        lower_planes = np.tile([0.0, 1.0, 0.0, -float(lower)], (len(wall.faces), 1))
+    elif lower.shape == (4,):
+        lower_planes = np.tile(lower, (len(wall.faces), 1))
+    elif lower.shape == (len(wall.faces), 4):
+        lower_planes = lower.copy()
+    else:
+        raise ValueError("Wall floor planes must be one equation or one equation per face")
+    if not np.isfinite(lower_planes).all():
+        raise ValueError("Invalid wall floor/ceiling clipping planes")
+    lower_lengths = np.linalg.norm(lower_planes[:, :3], axis=1)
+    if np.any(lower_lengths <= 1e-10):
+        raise ValueError("Invalid wall floor/ceiling clipping planes")
+    lower_planes /= lower_lengths[:, None]
+    lower_planes[lower_planes[:, 1] < 0] *= -1
+    if np.any(lower_planes[:, 1] < 0.7):
+        raise ValueError("Wall lower boundary must use upward-facing floor planes")
+
     vertices = np.asarray(wall.vertices, dtype=np.float64)
     faces = np.asarray(wall.faces, dtype=np.int64)
     triangles = vertices[faces]
-    lower_values = triangles[:, :, 1] - lower_y
+    lower_values = (np.einsum("fvc,fc->fv", triangles, lower_planes[:, :3])
+                    + lower_planes[:, None, 3])
     ceiling_values = triangles @ ceiling_plane[:3] + ceiling_plane[3]
     inside = (lower_values.min(axis=1) >= -1e-9) & (ceiling_values.max(axis=1) <= 1e-9)
     outside = (lower_values.max(axis=1) < -1e-9) | (ceiling_values.min(axis=1) > 1e-9)
@@ -100,10 +241,7 @@ def _clip_wall_to_floor_and_ceiling(wall: trimesh.Trimesh, lower_y: float,
     for face_id in crossing_ids:
         polygon = [(point.copy(), color.astype(np.float64)) for point, color in
                    zip(triangles[face_id], source_colors[faces[face_id]])]
-        for equation, keep_below in (
-            (np.array([0.0, 1.0, 0.0, -lower_y]), False),
-            (ceiling_plane, True),
-        ):
+        for equation, keep_below in ((lower_planes[face_id], False), (ceiling_plane, True)):
             clipped = []
             for index, (point, color) in enumerate(polygon):
                 next_point, next_color = polygon[(index + 1) % len(polygon)]
@@ -153,10 +291,14 @@ def _clip_wall_to_floor_and_ceiling(wall: trimesh.Trimesh, lower_y: float,
                         [xz_max[0], xz_min[1]], [xz_max[0], xz_max[1]]])
     ceiling_heights = -(ceiling_plane[0] * corners[:, 0]
                         + ceiling_plane[2] * corners[:, 1] + ceiling_plane[3]) / ceiling_plane[1]
+    floor_heights = -(lower_planes[:, None, 0] * triangles[:, :, 0]
+                      + lower_planes[:, None, 2] * triangles[:, :, 2]
+                      + lower_planes[:, None, 3]) / lower_planes[:, None, 1]
     return retained, {
         "source_y_range_m": [float(vertices[:, 1].min()), float(vertices[:, 1].max())],
         "retained_y_range_m": [float(retained.vertices[:, 1].min()), float(retained.vertices[:, 1].max())],
-        "lowest_floor_y_m": float(lower_y),
+        "lowest_floor_y_m": float(floor_heights.min()),
+        "floor_boundary_plane_count": int(len(np.unique(np.round(lower_planes, decimals=8), axis=0))),
         "ceiling_plane_equation": ceiling_plane.tolist(),
         "ceiling_height_range_over_wall_bounds_m": [float(ceiling_heights.min()), float(ceiling_heights.max())],
         "highest_ceiling_y_m": float(ceiling_heights.max()),
@@ -168,7 +310,8 @@ def _clip_wall_to_floor_and_ceiling(wall: trimesh.Trimesh, lower_y: float,
 
 
 def _extend_wall_top_to_ceiling(wall: trimesh.Trimesh, lower_y: float,
-                                ceiling_plane: np.ndarray) -> tuple[trimesh.Trimesh, dict]:
+                                ceiling_plane: np.ndarray,
+                                floor_supports: list[dict] | None = None) -> tuple[trimesh.Trimesh, dict]:
     """Extend the upper wall perimeter vertically wherever it falls below the roof."""
     ceiling_plane = np.asarray(ceiling_plane, dtype=np.float64).reshape(4)
     normal_length = float(np.linalg.norm(ceiling_plane[:3]))
@@ -204,7 +347,20 @@ def _extend_wall_top_to_ceiling(wall: trimesh.Trimesh, lower_y: float,
         return wall, {"extended_boundary_loop_count": 0,
                       "extended_boundary_edge_count": 0, "added_triangle_count": 0,
                       "maximum_extension_m": 0.0}
-    top_loops = [loop for loop, _, mean_y in footprint_loops if mean_y > lower_y + 1e-4]
+
+    floor_supports = [] if floor_supports is None else floor_supports
+
+    def lies_on_floor(loop: np.ndarray) -> bool:
+        points = vertices[loop]
+        samples = [_floor_height_at_xz(point[0], point[2], floor_supports, lower_y)
+                   for point in points]
+        if all(covered for _, covered in samples):
+            return max(abs(point[1] - height)
+                       for point, (height, _) in zip(points, samples)) <= BASE_FLOOR_ALIGNMENT_TOLERANCE_M
+        return abs(float(points[:, 1].mean()) - lower_y) <= 1e-4
+
+    top_loops = [loop for loop, _, mean_y in footprint_loops
+                 if mean_y > lower_y + 1e-4 and not lies_on_floor(loop)]
     if not top_loops:
         return wall, {"extended_boundary_loop_count": 0,
                       "extended_boundary_edge_count": 0, "added_triangle_count": 0,
@@ -407,8 +563,30 @@ def _regularized_wall_contour(levels_dir: Path, level_id: int,
     return footprint if not footprint.is_empty and shapely.area(footprint) > 1e-8 else None
 
 
+def _wall_contour_footprint(levels_dir: Path, level_id: int) -> Polygon | shapely.GeometryCollection | None:
+    path = levels_dir / f"floor_level_{level_id:03d}_polygons.json"
+    if not path.is_file():
+        return None
+    polygons = []
+    for area in json.loads(path.read_text(encoding="utf-8")).get("areas", []):
+        points = np.asarray(area.get("regularized_wall_contour_world_xz_m", []), dtype=np.float64)
+        if points.ndim != 2 or points.shape[0] < 3 or points.shape[1] != 2:
+            continue
+        polygon = Polygon(points)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if not polygon.is_empty and shapely.area(polygon) > 1e-8:
+            polygons.append(polygon)
+    if not polygons:
+        return None
+    footprint = shapely.union_all(polygons)
+    return footprint if not footprint.is_empty else None
+
+
 def _clip_surface_to_footprint(surface: trimesh.Trimesh, wall_footprint: Polygon,
-                               target_y: float | None = None) -> tuple[trimesh.Trimesh, dict]:
+                               target_y: float | None = None,
+                               retain_degenerate_inside: bool = False,
+                               allow_empty: bool = False) -> tuple[trimesh.Trimesh, dict]:
     """Translate optionally, then clip every triangle to its wall support footprint."""
     source_vertices = np.asarray(surface.vertices, dtype=np.float64).copy()
     shift = 0.0 if target_y is None else float(target_y - np.median(source_vertices[:, 1]))
@@ -419,6 +597,13 @@ def _clip_surface_to_footprint(surface: trimesh.Trimesh, wall_footprint: Polygon
     rings = np.concatenate((triangle_xz, triangle_xz[:, :1]), axis=1)
     triangle_polygons = shapely.polygons(rings)
     fully_inside = shapely.covers(wall_footprint, triangle_polygons)
+    if retain_degenerate_inside:
+        projected_areas = shapely.area(triangle_polygons)
+        for face_id in np.flatnonzero(projected_areas <= 1e-12):
+            fully_inside[face_id] = all(
+                wall_footprint.covers(Point(float(point[0]), float(point[1])))
+                for point in triangle_xz[face_id]
+            )
     partial_ids = np.flatnonzero(~fully_inside)
     clipped = shapely.intersection(wall_footprint, triangle_polygons[partial_ids])
     clipped_areas = shapely.area(clipped)
@@ -466,9 +651,30 @@ def _clip_surface_to_footprint(surface: trimesh.Trimesh, wall_footprint: Polygon
             clipped_face_count += 1
 
     faces = np.concatenate(face_chunks)
-    if not len(faces):
+    if not len(faces) and not allow_empty:
         raise ValueError("Clipping the surface to the wall footprint removed every triangle")
     vertices = np.concatenate(vertex_chunks).astype(np.float32)
+    if not len(faces):
+        result = trimesh.Trimesh(vertices=np.empty((0, 3), dtype=np.float32),
+                                 faces=np.empty((0, 3), dtype=np.int64), process=False)
+        result.visual.vertex_colors = np.empty((0, 4), dtype=np.uint8)
+        input_area = float(shapely.area(triangle_polygons).sum())
+        return result, {
+            "vertical_translation_m": shift,
+            "support_elevation_y_m": (float(target_y) if target_y is not None
+                                       else float(np.median(source_vertices[:, 1]))),
+            "wall_footprint_area_m2": float(shapely.area(wall_footprint)),
+            "input_projected_area_m2": input_area,
+            "retained_projected_area_m2": 0.0,
+            "removed_projected_area_m2": input_area,
+            "input_triangle_count": int(len(source_faces)),
+            "output_triangle_count": 0,
+            "clipped_source_triangle_count": int(len(partial_ids)),
+            "removed_source_triangle_count": int(len(source_faces) - int(fully_inside.sum()) - len(partial_ids)),
+            "generated_clip_triangle_count": 0,
+            "discarded_degenerate_clip_triangle_count": int(discarded_clip_slivers),
+            "discarded_float32_degenerate_triangle_count": 0,
+        }
     triangle_vertices = vertices[faces].astype(np.float64)
     areas = np.linalg.norm(np.cross(triangle_vertices[:, 1] - triangle_vertices[:, 0],
                                     triangle_vertices[:, 2] - triangle_vertices[:, 0]), axis=1)
@@ -590,7 +796,8 @@ def _orphan_ceilings(ceiling: trimesh.Trimesh, association: np.ndarray,
 
 
 def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
-                                   elements_dir: Path | None = None) -> dict:
+                                   elements_dir: Path | None = None,
+                                   diagnostics_dir: Path | None = None) -> dict:
     workspace = workspace.resolve()
     root = resolve_elaboration_output_dir(workspace)
     levels_dir = root / "intermediate_floor_levels"
@@ -607,6 +814,9 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
     ceiling_association = _face_property(ceiling_path, "associated_floor_level", len(ceiling_raw.faces))
     ceiling_groups = _face_property(ceiling_path, "ceiling_group_id", len(ceiling_raw.faces))
     ceiling_areas = _face_property(ceiling_path, "support_area_id", len(ceiling_raw.faces))
+    ceiling_junctions = _face_property(
+        ceiling_path, "is_vertical_junction", len(ceiling_raw.faces), default=0
+    )
     ceiling_manifest = json.loads(ceiling_manifest_path.read_text(encoding="utf-8"))
     floor_manifest = json.loads(levels_path.read_text(encoding="utf-8"))
     floor_levels = {int(item["level"]): item for item in floor_manifest.get("levels", [])}
@@ -618,26 +828,38 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
         if not floor_path.is_file():
             raise FileNotFoundError(f"Final regularized floor is missing: {floor_path}")
         floor_sources[level_id] = _mesh(floor_path)
-    highest_ceiling_y = float(ceiling_raw.vertices[:, 1].max())
-    wall_xz_bounds = np.column_stack((wall_raw.vertices[:, [0, 2]].min(axis=0),
-                                      wall_raw.vertices[:, [0, 2]].max(axis=0)))
-    wall_xz_center = wall_xz_bounds.mean(axis=1)
+    floor_min_y_by_level = {
+        level_id: float(floor.vertices[floor.faces, 1].min())
+        for level_id, floor in floor_sources.items()
+    }
+    lowest_floor_candidate_level = min(
+        floor_min_y_by_level, key=lambda level_id: (floor_min_y_by_level[level_id], level_id)
+    )
+
+    non_junction_faces = ceiling_raw.faces[ceiling_junctions == 0]
+    if not len(non_junction_faces):
+        raise ValueError("No non-junction ceiling surface is available to define the upper boundary")
+    highest_ceiling_y = float(ceiling_raw.vertices[non_junction_faces, 1].max())
     upper_ceiling_patches = []
     for patch in ceiling_manifest.get("output_planes", []):
-        if patch.get("associated_floor_level") is not None or not patch.get("wall_top_constraint_applied"):
-            continue
         equation = np.asarray(patch.get("plane_equation"), dtype=np.float64)
         if equation.shape != (4,) or not np.isfinite(equation).all() or abs(equation[1]) <= 1e-8:
-            raise ValueError(f"Invalid fitted upper ceiling plane in manifest: {patch}")
+            raise ValueError(f"Invalid fitted ceiling plane in manifest: {patch}")
         if equation[1] < 0:
             equation = -equation
-        height = -(equation[0] * wall_xz_center[0]
-                   + equation[2] * wall_xz_center[1] + equation[3]) / equation[1]
-        upper_ceiling_patches.append((float(height), patch, equation / np.linalg.norm(equation[:3])))
+        maximum_y = _ceiling_patch_max_y(
+            ceiling_raw, ceiling_groups, ceiling_association,
+            ceiling_areas, ceiling_junctions, patch,
+        )
+        upper_ceiling_patches.append((maximum_y, patch, equation / np.linalg.norm(equation[:3])))
     if upper_ceiling_patches:
-        _, upper_ceiling_patch, wall_ceiling_plane = max(upper_ceiling_patches, key=lambda item: item[0])
+        highest_surface_y, upper_ceiling_patch, wall_ceiling_plane = max(
+            upper_ceiling_patches, key=lambda item: item[0]
+        )
         wall_ceiling_source = {
             "ceiling_group_id": int(upper_ceiling_patch["group_id"]),
+            "associated_floor_level": upper_ceiling_patch.get("associated_floor_level"),
+            "highest_surface_y_m": float(highest_surface_y),
             "plane_equation": wall_ceiling_plane.tolist(),
         }
     else:
@@ -663,7 +885,15 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
     element_exports: list[tuple[str, list[tuple[trimesh.Trimesh, np.ndarray | None, np.ndarray | None]]]] = []
     counts = {"walls": 0, "detached_floors": 0, "detached_ceilings": 0, "slabs": 0, "boundary_fill_faces": 0}
     wall_topology = _subset(wall_raw, np.ones(len(wall_raw.faces), dtype=bool))
-    _, wall_base_y = _wall_base_footprint(wall_topology)
+    try:
+        wall_footprint, wall_base_y = _wall_base_footprint(wall_topology)
+        wall_footprint_source = "fitted_wall_base_contour"
+    except ValueError:
+        wall_base_y = float(wall_topology.vertices[:, 1].min())
+        wall_footprint = _wall_contour_footprint(levels_dir, lowest_floor_candidate_level)
+        if wall_footprint is None or wall_footprint.is_empty:
+            raise
+        wall_footprint_source = "lowest_floor_regularized_wall_contours"
     base_floor_level = min(
         floor_levels,
         key=lambda level_id: abs(
@@ -711,20 +941,34 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
             wall_topology, support_y_min, support_y_max, floor_contour,
         )
         ceiling_bottom, slab_clip = _clip_surface_to_footprint(ceiling_bottom, wall_support)
+        precision_edge_count, precision_face_count = weld_float32_boundary_edges(ceiling_bottom)
+        slab_clip["float32_ulp_boundary_edge_candidate_count"] = precision_edge_count
+        slab_clip["float32_ulp_collapsed_face_count"] = precision_face_count
         slab_clip["support_y_range_m"] = [support_y_min, support_y_max]
         bottom_source_colors = _rgb(ceiling_bottom)
         floor_source_colors = _rgb(floor_area_mesh)
-        solid, _, lift = close_slab(ceiling_bottom.vertices, ceiling_bottom.faces, floor_equation)
+        solid, _, lift = close_slab(
+            ceiling_bottom.vertices, ceiling_bottom.faces, floor_equation,
+            diagnostics_dir=(None if diagnostics_dir is None else
+                             diagnostics_dir / f"floor_{level_id:03d}_area_{area_id:03d}"),
+            diagnostic_context={
+                "floor_level": level_id,
+                "floor_area_id": area_id,
+                "ceiling_group_ids": sorted(group_ids),
+                "support_y_range_m": [support_y_min, support_y_max],
+                "float32_ulp_boundary_edge_candidate_count": precision_edge_count,
+                "float32_ulp_collapsed_face_count": precision_face_count,
+                "clip": slab_clip,
+            },
+        )
         if not solid.is_watertight:
             raise ValueError(f"Paired floor {level_id}/{area_id} did not produce a watertight slab")
 
         bottom_count = len(ceiling_bottom.faces)
         if len(solid.faces) < 2 * bottom_count:
             raise ValueError("Slab closure did not retain both paired surface caps")
-        assembled_floor_min_y = min(
-            assembled_floor_min_y,
-            float(solid.vertices[solid.faces[bottom_count:2 * bottom_count], 1].min()),
-        )
+        floor_cap_min_y = float(solid.vertices[solid.faces[bottom_count:2 * bottom_count], 1].min())
+        assembled_floor_min_y = min(assembled_floor_min_y, floor_cap_min_y)
         side_color = np.rint((np.median(floor_source_colors, axis=0).astype(float)
                               + np.median(bottom_source_colors, axis=0).astype(float)) * 0.5).astype(np.uint8)
         face_corners = np.empty((len(solid.faces), 3, 3), dtype=np.uint8)
@@ -776,7 +1020,8 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
                     wall_topology, support_y_min, support_y_max, floor_contour,
                 )
                 surface, alignment = _clip_surface_to_footprint(surface, wall_support, target_y)
-                assembled_floor_min_y = min(assembled_floor_min_y, float(surface.vertices[:, 1].min()))
+                area_min_y = float(surface.vertices[:, 1].min())
+                assembled_floor_min_y = min(assembled_floor_min_y, area_min_y)
                 alignment.update({
                     "floor_level": level_id,
                     "floor_area_id": area_id,
@@ -789,21 +1034,75 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
                 element_exports.append((f"{name}.ply", [(surface, None, None)]))
                 counts["detached_floors"] += int(len(surface.faces))
 
+    if not np.isfinite(assembled_floor_min_y):
+        raise ValueError("No finalized floor surface is available to bound the wall shell")
+    floor_alignment_by_area = {
+        (int(item["floor_level"]), int(item["floor_area_id"])): float(item["vertical_translation_m"])
+        for item in floor_alignment
+    }
+    floor_surface_min_by_level = {}
+    for level_id, floor in floor_sources.items():
+        floor_path = levels_dir / f"floor_level_{level_id:03d}_patterns_regularized.ply"
+        area_ids = _face_property(floor_path, "floor_area_id", len(floor.faces))
+        minimum = np.inf
+        for area_id in np.unique(area_ids):
+            selected_faces = floor.faces[area_ids == area_id]
+            if not len(selected_faces):
+                continue
+            shift = floor_alignment_by_area.get((level_id, int(area_id)), 0.0)
+            minimum = min(minimum, float(floor.vertices[selected_faces, 1].min()) + shift)
+        if np.isfinite(minimum):
+            floor_surface_min_by_level[level_id] = minimum
+    if not floor_surface_min_by_level:
+        raise ValueError("No fitted floor surface is available to define the lower boundary")
+    lowest_floor_level = min(
+        floor_surface_min_by_level,
+        key=lambda level_id: (floor_surface_min_by_level[level_id], level_id),
+    )
+    lowest_floor_y = floor_surface_min_by_level[lowest_floor_level]
+    lowest_floor_path = levels_dir / f"floor_level_{lowest_floor_level:03d}_patterns_regularized.ply"
+    floor_boundary_supports = _floor_area_supports(
+        levels_dir, floor_levels[lowest_floor_level], lowest_floor_path,
+        floor_sources[lowest_floor_level],
+    )
+    for support in floor_boundary_supports:
+        area_id = int(support["area_id"])
+        shift = (0.0 if area_id in paired_areas.get(lowest_floor_level, set())
+                 else floor_alignment_by_area.get((lowest_floor_level, area_id), 0.0))
+        support["equation"][3] -= float(support["equation"][1]) * shift
+        support["vertical_translation_m"] = float(shift)
+
+    clipped_orphans = []
     for group_id, mesh in orphan_elements:
+        mesh, clip = _clip_surface_to_footprint(
+            mesh, wall_footprint, retain_degenerate_inside=True, allow_empty=True,
+        )
+        next(item for item in ceiling_adjustments if item["ceiling_group_id"] == group_id)[
+            "wall_footprint_clip"
+        ] = clip
+        if len(mesh.faces):
+            clipped_orphans.append((group_id, mesh))
+    for group_id, mesh in clipped_orphans:
         name = f"ceiling_group_{group_id:03d}"
         _append_ply_mesh(ply_vertices, ply_faces, ply_colors, ply_roles, ply_levels, mesh, 2)
         pieces = [(mesh, None, None)]
         element_exports.append((f"{name}.ply", pieces))
         counts["detached_ceilings"] += int(len(mesh.faces))
 
-    if not np.isfinite(assembled_floor_min_y):
-        raise ValueError("No finalized floor surface is available to bound the wall shell")
+    wall_floor_planes, wall_floor_selection = _wall_face_floor_planes(
+        wall_raw, floor_boundary_supports, float(lowest_floor_y),
+    )
     wall_final, wall_clip = _clip_wall_to_floor_and_ceiling(
-        wall_raw, assembled_floor_min_y, wall_ceiling_plane,
+        wall_raw, wall_floor_planes, wall_ceiling_plane,
     )
     wall_final, wall_gap_fill = _extend_wall_top_to_ceiling(
-        wall_final, assembled_floor_min_y, wall_ceiling_plane,
+        wall_final, float(lowest_floor_y), wall_ceiling_plane,
+        floor_supports=floor_boundary_supports,
     )
+    wall_clip["lowest_floor_level"] = int(lowest_floor_level)
+    wall_clip["lowest_floor_surface_y_m"] = float(lowest_floor_y)
+    wall_clip["floor_boundary_selection"] = wall_floor_selection
+    wall_clip["wall_footprint_source"] = wall_footprint_source
     wall_element_pieces = [(wall_final, None, None)]
     wall_vertices, wall_faces, wall_colors, wall_roles, wall_levels = [], [], [], [], []
     _append_ply_mesh(wall_vertices, wall_faces, wall_colors, wall_roles, wall_levels, wall_final, 0)
@@ -885,8 +1184,8 @@ def assemble_final_regularized_mesh(workspace: Path, output: Path | None = None,
         "unmatched_wall_boundaries": unmatched_wall_boundaries,
         "topology": topology,
         "topology_note": (
-            "Walls are clipped to the lowest finalized floor and fitted upper ceiling plane, then upper wall-perimeter edges below that plane are extended vertically to close gaps; the source wall shell supplies horizontal support contours. Standalone floor footprints use their own wall contour; paired slabs are clipped to the intersection of fitted wall contours across their vertical span. Only the floor nearest the source wall base is vertically aligned; no floor-wall connector is synthesized. "
-            "Finalized orphan ceilings retain their Step 4 height, contour, and relief. No separate roof cap is synthesized; the extended wall perimeter remains open at the ceiling. Topology is audited from the exact float32 coordinates written to the PLY; separate element boundaries may remain open, while each paired slab must be watertight."
+            "Walls are clipped against the lowest finalized floor level's fitted area planes where a plane supports the full projected wall face, with the actual lowest floor Y as fallback, and against the fitted plane of the ceiling patch reaching the highest actual Y. Upper wall-perimeter edges below that ceiling plane are extended to close gaps, while loops on the local floor boundary remain untouched. Standalone floor footprints use their own wall contour; paired slabs are clipped to the intersection of fitted wall contours across their vertical span. Only the floor level nearest the source wall base is vertically aligned; no floor-wall connector is synthesized. "
+            "Orphan ceilings retain their Step 4 height and relief inside the wall-base footprint; their projected overhang is clipped without changing paired slab closure. No separate roof cap is synthesized. Topology is audited from the exact float32 coordinates written to the PLY; separate element boundaries may remain open, while each paired slab must be watertight."
         ),
     }
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",

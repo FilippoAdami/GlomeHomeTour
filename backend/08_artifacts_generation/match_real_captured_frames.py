@@ -5,11 +5,11 @@ matching the optimal mesh-derived camera poses, and generate side-by-side compar
 
 Outputs:
   1. Matched real images:
-     <workspace>/06_mesh_elaboration/non_structural_frames_real/class_XXX_real.jpg
+     <workspace>/artifacts/real_frame_matches/real/class_XXX_real.jpg
   2. Side-by-side comparison images (Mesh vs. Best Real Video Frame):
-     <workspace>/06_mesh_elaboration/non_structural_frames_side_by_side/class_XXX_comparison.png
+     <workspace>/artifacts/real_frame_matches/comparisons/class_XXX_comparison.png
   3. Real frame matching manifest:
-     <workspace>/06_mesh_elaboration/non_structural_frames_real/non_structural_frames_real_manifest.json
+     <workspace>/artifacts/real_frame_matches/real/non_structural_frames_real_manifest.json
 """
 
 from __future__ import annotations
@@ -31,8 +31,6 @@ if str(_backend_dir) not in sys.path:
     sys.path.insert(0, str(_backend_dir))
 if str(_backend_dir / "03_FastGS_DNSplatter") not in sys.path:
     sys.path.insert(0, str(_backend_dir / "03_FastGS_DNSplatter"))
-if str(_backend_dir / "06_mesh_elaboration") not in sys.path:
-    sys.path.insert(0, str(_backend_dir / "06_mesh_elaboration"))
 
 from Utilities.pipeline_paths import bootstrap
 bootstrap()
@@ -169,8 +167,9 @@ def run_real_frame_matching(
     if manifest_path is None:
         manifest_path = (
             workspace
-            / "06_mesh_elaboration"
-            / "non_structural_frames"
+            / "segmentation"
+            / "non_structural_category_frames"
+            / "mesh"
             / "non_structural_frames_manifest.json"
         )
 
@@ -185,11 +184,11 @@ def run_real_frame_matching(
         raise ValueError(f"Manifest at {manifest_path} contains 0 extracted classes.")
 
     if output_real_dir is None:
-        output_real_dir = workspace / "06_mesh_elaboration" / "non_structural_frames_real"
+        output_real_dir = workspace / "artifacts" / "real_frame_matches" / "real"
     output_real_dir.mkdir(parents=True, exist_ok=True)
 
     if output_sbs_dir is None:
-        output_sbs_dir = workspace / "06_mesh_elaboration" / "non_structural_frames_side_by_side"
+        output_sbs_dir = workspace / "artifacts" / "real_frame_matches" / "comparisons"
     output_sbs_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading real video cameras from the active COLMAP pose set...")
@@ -286,8 +285,8 @@ def main():
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path("backend/current_scene"),
-        help="Workspace directory containing sparse/0 and 06_mesh_elaboration.",
+        default=_backend_dir / "current_scene/scan_0",
+        help="Scan directory containing sparse/0, segmentation/, and mesh.ply.",
     )
     parser.add_argument(
         "--manifest",

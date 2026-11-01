@@ -27,10 +27,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "04_3DGS_to_mesh"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fill_mesh_holes import export_ply_with_face_attributes, read_ply_face_flags
 from clean_floor_scene_slices import _elongated_fill_faces
+from fit_floors_ceilings_planes import fit_robust_plane
+from planar_outlier_filter import FIT_DISTANCE_M as CEILING_FRAGMENT_PLANE_DISTANCE_M
+from planar_outlier_filter import MIN_SUPPORT_FRACTION as CEILING_FRAGMENT_MIN_SUPPORT_FRACTION
 
 ROLE_NORMAL_Y_MIN = 0.5
 COPLANAR_BLOB_DISTANCE_M = 0.03
 COPLANAR_BLOB_NORMAL_DEG = 25.0
+FIXED_CATEGORY_COUNT = 28
 
 
 def component_face_indices(triangle_clusters: np.ndarray, num_components: int) -> List[np.ndarray]:
@@ -121,6 +125,129 @@ def _component_plane_support_fraction(
         & (normal_alignment >= np.cos(np.deg2rad(COPLANAR_BLOB_NORMAL_DEG)))
     )
     return float(supported.mean())
+
+
+def _recover_fragmented_ceiling_groups(
+    vertices: np.ndarray,
+    triangles: np.ndarray,
+    component_faces: list[np.ndarray],
+    component_areas: np.ndarray,
+    component_ids: list[int],
+    minimum_area: float,
+    maximum_gap: float,
+    highest_major_y: float,
+) -> list[dict[str, Any]]:
+    """Keep distant ceiling fragments only when they form a nearby, supported upper plane."""
+    records = []
+    for component_id in component_ids:
+        faces = triangles[component_faces[component_id]]
+        corners = vertices[faces]
+        cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        double_area = np.linalg.norm(cross, axis=1)
+        valid = double_area > 1e-12
+        if not valid.any():
+            continue
+        centers = corners[valid].mean(axis=1)
+        weights = double_area[valid]
+        normals = cross[valid] / weights[:, None]
+        normals *= np.where(normals[:, 1] < 0.0, -1.0, 1.0)[:, None]
+        normal = np.average(normals, axis=0, weights=weights)
+        normal_length = float(np.linalg.norm(normal))
+        if normal_length <= 1e-10 or abs(normal[1]) <= 1e-8:
+            continue
+        normal /= normal_length
+        center = np.average(centers, axis=0, weights=weights)
+        points = vertices[np.unique(faces)]
+        records.append({
+            "component_id": component_id,
+            "faces": faces,
+            "area": float(component_areas[component_id]),
+            "normal": normal,
+            "offset": -float(normal @ center),
+            "center": center,
+            "bounds_xz": (points[:, [0, 2]].min(axis=0), points[:, [0, 2]].max(axis=0)),
+        })
+
+    parents = list(range(len(records)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def join(first: int, second: int) -> None:
+        first_root, second_root = find(first), find(second)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    normal_cosine = float(np.cos(np.deg2rad(COPLANAR_BLOB_NORMAL_DEG)))
+    for first in range(len(records)):
+        a = records[first]
+        for second in range(first + 1, len(records)):
+            b = records[second]
+            if float(a["normal"] @ b["normal"]) < normal_cosine:
+                continue
+            xz_gap = np.maximum(
+                0.0,
+                np.maximum(a["bounds_xz"][0] - b["bounds_xz"][1],
+                           b["bounds_xz"][0] - a["bounds_xz"][1]),
+            )
+            if float(np.linalg.norm(xz_gap)) > maximum_gap:
+                continue
+            midpoint_xz = (a["center"][[0, 2]] + b["center"][[0, 2]]) * 0.5
+            height_a = -(a["normal"][[0, 2]] @ midpoint_xz + a["offset"]) / a["normal"][1]
+            height_b = -(b["normal"][[0, 2]] @ midpoint_xz + b["offset"]) / b["normal"][1]
+            if abs(float(height_a - height_b)) <= CEILING_FRAGMENT_PLANE_DISTANCE_M:
+                join(first, second)
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for index, record in enumerate(records):
+        grouped.setdefault(find(index), []).append(record)
+
+    recovered = []
+    normal_cosine_30 = float(np.cos(np.deg2rad(30.0)))
+    for members in grouped.values():
+        area = sum(member["area"] for member in members)
+        if area < minimum_area:
+            continue
+        faces = np.concatenate([member["faces"] for member in members])
+        corners = vertices[faces]
+        cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 1])
+        double_area = np.linalg.norm(cross, axis=1)
+        valid = double_area > 1e-12
+        if not valid.any():
+            continue
+        centers = corners[valid].mean(axis=1)
+        weights = double_area[valid] * 0.5
+        normals = cross[valid] / double_area[valid, None]
+        try:
+            normal, offset, support = fit_robust_plane(
+                centers, weights, CEILING_FRAGMENT_PLANE_DISTANCE_M,
+                prefer_normal_up=True, face_normals=normals,
+            )
+        except ValueError:
+            continue
+        if support < CEILING_FRAGMENT_MIN_SUPPORT_FRACTION:
+            continue
+        supported = (
+            (np.abs(centers @ normal + offset) <= CEILING_FRAGMENT_PLANE_DISTANCE_M)
+            & (np.abs(normals @ normal) >= normal_cosine_30)
+        )
+        if not supported.any():
+            continue
+        supported_max_y = float(corners[valid][supported, :, 1].max())
+        if supported_max_y <= highest_major_y:
+            continue
+        recovered.append({
+            "component_ids": sorted(member["component_id"] for member in members),
+            "faces": faces,
+            "area_m2": float(area),
+            "plane_support_fraction": float(support),
+            "maximum_supported_y_m": supported_max_y,
+        })
+
+    return sorted(recovered, key=lambda item: (-item["maximum_supported_y_m"], -item["area_m2"]))
 
 
 def prior_owned_raw_meshes(manifest_path: Path) -> set[str]:
@@ -279,8 +406,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_door_window_associations(path: Path) -> dict[int, int]:
-    """Return recognized source image classes mapped to door (1) or window (2)."""
+def load_class_category_associations(path: Path) -> dict[int, int]:
+    """Return valid source class to fixed-category associations."""
     if not path.is_file():
         return {}
     data = json.loads(path.read_text())
@@ -292,12 +419,21 @@ def load_door_window_associations(path: Path) -> dict[int, int]:
         if not isinstance(pair, list) or len(pair) != 2:
             raise ValueError(f"Invalid association tuple in {path}: {pair!r}")
         source_class_id, text_class_id = map(int, pair)
-        if text_class_id not in {1, 2}:
-            continue
+        if source_class_id <= 0 or not 1 <= text_class_id <= FIXED_CATEGORY_COUNT:
+            raise ValueError(f"Invalid source/category IDs in {path}: {pair!r}")
         previous = result.setdefault(source_class_id, text_class_id)
         if previous != text_class_id:
-            raise ValueError(f"Source class {source_class_id} maps to both door and window in {path}")
+            raise ValueError(f"Source class {source_class_id} maps to multiple categories in {path}")
     return result
+
+
+def load_door_window_associations(path: Path) -> dict[int, int]:
+    """Return source classes mapped to door (1) or window (2)."""
+    return {
+        class_id: category_id
+        for class_id, category_id in load_class_category_associations(path).items()
+        if category_id in {1, 2}
+    }
 
 
 def load_associated_object_instances(
@@ -401,6 +537,9 @@ def merge_associated_instances(
         target_flags = read_ply_face_flags(target["path"], "is_hole_fill")
         if target_flags is None or len(target_flags) != len(target_triangles):
             target_flags = np.zeros(len(target_triangles), dtype=np.uint8)
+        target_categories = read_ply_face_flags(target["path"], "semantic_category_id")
+        if target_categories is None or len(target_categories) != len(target_triangles):
+            target_categories = np.zeros(len(target_triangles), dtype=np.uint8)
 
         vertices = np.vstack((target_vertices, source["vertices"]))
         source_face_ids, source_cleanup = _clean_role_triangles(
@@ -412,9 +551,16 @@ def merge_associated_instances(
                                source["triangles"][source_face_ids] + len(target_vertices)))
         colors = np.vstack((target_colors, source["colors"]))
         flags = np.concatenate((target_flags, source["hole_fill_flags"][source_face_ids]))
+        categories = np.concatenate((
+            target_categories,
+            np.full(len(source_face_ids), source["text_class_id"], dtype=np.uint8),
+        ))
         if not export_colored_ply(
             target["path"], vertices, triangles, colors,
-            face_attributes={"is_hole_fill": ("uchar", flags)},
+            face_attributes={
+                "is_hole_fill": ("uchar", flags),
+                "semantic_category_id": ("uchar", categories),
+            },
         ):
             raise OSError(f"Failed to merge associated instance into {target['path']}")
 
@@ -532,6 +678,9 @@ def main() -> int:
             structural_classes_by_role["column"].append(cid)
         elif "ramp" in role:
             structural_classes_by_role["ramp"].append(cid)
+    structural_class_ids = {
+        cid for class_ids in structural_classes_by_role.values() for cid in class_ids
+    }
 
     associations_path = getattr(args, "associations_json", None)
     segmentation_dir = getattr(args, "segmentation_output", None)
@@ -546,13 +695,20 @@ def main() -> int:
         if not associations_path.is_file():
             associations_path = args.mesh_path.parent / "non_structural_similarity" / "valid_class_associations.json"
     try:
-        door_window_associations = load_door_window_associations(associations_path)
+        class_category_associations = load_class_category_associations(associations_path)
+        door_window_associations = {
+            cid: category_id for cid, category_id in class_category_associations.items()
+            if category_id in {1, 2} and cid not in structural_class_ids
+        }
         associated_instances = load_associated_object_instances(door_window_associations, segmentation_dir)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"Error: Could not load associated door/window instances: {exc}")
         return 1
     if associated_instances:
         print(f"\nLoaded {len(associated_instances)} associated door/window instances from {associations_path}")
+    semantic_category_by_triangle = np.zeros(len(labels), dtype=np.uint8)
+    for source_class_id, category_id in class_category_associations.items():
+        semantic_category_by_triangle[labels == source_class_id] = category_id
 
     print("\nIdentified structural classes:")
     for role, cids in structural_classes_by_role.items():
@@ -577,6 +733,10 @@ def main() -> int:
         },
         "roles": {},
         "instances": [],
+        "source_class_categories": {
+            str(class_id): int(category_id)
+            for class_id, category_id in sorted(class_category_associations.items())
+        },
     }
 
     for role, cids in structural_classes_by_role.items():
@@ -658,6 +818,7 @@ def main() -> int:
         discarded_small_tris = 0
         discarded_non_coplanar_count = 0
         discarded_non_coplanar_tris = 0
+        fragmented_ceiling_candidates: dict[int, tuple[str, int]] = {}
 
         thresh = args.merge_dist_thresh
         if role == "ceiling":
@@ -676,17 +837,52 @@ def main() -> int:
                     role_vertices, s_faces, big_plane_surfaces[best_big_idx], thresh
                 )
                 if support_fraction < 0.10:
-                    discarded_non_coplanar_count += 1
-                    discarded_non_coplanar_tris += len(s_orig_tris)
-                    discarded_non_coplanar_count_per_big[best_big_idx] += 1
-                    discarded_non_coplanar_tris_per_big[best_big_idx] += len(s_orig_tris)
+                    if role == "ceiling":
+                        fragmented_ceiling_candidates[s_idx] = ("non_coplanar", best_big_idx)
+                    else:
+                        discarded_non_coplanar_count += 1
+                        discarded_non_coplanar_tris += len(s_orig_tris)
+                        discarded_non_coplanar_count_per_big[best_big_idx] += 1
+                        discarded_non_coplanar_tris_per_big[best_big_idx] += len(s_orig_tris)
                     continue
                 assigned_triangles_per_big[best_big_idx].extend(s_orig_tris)
                 merged_small_count_per_big[best_big_idx] += 1
                 merged_small_tris_per_big[best_big_idx] += len(s_orig_tris)
             else:
-                discarded_small_count += 1
-                discarded_small_tris += len(s_orig_tris)
+                if role == "ceiling":
+                    fragmented_ceiling_candidates[s_idx] = ("far", best_big_idx)
+                else:
+                    discarded_small_count += 1
+                    discarded_small_tris += len(s_orig_tris)
+
+        recovered_ceiling_groups = []
+        recovered_ceiling_components = set()
+        if fragmented_ceiling_candidates:
+            highest_major_y = max(
+                float(role_vertices[np.unique(remapped_triangles[component_faces[index]])][:, 1].max())
+                for index in big_indices
+            )
+            recovered_ceiling_groups = _recover_fragmented_ceiling_groups(
+                role_vertices, remapped_triangles, component_faces, comp_areas,
+                sorted(fragmented_ceiling_candidates), min_area, thresh, highest_major_y,
+            )
+            recovered_ceiling_components = {
+                component_id
+                for group in recovered_ceiling_groups
+                for component_id in group["component_ids"]
+            }
+            for component_id, (reason, best_big_idx) in fragmented_ceiling_candidates.items():
+                if component_id in recovered_ceiling_components:
+                    continue
+                component_triangle_count = len(component_faces[component_id])
+                if reason == "far":
+                    discarded_small_count += 1
+                    discarded_small_tris += component_triangle_count
+                else:
+                    discarded_non_coplanar_count += 1
+                    discarded_non_coplanar_tris += component_triangle_count
+                    discarded_non_coplanar_count_per_big[best_big_idx] += 1
+                    discarded_non_coplanar_tris_per_big[best_big_idx] += component_triangle_count
 
         print(f"  Small components resolution:")
         for i in range(len(big_indices)):
@@ -696,16 +892,39 @@ def main() -> int:
             f"    Discarded non-coplanar blobs: {discarded_non_coplanar_count} components "
             f"({discarded_non_coplanar_tris:,} tris)"
         )
+        for index, group in enumerate(recovered_ceiling_groups, start=len(big_indices)):
+            print(
+                f"    Recovered upper ceiling group {index}: "
+                f"{len(group['component_ids'])} components, "
+                f"{len(group['faces']):,} tris, {group['area_m2']:.2f} m², "
+                f"supported max Y={group['maximum_supported_y_m']:.2f} m "
+                f"({group['plane_support_fraction']:.0%} planar support)"
+            )
+
+        recovered_ceiling_metadata = {}
+        for group in recovered_ceiling_groups:
+            source_faces = np.sort(np.concatenate([
+                role_tri_indices[component_faces[component_id]]
+                for component_id in group["component_ids"]
+            ]))
+            instance_index = len(assigned_triangles_per_big)
+            assigned_triangles_per_big.append(source_faces.tolist())
+            merged_small_count_per_big.append(0)
+            merged_small_tris_per_big.append(0)
+            discarded_non_coplanar_count_per_big.append(0)
+            discarded_non_coplanar_tris_per_big.append(0)
+            recovered_ceiling_metadata[instance_index] = group
 
         filenames = []
-        for i in range(len(big_indices)):
+        for i in range(len(assigned_triangles_per_big)):
             filenames.append(instance_filename(role, i))
 
         role_instance_entries = []
-        for i, b_idx in enumerate(big_indices):
+        for i in range(len(assigned_triangles_per_big)):
             inst_tri_indices = np.array(assigned_triangles_per_big[i], dtype=np.int64)
             inst_triangles = triangles[inst_tri_indices]
             inst_flags = face_hole_fill_flags[inst_tri_indices]
+            inst_semantic_categories = semantic_category_by_triangle[inst_tri_indices]
 
             inst_unique_v_idx, inst_remapped_tri = np.unique(inst_triangles, return_inverse=True)
             inst_remapped_tri = inst_remapped_tri.reshape(inst_triangles.shape)
@@ -724,7 +943,10 @@ def main() -> int:
             print(f"  Exporting {out_file.name}: {len(inst_vertices):,} verts, {len(inst_triangles):,} tris (mean Y: {mean_y:.2f}m)...")
             if not export_colored_ply(
                 out_file, inst_vertices, inst_remapped_tri, inst_colors,
-                face_attributes={"is_hole_fill": ("uchar", inst_flags)}
+                face_attributes={
+                    "is_hole_fill": ("uchar", inst_flags),
+                    "semantic_category_id": ("uchar", inst_semantic_categories),
+                }
             ) or not out_file.is_file():
                 print(f"Error: Failed to export {out_file}")
                 staging.cleanup()
@@ -755,9 +977,16 @@ def main() -> int:
                 "non_coplanar_blob_components_removed": int(discarded_non_coplanar_count_per_big[i]),
                 "non_coplanar_blob_triangles_removed": int(discarded_non_coplanar_tris_per_big[i]),
             }
+            if i in recovered_ceiling_metadata:
+                recovered_group = recovered_ceiling_metadata[i]
+                inst_meta["recovered_fragmented_components"] = len(recovered_group["component_ids"])
+                inst_meta["recovery_plane_support_fraction"] = round(
+                    recovered_group["plane_support_fraction"], 4
+                )
             manifest["instances"].append(inst_meta)
             role_instance_entries.append(inst_meta)
 
+        recovered_groups = recovered_ceiling_groups if role == "ceiling" else []
         manifest["roles"][role] = {
             "input_cleanup": role_cleanup,
             "num_major_instances": len(big_indices),
@@ -767,6 +996,9 @@ def main() -> int:
             "discarded_small_triangles": discarded_small_tris,
             "discarded_non_coplanar_blob_components": discarded_non_coplanar_count,
             "discarded_non_coplanar_blob_triangles": discarded_non_coplanar_tris,
+            "recovered_fragmented_instances": len(recovered_groups),
+            "recovered_fragmented_components": sum(len(group["component_ids"]) for group in recovered_groups),
+            "recovered_fragmented_triangles": sum(len(group["faces"]) for group in recovered_groups),
             "instances": [e["instance_name"] for e in role_instance_entries],
         }
 

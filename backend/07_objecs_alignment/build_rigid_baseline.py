@@ -10,14 +10,18 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+from structural_surfaces import load_role_meshes
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SEGMENTATION = ROOT / "current_scene/05_semantic_segmentation/mesh_objects_step3/segmentation_output"
-DEFAULT_SHELL = ROOT / "current_scene/06_mesh_elaboration/per_level_collapse_candidate/all_structural_regularized.ply"
-DEFAULT_OUTPUT = ROOT / "current_scene/06_mesh_elaboration/new_step/outputs/segmentation_alignment"
+DEFAULT_SEGMENTATION = ROOT / "current_scene/scan_0/segmentation"
+DEFAULT_SHELL = ROOT / "current_scene/scan_0/mesh_elaboration/complete.ply"
+DEFAULT_OUTPUT = ROOT / "current_scene/scan_0/objects_alignment"
 FIT_ROLES = ("wall", "floor", "ceiling")
 STRUCTURAL_ROLES = {*FIT_ROLES, "stairs", "columns", "column", "ramps", "ramp"}
+MAX_GLOBAL_TRANSLATION_M = 0.05
+MAX_GLOBAL_ROTATION_DEG = 3.0
+MIN_GLOBAL_INLIER_FRACTION = 0.10
 
 
 def sha256(path):
@@ -44,8 +48,8 @@ def fit_rigid(source, target, weights, rotation=True):
 
 def robust_fit(source, target, weights, normals, allow_rotation, seed=19):
     """Robust point-to-plane translation; optional rigid fit uses deterministic RANSAC."""
-    original_count = len(source)
-    selected = np.arange(original_count)
+    full_source, full_target, full_normals = source, target, normals
+    selected = np.arange(len(source))
     if len(source) > 40_000:
         selected = np.linspace(0, len(source) - 1, 40_000, dtype=np.int64)
         source, target, weights, normals = source[selected], target[selected], weights[selected], normals[selected]
@@ -54,8 +58,7 @@ def robust_fit(source, target, weights, normals, allow_rotation, seed=19):
         if len(source) < 3:
             matrix = normals * np.sqrt(weights[:, None])
             translation = np.linalg.lstsq(matrix, displacement * np.sqrt(weights), rcond=None)[0]
-            inliers = np.ones(original_count, dtype=bool)
-            return np.eye(3), translation, inliers
+            return np.eye(3), translation, np.ones(len(full_source), dtype=bool)
         rng = np.random.default_rng(seed)
         inliers = np.ones(len(source), dtype=bool)
         best = np.zeros(len(source), dtype=bool)
@@ -81,9 +84,9 @@ def robust_fit(source, target, weights, normals, allow_rotation, seed=19):
             if not updated.any() or np.array_equal(updated, inliers):
                 break
             inliers = updated
-        result = np.zeros(original_count, dtype=bool)
-        result[selected[inliers]] = True
-        return np.eye(3), translation, result
+        full_displacement = np.einsum("ij,ij->i", full_normals, full_target - full_source)
+        full_residual = np.abs(full_normals @ translation - full_displacement)
+        return np.eye(3), translation, full_residual <= cutoff
     rng = np.random.default_rng(seed)
     sample_size = 3
     if len(source) < sample_size:
@@ -106,9 +109,8 @@ def robust_fit(source, target, weights, normals, allow_rotation, seed=19):
             break
         best = updated
     rotation, translation = fit_rigid(source[best], target[best], weights[best], allow_rotation)
-    inliers = np.zeros(original_count, dtype=bool)
-    inliers[selected[best]] = True
-    return rotation, translation, inliers
+    full_residual = np.linalg.norm(full_source @ rotation.T + translation - full_target, axis=1)
+    return rotation, translation, full_residual <= cutoff
 
 
 def mesh_scene(mesh):
@@ -141,6 +143,17 @@ def main():
         raise FileNotFoundError(f"Stage 05 instance folder is missing: checked {classes_dir} and {instances_plys_dir}; rerun 3D extraction first")
     raw_meta = json.loads(metadata_path.read_text())
     metadata = raw_meta.get("classes") or raw_meta.get("classifications") or {}
+    category_names = {}
+    category_path = package / "non_structural_similarity" / "valid_class_associations.json"
+    categories_path = package / "non_structural_similarity" / "categories.json"
+    if category_path.is_file() and categories_path.is_file():
+        categories = {int(item["id"]): str(item["name"])
+                      for item in json.loads(categories_path.read_text())}
+        associations = json.loads(category_path.read_text()).get("associations", [])
+        for class_id, category_id in associations:
+            if int(category_id) not in categories:
+                raise ValueError(f"Unknown category ID {category_id} in {category_path}")
+            category_names[int(class_id)] = categories[int(category_id)]
     role_meshes, object_meshes = {role: [] for role in FIT_ROLES}, []
     if classes_dir.is_dir():
         for class_dir in sorted(classes_dir.iterdir()):
@@ -148,7 +161,9 @@ def main():
                 continue
             class_id = int(class_dir.name.split("_")[1])
             info = metadata.get(str(class_id), {})
-            role = info.get("structural_role", "object")
+            role = info.get("structural_role")
+            if role is None:
+                raise ValueError(f"Missing structural_role for Stage 05 class {class_id} in {metadata_path}")
             if role not in STRUCTURAL_ROLES | {"object"}:
                 raise ValueError(f"Unsupported structural_role {role!r} in {class_dir}")
             instances = sorted(class_dir.glob("instance_*.ply"))
@@ -156,8 +171,9 @@ def main():
                 mesh = o3d.io.read_triangle_mesh(str(path))
                 if not len(mesh.triangles):
                     continue
-                item = {"class_id": class_id, "role": role, "path": path, "mesh": mesh}
-                if role in {"object", "columns", "column", "ramps", "ramp"}:
+                item = {"class_id": class_id, "role": role, "path": path, "mesh": mesh,
+                        "category": category_names.get(class_id)}
+                if role == "object":
                     object_meshes.append(item)
                 elif role in FIT_ROLES:
                     role_meshes[role].append(item)
@@ -170,14 +186,6 @@ def main():
                     mesh = o3d.io.read_triangle_mesh(str(path))
                     if len(mesh.triangles):
                         role_meshes[role_name].append({"class_id": 0, "role": role_name, "path": path, "mesh": mesh})
-        for folder_name in ["Columns", "Stairs", "Ramps"]:
-            s_dir = instances_plys_dir / "Structural" / folder_name
-            if s_dir.is_dir():
-                for path in sorted(s_dir.glob("instance_*.ply")):
-                    mesh = o3d.io.read_triangle_mesh(str(path))
-                    if len(mesh.triangles):
-                        cid = 6 if folder_name == "Columns" else 3 if folder_name == "Stairs" else 4
-                        object_meshes.append({"class_id": cid, "role": folder_name.lower(), "path": path, "mesh": mesh})
         ns_dir = instances_plys_dir / "Non-Structural"
         if ns_dir.is_dir():
             for c_dir in sorted(ns_dir.iterdir()):
@@ -190,30 +198,24 @@ def main():
                 for path in sorted(c_dir.glob("instance_*.ply")):
                     mesh = o3d.io.read_triangle_mesh(str(path))
                     if len(mesh.triangles):
-                        object_meshes.append({"class_id": cid, "role": "object", "path": path, "mesh": mesh})
+                        object_meshes.append({"class_id": cid, "role": "object", "path": path, "mesh": mesh,
+                                              "category": category_names.get(cid)})
 
     shell = o3d.io.read_triangle_mesh(str(args.shell))
-    shell.compute_triangle_normals()
-    shell_vertices, shell_faces = np.asarray(shell.vertices), np.asarray(shell.triangles)
-    shell_normals = np.asarray(shell.triangle_normals)
-    role_masks = {"wall": np.abs(shell_normals[:, 1]) < 0.65,
-                  "floor": shell_normals[:, 1] >= 0.65,
-                  "ceiling": shell_normals[:, 1] <= -0.65}
+    role_surfaces = load_role_meshes(shell, args.shell)
     role_scenes = {}
-    for role, mask in role_masks.items():
-        if not role_meshes[role]:
+    for role, items in role_meshes.items():
+        surface = role_surfaces[role]
+        if not items or not len(surface.triangles):
             continue
-        ids = np.flatnonzero(mask)
-        if not len(ids):
-            raise ValueError(f"Regularized shell has no target triangles for role {role}")
-        target = o3d.geometry.TriangleMesh()
-        used, inverse = np.unique(shell_faces[ids], return_inverse=True)
-        target.vertices = o3d.utility.Vector3dVector(shell_vertices[used])
-        target.triangles = o3d.utility.Vector3iVector(inverse.reshape(-1, 3))
-        role_scenes[role] = mesh_scene(target)
+        role_scenes[role] = mesh_scene(surface)
 
     sources, targets, weights, anchor_normals = [], [], [], []
+    roles_used_for_fit = set()
     for role, items in role_meshes.items():
+        scene = role_scenes.get(role)
+        if scene is None:
+            continue
         for item in items:
             mesh = item["mesh"]
             mesh.compute_triangle_normals()
@@ -224,7 +226,6 @@ def main():
             points = tri.mean(axis=1)
             areas = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
             normals = np.asarray(mesh.triangle_normals)[sampled]
-            scene = role_scenes[role]
             closest_parts, target_normals = [], []
             for start in range(0, len(points), 100_000):
                 result = scene.compute_closest_points(o3d.core.Tensor(points[start:start + 100_000].astype(np.float32)))
@@ -235,6 +236,7 @@ def main():
             normal_agreement = np.abs(np.einsum("ij,ij->i", normals, target_normals))
             valid = (np.isfinite(areas) & (areas > 0) & (distance <= 0.25) & (normal_agreement >= 0.5))
             if valid.any():
+                roles_used_for_fit.add(role)
                 sources.append(points[valid])
                 targets.append(closest[valid])
                 weights.append(areas[valid])
@@ -244,11 +246,22 @@ def main():
         raise ValueError("No wall/floor/ceiling instance faces matched the regularized shell")
     source, target, weight, normals = (np.concatenate(values) for values in
                                        (sources, targets, weights, anchor_normals))
-    rotation, translation, inliers = robust_fit(source, target, weight, normals, args.allow_rotation)
+    proposed_rotation, proposed_translation, inliers = robust_fit(source, target, weight, normals, args.allow_rotation)
     residual_before = np.linalg.norm(source - target, axis=1)
-    residual_after = np.linalg.norm(source @ rotation.T + translation - target, axis=1)
+    residual_after = np.linalg.norm(source @ proposed_rotation.T + proposed_translation - target, axis=1)
     plane_before = np.einsum("ij,ij->i", normals, source - target)
-    plane_after = np.einsum("ij,ij->i", normals, source @ rotation.T + translation - target)
+    plane_after = np.einsum("ij,ij->i", normals, source @ proposed_rotation.T + proposed_translation - target)
+    proposed_angle = np.rad2deg(np.arccos(np.clip((np.trace(proposed_rotation) - 1) / 2, -1.0, 1.0)))
+    rejection_reasons = []
+    if inliers.mean() < MIN_GLOBAL_INLIER_FRACTION:
+        rejection_reasons.append("low_full_anchor_inlier_fraction")
+    if np.linalg.norm(proposed_translation) > MAX_GLOBAL_TRANSLATION_M:
+        rejection_reasons.append("translation_exceeds_same_frame_tolerance")
+    if proposed_angle > MAX_GLOBAL_ROTATION_DEG:
+        rejection_reasons.append("rotation_exceeds_same_frame_tolerance")
+    transform_applied = not rejection_reasons
+    rotation = proposed_rotation if transform_applied else np.eye(3)
+    translation = proposed_translation if transform_applied else np.zeros(3)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     aligned_dir = args.output_dir / "rigid_baseline_instances"
@@ -265,6 +278,7 @@ def main():
             raise IOError(f"Could not write aligned instance {destination}")
         merged_objects += mesh
         manifest.append({"class_id": item["class_id"], "role": item["role"],
+                         "category": item.get("category"),
                          "source": str(item["path"]), "path": str(relative),
                          "triangles": len(mesh.triangles)})
     objects_path = args.output_dir / "rigid_baseline_objects.ply"
@@ -280,17 +294,28 @@ def main():
                          "regularized_shell": str(args.shell), "shell_sha256": sha256(args.shell)},
               "transform": {"rotation": rotation.tolist(), "translation_m": translation.tolist(),
                             "rotation_angle_deg": float(angle), "rotation_enabled": args.allow_rotation},
+              "proposed_transform": {"rotation": proposed_rotation.tolist(),
+                                     "translation_m": proposed_translation.tolist(),
+                                     "rotation_angle_deg": float(proposed_angle)},
+              "transform_decision": {"applied": transform_applied,
+                                     "rejection_reasons": rejection_reasons,
+                                     "limits": {"max_translation_m": MAX_GLOBAL_TRANSLATION_M,
+                                                "max_rotation_deg": MAX_GLOBAL_ROTATION_DEG,
+                                                "min_full_anchor_inlier_fraction": MIN_GLOBAL_INLIER_FRACTION}},
               "fit": {"method": "area-weighted robust point-to-plane translation" if not args.allow_rotation
                       else "deterministic area-weighted point-to-point RANSAC",
+                      "evaluation_transform": "proposed_transform",
                       "inlier_threshold_m": 0.08,
-                      "anchors": int(len(source)), "inliers": int(inliers.sum()),
+                      "anchors": int(len(source)), "fit_sample_count": min(len(source), 40_000),
+                      "inliers": int(inliers.sum()),
                       "rms_before_m": float(np.sqrt(np.average(plane_before**2, weights=weight))),
                       "rms_after_m": float(np.sqrt(np.average(plane_after[inliers]**2, weights=weight[inliers]))),
                       "point_distance_rms_after_m": float(np.sqrt(np.average(residual_after[inliers]**2, weights=weight[inliers]))),
                       "inlier_fraction": float(inliers.mean())},
-              "roles_used_for_fit": list(FIT_ROLES), "fit_structural_instance_meshes_omitted":
+              "roles_used_for_fit": [role for role in FIT_ROLES if role in roles_used_for_fit],
+              "structural_anchor_instances":
                   int(sum(len(items) for items in role_meshes.values())),
-              "stairs_omitted_because_shell_retains_them": sum(1 for d in classes_dir.glob("class_*_stairs/instance_*.ply")) if classes_dir.is_dir() else 0,
+              "non_object_structural_roles_excluded": sorted(STRUCTURAL_ROLES - set(FIT_ROLES)),
               "object_instances": manifest, "collision_status": "not evaluated",
               "outputs": {"objects": str(objects_path), "shell": str(args.output_dir / "rigid_baseline_shell.ply"),
                           "combined_scene": str(scene_path), "instances_dir": str(aligned_dir)},
@@ -304,7 +329,9 @@ def main():
                                   "contact_distance_m": groups["contact_distance_m"]}
     (args.output_dir / "rigid_baseline_report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"anchors": len(source), "inliers": int(inliers.sum()),
-                      "object_instances": len(manifest), "translation_m": translation.tolist(),
+                      "object_instances": len(manifest), "transform_applied": transform_applied,
+                      "proposed_translation_m": proposed_translation.tolist(),
+                      "translation_m": translation.tolist(),
                       "rotation_angle_deg": float(angle), "rms_after_m": report["fit"]["rms_after_m"],
                       "contact_pairs": groups["contact_pair_count"], "contact_groups": groups["group_count"],
                       "scene": str(scene_path)}, indent=2))

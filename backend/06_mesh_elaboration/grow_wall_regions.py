@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
+from plyfile import PlyData
 
 NORMAL_ANGLE_DEG = 35.0
 MAX_PLANE_DISTANCE = 0.15
@@ -343,11 +344,21 @@ def _region_color(region_id: int) -> np.ndarray:
     return np.asarray(colorsys.hsv_to_rgb(hue, saturation, brightness), dtype=np.float64)
 
 
+def _read_semantic_category_ids(path: Path, triangle_count: int) -> np.ndarray:
+    ply = PlyData.read(str(path), known_list_len={"face": {"vertex_indices": 3}})
+    if "face" not in ply or "semantic_category_id" not in ply["face"].data.dtype.names:
+        return np.zeros(triangle_count, dtype=np.uint8)
+    category_ids = np.asarray(ply["face"]["semantic_category_id"], dtype=np.uint8)
+    if category_ids.shape != (triangle_count,):
+        raise ValueError(f"Semantic category face data does not align with triangles in {path}")
+    return category_ids
+
+
 def _write_colored_regions(
     paths: list[Path], output_path: Path, labels_path: Path,
     seed_count: int, random_seed: int
 ) -> dict:
-    vertex_chunks, color_chunks, label_chunks, region_records = [], [], [], []
+    vertex_chunks, color_chunks, label_chunks, category_chunks, region_records = [], [], [], [], []
     total_triangles = degenerate_triangles = next_region_id = 0
     output_triangle_offset = 0
 
@@ -365,6 +376,7 @@ def _write_colored_regions(
         region_count = int(labels.max()) + 1
         labels = local_labels + next_region_id
         label_chunks.append(labels.astype(np.int32, copy=False))
+        category_chunks.append(_read_semantic_category_ids(path, len(triangles)))
         region_base = next_region_id
         next_region_id += region_count
         corners = vertices[triangles]
@@ -423,6 +435,9 @@ def _write_colored_regions(
     if not o3d.io.write_triangle_mesh(str(output_path), output_mesh, write_vertex_colors=True):
         raise OSError(f"Could not write colored region mesh: {output_path}")
     np.save(labels_path, np.concatenate(label_chunks))
+    category_path = labels_path.with_name("wall_regions_semantic_category_ids.npy")
+    category_ids = np.concatenate(category_chunks)
+    np.save(category_path, category_ids)
     return {
         "algorithm": "area_seeded_multi_source_region_growing_v7",
         "seed_count_per_batch": seed_count,
@@ -441,6 +456,8 @@ def _write_colored_regions(
         "regions": region_records,
         "colored_mesh": str(output_path),
         "triangle_labels_file": labels_path.name,
+        "semantic_category_ids_file": category_path.name,
+        "semantic_category_triangle_count": int(np.count_nonzero(category_ids)),
     }
 
 
