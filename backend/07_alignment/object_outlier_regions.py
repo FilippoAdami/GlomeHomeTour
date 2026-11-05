@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -361,11 +362,13 @@ def _signed_outside_distances_by_object(
 
 
 def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.ndarray],
-                             output_dir: Path) -> tuple[Path, dict[str, int]]:
+                             output_dir: Path) -> tuple[Path, dict[str, Any]]:
     """Apply the locked two-cutoff rule and write the single annotated object PLY."""
+    timings: dict[str, float] = {}
     source_path = output_dir / "aligned_objects.ply"
     if not source_path.is_file():
         raise FileNotFoundError(f"Missing final aligned object mesh: {source_path}")
+    stage_started = time.perf_counter()
     source = plyfile.PlyData.read(str(source_path))
     source_vertices = source["vertex"].data
     source_faces = np.stack([np.asarray(face, dtype=np.int64) for face in source["face"].data["vertex_indices"]])
@@ -376,7 +379,9 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
     selected_regions = []
     visible_group_count = 0
     surfaces = {}
+    timings["load_combined_objects"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     for scan_id, scan in sorted(scans.items()):
         object_paths = sorted((output_dir / "objects" / scan_id).rglob("*.ply"))
         if not object_paths:
@@ -433,10 +438,12 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
                     "triangle_areas": triangle_areas[component],
                     "surface": _region_surface(region_triangles),
                 })
+    timings["scan_surfaces_distances_and_patch_selection"] = time.perf_counter() - stage_started
 
     if offset != len(source_faces) or vertex_offset != len(source_vertices):
         raise ValueError(f"Processed {offset}/{len(source_faces)} faces and {vertex_offset}/{len(source_vertices)} vertices")
 
+    stage_started = time.perf_counter()
     groups = _visible_groups(selected_regions)
     visible_group_count = len(groups)
     for group in groups:
@@ -448,7 +455,9 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
         if keep:
             for region in group:
                 selected_faces[region["face_ids"]] = True
+    timings["group_and_filter_regions"] = time.perf_counter() - stage_started
 
+    stage_started = time.perf_counter()
     colored_vertices, output_faces = _split_red_vertices(source_vertices, source_faces, selected_faces)
     output_path = output_dir / "aligned_objects_final_red.ply"
     staged_path = _write_marked_ply(source, colored_vertices, output_faces, selected_faces, output_path)
@@ -472,10 +481,12 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
         staged_path.replace(output_path)
     finally:
         staged_path.unlink(missing_ok=True)
+    timings["write_and_validate_red_mesh"] = time.perf_counter() - stage_started
     summary = {
         "first_cutoff_regions": len(selected_regions),
         "contiguous_groups": visible_group_count,
         "red_regions": sum(1 for group in groups if selected_faces[np.concatenate([r["face_ids"] for r in group])].any()),
         "red_triangles": int(selected_faces.sum()),
+        "timings_seconds": timings,
     }
     return output_path, summary

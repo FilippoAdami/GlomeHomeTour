@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -45,6 +46,7 @@ class MultiAssetSynchronizer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.gaussian_overlap_scenes: Dict[str, Any] = {}
         self.transformed_gaussian_splat_paths: Dict[str, Dict[Path, Path]] = {}
+        self.timings_seconds: Dict[str, float] = {}
 
     def synchronize_and_export_all(
         self,
@@ -53,6 +55,17 @@ class MultiAssetSynchronizer:
         report_data: Dict[str, Any],
     ) -> Dict[str, Path]:
         """Assembles and exports all 3D deliverables and manifest files."""
+        self.timings_seconds = {}
+
+        def measure(name: str, operation):
+            started = time.perf_counter()
+            try:
+                return operation()
+            finally:
+                elapsed = time.perf_counter() - started
+                self.timings_seconds[name] = elapsed
+                logger.info("Timing %-48s %.2f s", f"step2.{name}", elapsed)
+
         (self.output_dir / "aligned_sealed_meshes_with_doors_red.ply").unlink(missing_ok=True)
         (self.output_dir / "aligned_scene_with_objects.ply").unlink(missing_ok=True)
         scan_keys = sorted(list(scans.keys()))
@@ -63,21 +76,26 @@ class MultiAssetSynchronizer:
         # 1. Aligned Regularized Meshes (Phase 06)
         logger.info("[Export 1/4] Assembling aligned regularized meshes (Phase 06)...")
         p_reg = self.output_dir / "aligned_regularized_meshes.ply"
-        self._assemble_regularized_meshes(scans, transforms, p_reg)
+        measure("assemble_regularized_meshes", lambda: self._assemble_regularized_meshes(scans, transforms, p_reg))
         exported_paths["aligned_regularized_meshes"] = p_reg
 
         # 2. Aligned Sealed Meshes (Phase 04)
         logger.info("[Export 2/4] Assembling aligned sealed meshes (Phase 04)...")
         p_sealed = self.output_dir / "aligned_sealed_meshes.ply"
-        aligned_sealed_meshes = self._assemble_sealed_meshes(scans, transforms, p_sealed)
-        self.gaussian_overlap_scenes = build_mesh_occupancy_scenes(aligned_sealed_meshes)
+        aligned_sealed_meshes = measure(
+            "assemble_sealed_meshes", lambda: self._assemble_sealed_meshes(scans, transforms, p_sealed)
+        )
+        self.gaussian_overlap_scenes = measure(
+            "build_mesh_occupancy_scenes", lambda: build_mesh_occupancy_scenes(aligned_sealed_meshes)
+        )
         exported_paths["aligned_sealed_meshes"] = p_sealed
 
         # 3. Aligned 3D Gaussian Splats (Phase 04)
         logger.info("[Export 3/4] Assembling aligned 3D Gaussian Splats with quaternion rotations...")
         p_gs = self.output_dir / "aligned_sealed_gaussians.ply"
-        self.transformed_gaussian_splat_paths = self._assemble_gaussian_splats(
-            scans, transforms, p_gs, self.gaussian_overlap_scenes
+        self.transformed_gaussian_splat_paths = measure(
+            "assemble_gaussian_splats",
+            lambda: self._assemble_gaussian_splats(scans, transforms, p_gs, self.gaussian_overlap_scenes),
         )
         exported_paths["aligned_sealed_gaussians"] = p_gs
 
@@ -91,7 +109,10 @@ class MultiAssetSynchronizer:
         p_objects_dir = self.output_dir / "objects"
         p_combined_objects = self.output_dir / "aligned_objects.ply"
         p_obj_manifest = stats_dir / "aligned_objects_manifest.json"
-        self._assemble_objects(scans, transforms, p_objects_dir, p_combined_objects, p_obj_manifest)
+        measure(
+            "assemble_object_instances",
+            lambda: self._assemble_objects(scans, transforms, p_objects_dir, p_combined_objects, p_obj_manifest),
+        )
         exported_paths["aligned_objects"] = p_combined_objects
         exported_paths["aligned_objects_manifest"] = p_obj_manifest
         exported_paths["objects_dir"] = p_objects_dir
@@ -109,22 +130,27 @@ class MultiAssetSynchronizer:
                 for sname in scan_keys
             },
         }
-        with open(p_tf, "w") as f:
-            json.dump(tf_manifest, f, indent=2)
+        def write_manifests():
+            with open(p_tf, "w") as f:
+                json.dump(tf_manifest, f, indent=2)
+
+            p_rep = stats_dir / "multi_room_alignment_report.json"
+            full_report = {
+                "anchor_scan": anchor_scan,
+                "scan_count": len(scans),
+                "scans": scan_keys,
+                "alignment_metrics": report_data,
+                "transforms": {sname: transforms[sname].tolist() for sname in scan_keys},
+            }
+            with open(p_rep, "w") as f:
+                json.dump(full_report, f, indent=2)
+            return p_rep
+
+        p_rep = measure("write_alignment_manifests", write_manifests)
         logger.info(f"Saved transform manifest to: {p_tf}")
         exported_paths["aligned_scans_transforms"] = p_tf
 
         # 7. Structured Multi-Room Alignment Report in stats/
-        p_rep = stats_dir / "multi_room_alignment_report.json"
-        full_report = {
-            "anchor_scan": anchor_scan,
-            "scan_count": len(scans),
-            "scans": scan_keys,
-            "alignment_metrics": report_data,
-            "transforms": {sname: transforms[sname].tolist() for sname in scan_keys},
-        }
-        with open(p_rep, "w") as f:
-            json.dump(full_report, f, indent=2)
         logger.info(f"Saved alignment report to: {p_rep}")
         exported_paths["multi_room_alignment_report"] = p_rep
 

@@ -6,13 +6,13 @@ The pipeline runs in one command:
 1. **Scan alignment**: Uses ARCore tracked paths, trajectory-guided door matching, portal clearance, and coplanar regularized planes to align scans.
 2. **Asset synchronization**: Applies each scan's final rigid transform to its source object instances, sealed and regularized meshes, Gaussian splats, and scan assets.
 3. **Object contour fitting**: Detects filtered sealed-mesh contact contours, translates touching instance groups into their regularized shells, then pulls them toward nearby planes and applies per-scan wall median regularization. The plane pull allows up to 5% of unique red-contour vertex positions outside, forbids any object vertices below the lowest floor, and has a 15 cm cap per axis. The median pull has a separate 15 cm per-plane cap.
-4. **Region selection and replacement**: A triangle is a candidate when any vertex is more than 1 mm beyond its scan's exterior regularized shell. Edge-connected patches pass the first cutoff only when area is greater than 0.5 m² and maximum depth is greater than 5 cm. Adjacent patches within 1 mm are grouped. A group is kept when its seam score—attachment boundary length divided by the square root of group area—is below 3.0, or its rectangle similarity—projected union area divided by the minimum rotated rectangle area on the dominant nearest regularized plane—is above 0.7. Each kept group's projected contour produces a size-regularized axis-aligned box retaining at least 95% of its area and boundary. It is a window when Gemma 2 associated its instance with window or the box bottom is over 1.5 m above its closest same-scan floor; otherwise it is a mirror. The retained faces are removed from individual object PLYs. The associated sealed mesh is cut at the box and receives a silver panel; mirror panels sit 1 cm inside the support plane. Separate silver panel PLYs are saved under `objects/<scan>/panel_instances/`, and are included in `aligned_objects.ply`, each scan's sealed `mesh.ply`, and `aligned_sealed_meshes.ply`. Regularized meshes are not modified.
+4. **Region selection and replacement**: A triangle is a candidate when any vertex is more than 1 mm beyond its scan's exterior regularized shell. Edge-connected patches pass the first cutoff only when area is greater than 0.5 m² and maximum depth is greater than 5 cm. Adjacent patches within 1 mm are grouped. A group is kept when its seam score—attachment boundary length divided by the square root of group area—is below 3.0, or its rectangle similarity—projected union area divided by the minimum rotated rectangle area on the dominant nearest regularized plane—is above 0.7. Each kept group's projected contour produces a size-regularized axis-aligned box retaining at least 95% of its area and boundary. It is a window when Gemma 2 associated its instance with window or the box bottom is over 1.5 m above its closest same-scan floor; otherwise it is a mirror. The retained faces are removed from individual object PLYs and the exact corresponding Phase 05 source faces are removed from that scan's sealed mesh. Object-frame panels remain with `aligned_objects.ply`; sealed-frame panels reverse each contributing instance's post-scan placement translation while preserving global scan alignment, then move only as needed to fit within the sealed mesh bounds and stay above the selected same-scan floor plane. If those constraints cannot both be met, replacement fails instead of publishing a misplaced panel. For a region with one placement group, the sealed panel reuses the region's already-optimized box; multiple placement groups get their own boxes. Panels are added to each scan's sealed `mesh.ply`, `aligned_sealed_meshes.ply`, and GLB. Mirror panels sit 1 cm inside the support plane. Object-frame panels are saved under `objects/<scan>/panel_instances/`; sealed-frame panels are saved under `scans/<scan>/panel_instances/`. Regularized meshes are not modified.
 
-Each of the five macro steps logs its elapsed time when it finishes; the runner logs total Phase 07 time at completion.
+Each of the five macro steps logs its elapsed wall time, and the runner records named substep timings. After a successful run, total, macro-step, and substep timings are written to `stats/phase07_timing_report.json`.
 
 Perimeter wall direction is inferred with 2 cm probes against the regularized floor footprint; patch grouping estimates surface gaps from vertices, edge midpoints, and face centers.
 
-Contour colors, the red-marked object PLY, classification images, and earlier contour/PBR experiment folders are temporary working data. The runner removes them after the final replacement files are published. The replacement manifest at `stats/phase07_region_replacements.json` records the region decisions and bbox/cut statistics. Regularized meshes remain exactly as synchronized before this step.
+Contour colors, the red-marked object PLY, classification images, and earlier contour/PBR experiment folders are temporary working data. The runner removes them after the final replacement files are published. The replacement manifest at `stats/phase07_region_replacements.json` records region decisions, exact source-face removals, and sealed-panel placement transforms. Regularized meshes remain exactly as synchronized before this step.
 
 ---
 
@@ -61,15 +61,17 @@ All 3D assets, scan models, and statistical manifests are exported inside `<work
 
 | Asset Path | Description |
 |---|---|
-| `aligned_objects.ply` | Final objects with selected outlier faces removed and silver panels included. |
+| `aligned_objects.ply` | Final objects with selected outlier faces removed and object-frame silver panels included. |
 | `objects/<scan_name>/<class_name>/instance_*.ply` | Final object instances with selected outlier faces removed. |
-| `objects/<scan_name>/panel_instances/*.ply` | Individual silver panels, one PLY per selected region. |
+| `objects/<scan_name>/panel_instances/*.ply` | Object-frame silver panels included in `aligned_objects.ply`. |
 | `aligned_regularized_meshes.ply` | Merged Phase 06 regularized meshes in global space. |
-| `aligned_sealed_meshes.ply` | Merged Phase 04 sealed meshes with replacement panels. |
-| `aligned_sealed_meshes.glb` | GLB version of the final aligned sealed meshes, including silver panels. |
+| `aligned_sealed_meshes.ply` | Merged Phase 04 sealed meshes with the exact selected source faces removed and sealed-frame replacement panels. |
+| `aligned_sealed_meshes.glb` | GLB version of the final aligned sealed meshes, including sealed-frame replacement panels. |
 | `aligned_sealed_gaussians.ply` | Merged Phase 04 Gaussian splats; centers inside another scan's aligned sealed mesh are removed. |
-| `stats/phase07_region_replacements.json` | Per-region classification, bbox coverage, and sealed-mesh cut statistics. |
-| `scans/<scan_name>/mesh.ply` | That scan's aligned sealed mesh with replacement panels. |
+| `stats/phase07_region_replacements.json` | Per-region classification, exact source-face removal counts, and sealed-panel placement transforms. |
+| `stats/phase07_timing_report.json` | Phase 07 macro-step and substep wall times from the most recent successful run. |
+| `scans/<scan_name>/mesh.ply` | That scan's aligned sealed mesh with corresponding source faces removed and sealed-frame replacement panels. |
+| `scans/<scan_name>/panel_instances/*.ply` | Sealed-frame panels with each contributing object's placement translation reversed. |
 | `scans/<scan_name>/mesh_elaboration/complete.ply` and `elements/*.ply` | That scan's aligned regularized mesh and elements. |
 | `scans/<scan_name>/gaussian_splat/*.ply` | That scan's aligned Gaussian splats. |
 | `scans/<scan_name>/trajectory.csv`, `transforms.json`, `sparse/0/*` | Aligned ARCore trajectory, NeRF/3DGS poses, and COLMAP reconstruction/poses. |
