@@ -1,0 +1,80 @@
+# Phase 07 — Unified Alignment (Objects & Multi-Room Scans)
+
+Phase 07 registers the scans, applies those transforms to each scan's objects and assets, then fits object contact contours against the aligned regularized shells.
+
+The pipeline runs in one command:
+1. **Scan alignment**: Uses ARCore tracked paths, trajectory-guided door matching, portal clearance, and coplanar regularized planes to align scans.
+2. **Asset synchronization**: Applies each scan's final rigid transform to its source object instances, sealed and regularized meshes, Gaussian splats, and scan assets.
+3. **Object contour fitting**: Detects filtered sealed-mesh contact contours, translates touching instance groups into their regularized shells, then pulls them toward nearby planes and applies per-scan wall median regularization. The plane pull allows up to 5% of unique red-contour vertex positions outside, forbids any object vertices below the lowest floor, and has a 15 cm cap per axis. The median pull has a separate 15 cm per-plane cap.
+4. **Region selection and replacement**: A triangle is a candidate when any vertex is more than 1 mm beyond its scan's exterior regularized shell. Edge-connected patches pass the first cutoff only when area is greater than 0.5 m² and maximum depth is greater than 5 cm. Adjacent patches within 1 mm are grouped. A group is kept when its seam score—attachment boundary length divided by the square root of group area—is below 3.0, or its rectangle similarity—projected union area divided by the minimum rotated rectangle area on the dominant nearest regularized plane—is above 0.7. Each kept group's projected contour produces a size-regularized axis-aligned box retaining at least 95% of its area and boundary. It is a window when Gemma 2 associated its instance with window or the box bottom is over 1.5 m above its closest same-scan floor; otherwise it is a mirror. The retained faces are removed from individual object PLYs. The associated sealed mesh is cut at the box and receives a silver panel; mirror panels sit 1 cm inside the support plane. Separate silver panel PLYs are saved under `objects/<scan>/panel_instances/`, and are included in `aligned_objects.ply`, each scan's sealed `mesh.ply`, and `aligned_sealed_meshes.ply`. Regularized meshes are not modified.
+
+Each of the five macro steps logs its elapsed time when it finishes; the runner logs total Phase 07 time at completion.
+
+Perimeter wall direction is inferred with 2 cm probes against the regularized floor footprint; patch grouping estimates surface gaps from vertices, edge midpoints, and face centers.
+
+Contour colors, the red-marked object PLY, classification images, and earlier contour/PBR experiment folders are temporary working data. The runner removes them after the final replacement files are published. The replacement manifest at `stats/phase07_region_replacements.json` records the region decisions and bbox/cut statistics. Regularized meshes remain exactly as synchronized before this step.
+
+---
+
+## Directory Structure
+
+```text
+backend/07_alignment/
+├── step_alignment.py                 # Unified Production Orchestrator & CLI
+├── step_objects_alignment.py         # Standalone legacy per-scan alignment utility
+├── temporary_alternative_pipeline/  # Production contour detection and fitting stages
+├── step_scan_alignment.py           # Multi-room scan alignment runner
+├── scan_loader.py                   # Dynamic dataset ingestion for arbitrary scan sets
+├── arcore_trajectory_bridge.py      # ARCore transit tracking & Manhattan rotation estimation
+├── portal_detector.py               # Trajectory ray-piercing & composite door decomposition
+├── door_alignment_engine.py         # Door pairing & coaxial portal registration
+├── coplanar_planes_engine.py        # All-plane coplanar optimization (floors & facades)
+├── multi_asset_synchronizer.py      # Step 3: Global SE(3) transformation & deliverables exporter
+├── object_outlier_regions.py        # Final red outlier detection, cutoffs, and face marker
+├── step_replace_red_regions_with_panels.py # Final classification and mesh replacement
+└── README.md
+```
+
+---
+
+## Running the Unified Pipeline
+
+From the repository root:
+
+```bash
+backend/.venv/bin/python backend/07_alignment/step_alignment.py --workspace backend/current_scene
+```
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--workspace` | `backend/current_scene` | Path to workspace containing `scan_*` directories (or single scan). |
+| `--output-dir` | `<workspace>/multi_room_alignment` | Output directory for synchronized property models and deliverables. |
+| `--skip-scans` | `False` | Skip multi-room scan alignment and reuse existing transforms. |
+
+---
+
+## Deliverables & Outputs
+
+All 3D assets, scan models, and statistical manifests are exported inside `<workspace>/multi_room_alignment/`:
+
+| Asset Path | Description |
+|---|---|
+| `aligned_objects.ply` | Final objects with selected outlier faces removed and silver panels included. |
+| `objects/<scan_name>/<class_name>/instance_*.ply` | Final object instances with selected outlier faces removed. |
+| `objects/<scan_name>/panel_instances/*.ply` | Individual silver panels, one PLY per selected region. |
+| `aligned_regularized_meshes.ply` | Merged Phase 06 regularized meshes in global space. |
+| `aligned_sealed_meshes.ply` | Merged Phase 04 sealed meshes with replacement panels. |
+| `aligned_sealed_meshes.glb` | GLB version of the final aligned sealed meshes, including silver panels. |
+| `aligned_sealed_gaussians.ply` | Merged Phase 04 Gaussian splats; centers inside another scan's aligned sealed mesh are removed. |
+| `stats/phase07_region_replacements.json` | Per-region classification, bbox coverage, and sealed-mesh cut statistics. |
+| `scans/<scan_name>/mesh.ply` | That scan's aligned sealed mesh with replacement panels. |
+| `scans/<scan_name>/mesh_elaboration/complete.ply` and `elements/*.ply` | That scan's aligned regularized mesh and elements. |
+| `scans/<scan_name>/gaussian_splat/*.ply` | That scan's aligned Gaussian splats. |
+| `scans/<scan_name>/trajectory.csv`, `transforms.json`, `sparse/0/*` | Aligned ARCore trajectory, NeRF/3DGS poses, and COLMAP reconstruction/poses. |
+| `stats/aligned_scans_transforms.json` | Solved $4 \times 4$ $\mathrm{SE}(3)$ transform for each scan; retained so `--skip-scans` can reuse the alignment. |
+
+Multi-scan registration uses the exact union of Phase 06 floor triangles to reject any positive-area overlap between room footprints. Candidate wall planes are snapped even along doorway tangent axes when their aligned surface spans remain disjoint and the paired door openings still overlap. Alignment reports and visual diagnostics are temporary and removed after successful publication.
+
+The merged and per-scan Gaussian clouds omit centers enclosed by another scan's aligned Phase 04 sealed mesh. Source scan assets are backed up in each scan's `.raw_unaligned/` before in-place alignment. The runner does not produce `aligned_scene_with_objects.ply`; the sealed meshes and objects remain available as separate outputs.

@@ -1,10 +1,13 @@
 import importlib.util
 from pathlib import Path
 
+import sys
 import numpy as np
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "06_mesh_elaboration" / "build_rigid_baseline.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "07_alignment" / "build_rigid_baseline.py"
+if str(SCRIPT.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("build_rigid_baseline", SCRIPT)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)

@@ -2,7 +2,12 @@ package com.glomehometour.arscan
 
 import android.os.Handler
 import android.os.HandlerThread
+import java.util.HashMap
+import java.util.HashSet
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.acos
+import kotlin.math.floor
+import kotlin.math.sqrt
 
 /**
  * Pixel -> world unprojection for ARCore's depth image.
@@ -77,18 +82,51 @@ class CoverageWorker(voxelSizeM: Float = DEFAULT_VOXEL_SIZE_M) {
         private set
     @Volatile var floorplan: VoxelGrid.Floorplan2D? = null
         private set
+    /** Sparse coverage levels keyed only by columns containing retained feature landmarks. */
+    @Volatile var landmarkCoverage: Map<Long, Byte> = emptyMap()
+        private set
     @Volatile var stats = Stats(0, 0, 0, 0, 0f, false, 0f)
         private set
 
     private val thread = HandlerThread("voxel-worker").apply { start() }
     private val handler = Handler(thread.looper)
     private val busy = AtomicBoolean(false)
+    private val coverageBusy = AtomicBoolean(false)
+    private val coverageX = FloatArray(MAX_COVERAGE_LANDMARKS)
+    private val coverageY = FloatArray(MAX_COVERAGE_LANDMARKS)
+    private val coverageZ = FloatArray(MAX_COVERAGE_LANDMARKS)
+    private val coverageT = FloatArray(3)
+    private val coverageQ = FloatArray(4)
+    private val columns = HashMap<Long, ColumnStats>()
+    private val visibleColumns = HashSet<Long>()
+    private val columnViews = HashMap<Long, ColumnViewEvidence>()
+    private val columnQuality = HashMap<Long, Byte>()
+    private val inverseCoverageQ = FloatArray(4)
+    private val cameraPoint = FloatArray(3)
 
     private val world = FloatArray(3)
     private val targetScratch = FloatArray(3)
     private val occlusionScratch = FloatArray(3)
     private var lastSnapshotNanos = 0L
     private var lastFrontierNanos = 0L
+
+    private class ColumnStats(val centreX: Float, val centreZ: Float) {
+        var pointCount = 0
+        var minY = Float.MAX_VALUE
+        var secondMinY = Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        var secondMaxY = -Float.MAX_VALUE
+    }
+
+    private class ColumnViewEvidence {
+        var views = 0
+        var cameraX = 0f
+        var cameraY = 0f
+        var cameraZ = 0f
+        var bearingX = 0f
+        var bearingY = 0f
+        var bearingZ = 0f
+    }
 
     /** GL thread. Depth path. Returns false if the worker was busy and the frame was skipped. */
     fun submitDepth(depth: ArScanRenderer.DepthFrame, t: FloatArray, q: FloatArray, floorY: Float): Boolean {
@@ -141,6 +179,48 @@ class CoverageWorker(voxelSizeM: Float = DEFAULT_VOXEL_SIZE_M) {
         return true
     }
 
+    /**
+     * Recomputes colors for feature-backed minimap columns from an accepted camera view.
+     * Coordinate copies keep the render thread's reusable landmark buffers out of the worker.
+     */
+    fun submitLandmarkCoverage(
+        xs: FloatArray, ys: FloatArray, zs: FloatArray, count: Int,
+        cameraT: FloatArray, cameraQ: FloatArray,
+        imageWidth: Int, imageHeight: Int,
+        fx: Float, fy: Float, cx: Float, cy: Float,
+        floorY: Float,
+    ): Boolean {
+        val n = minOf(count, xs.size, ys.size, zs.size, coverageX.size)
+        if (n == 0 || !coverageBusy.compareAndSet(false, true)) return false
+
+        System.arraycopy(xs, 0, coverageX, 0, n)
+        System.arraycopy(ys, 0, coverageY, 0, n)
+        System.arraycopy(zs, 0, coverageZ, 0, n)
+        System.arraycopy(cameraT, 0, coverageT, 0, 3)
+        System.arraycopy(cameraQ, 0, coverageQ, 0, 4)
+        val queued = handler.post {
+            try {
+                computeLandmarkCoverage(n, imageWidth, imageHeight, fx, fy, cx, cy, floorY)
+            } finally {
+                coverageBusy.set(false)
+            }
+        }
+        if (!queued) coverageBusy.set(false)
+        return queued
+    }
+
+    /** Starts fresh view history at a room boundary while leaving occupancy guidance intact. */
+    fun resetLandmarkCoverage() {
+        landmarkCoverage = emptyMap()
+        handler.post {
+            columnViews.clear()
+            columnQuality.clear()
+            columns.clear()
+            visibleColumns.clear()
+            landmarkCoverage = emptyMap()
+        }
+    }
+
     fun shutdown() {
         thread.quitSafely()
     }
@@ -163,6 +243,136 @@ class CoverageWorker(voxelSizeM: Float = DEFAULT_VOXEL_SIZE_M) {
                 u += DEPTH_STRIDE
             }
             v += DEPTH_STRIDE
+        }
+    }
+
+    private fun computeLandmarkCoverage(
+        count: Int,
+        imageWidth: Int, imageHeight: Int,
+        fx: Float, fy: Float, cx: Float, cy: Float,
+        floorY: Float,
+    ) {
+        for (column in columns.values) {
+            column.pointCount = 0
+            column.minY = Float.MAX_VALUE
+            column.secondMinY = Float.MAX_VALUE
+            column.maxY = -Float.MAX_VALUE
+            column.secondMaxY = -Float.MAX_VALUE
+        }
+        visibleColumns.clear()
+        inverseCoverageQ[0] = coverageQ[0]
+        inverseCoverageQ[1] = coverageQ[1]
+        inverseCoverageQ[2] = coverageQ[2]
+        inverseCoverageQ[3] = -coverageQ[3]
+        val canProject = imageWidth > 0 && imageHeight > 0 && fx > 0f && fy > 0f
+
+        for (i in 0 until count) {
+            val x = coverageX[i]; val y = coverageY[i]; val z = coverageZ[i]
+            if (!x.isFinite() || !y.isFinite() || !z.isFinite()) continue
+            if (x !in -60f..60f || z !in -60f..60f) continue
+            val ix = floor(x / COVERAGE_COLUMN_SIZE_M).toInt()
+            val iz = floor(z / COVERAGE_COLUMN_SIZE_M).toInt()
+            val key = coverageColumnKey(ix, iz)
+            val column = columns[key] ?: ColumnStats(
+                (ix + 0.5f) * COVERAGE_COLUMN_SIZE_M,
+                (iz + 0.5f) * COVERAGE_COLUMN_SIZE_M,
+            ).also {
+                columns[key] = it
+            }
+            column.pointCount++
+            if (y < column.minY) {
+                column.secondMinY = column.minY
+                column.minY = y
+            } else if (y < column.secondMinY) {
+                column.secondMinY = y
+            }
+            if (y > column.maxY) {
+                column.secondMaxY = column.maxY
+                column.maxY = y
+            } else if (y > column.secondMaxY) {
+                column.secondMaxY = y
+            }
+            // A retained feature inside an accepted camera frustum anchors view evidence to this column.
+            if (!canProject) continue
+            val dx = x - coverageT[0]; val dy = y - coverageT[1]; val dz = z - coverageT[2]
+            val distanceSq = dx * dx + dy * dy + dz * dz
+            if (distanceSq !in MIN_FRUSTUM_DISTANCE_SQ..MAX_FRUSTUM_DISTANCE_SQ) continue
+            Unproject.rotate(inverseCoverageQ, dx, dy, dz, cameraPoint)
+            val depth = -cameraPoint[2]
+            if (depth !in MIN_FRUSTUM_RANGE_M..MAX_FRUSTUM_RANGE_M) continue
+            val u = fx * cameraPoint[0] / depth + cx
+            val v = cy - fy * cameraPoint[1] / depth
+            if (u in 0f..imageWidth.toFloat() && v in 0f..imageHeight.toFloat()) visibleColumns.add(key)
+        }
+
+        val staleColumns = columns.entries.iterator()
+        while (staleColumns.hasNext()) {
+            val entry = staleColumns.next()
+            if (entry.value.pointCount == 0) {
+                staleColumns.remove()
+                columnViews.remove(entry.key)
+                columnQuality.remove(entry.key)
+            }
+        }
+
+        for (key in visibleColumns) {
+            val column = columns[key] ?: continue
+            val evidence = columnViews.getOrPut(key) { ColumnViewEvidence() }
+            updateColumnView(evidence, column, coverageT, floorY)
+            columnQuality[key] = coverageLevel(column, evidence.views)
+        }
+
+        // Publish a detached snapshot; the UI reads it while this worker continues updating its maps.
+        landmarkCoverage = HashMap(columnQuality)
+    }
+
+    private fun updateColumnView(
+        evidence: ColumnViewEvidence,
+        column: ColumnStats,
+        cameraT: FloatArray,
+        floorY: Float,
+    ) {
+        val bx = cameraT[0] - column.centreX
+        val by = cameraT[1] - (floorY + VIEW_REFERENCE_HEIGHT_M)
+        val bz = cameraT[2] - column.centreZ
+        val length = sqrt(bx * bx + by * by + bz * bz)
+        if (length <= 1e-4f) return
+        val nx = bx / length; val ny = by / length; val nz = bz / length
+
+        if (evidence.views == 0) {
+            evidence.views = 1
+            evidence.cameraX = cameraT[0]; evidence.cameraY = cameraT[1]; evidence.cameraZ = cameraT[2]
+            evidence.bearingX = nx; evidence.bearingY = ny; evidence.bearingZ = nz
+            return
+        }
+
+        val dx = cameraT[0] - evidence.cameraX
+        val dy = cameraT[1] - evidence.cameraY
+        val dz = cameraT[2] - evidence.cameraZ
+        val moved = sqrt(dx * dx + dy * dy + dz * dz) >= MIN_VIEW_TRANSLATION_M
+        val dot = (nx * evidence.bearingX + ny * evidence.bearingY + nz * evidence.bearingZ).coerceIn(-1f, 1f)
+        val angleDeg = Math.toDegrees(acos(dot.toDouble())).toFloat()
+        if (moved && angleDeg >= MIN_VIEW_ANGLE_DEG && evidence.views < MAX_DISTINCT_VIEWS) {
+            evidence.views++
+            evidence.cameraX = cameraT[0]; evidence.cameraY = cameraT[1]; evidence.cameraZ = cameraT[2]
+            evidence.bearingX = nx; evidence.bearingY = ny; evidence.bearingZ = nz
+        }
+    }
+
+    private fun coverageLevel(column: ColumnStats, views: Int): Byte {
+        // Trim one isolated high/low point when supported; keep sparse floor-to-ceiling pairs intact.
+        val span = when {
+            column.pointCount >= 5 -> column.secondMaxY - column.secondMinY
+            column.pointCount >= 2 -> column.maxY - column.minY
+            else -> 0f
+        }
+        val verticalSpan = span.coerceAtLeast(0f).coerceAtMost(MAX_VERTICAL_SPAN_M)
+        // shortcut: fixed indoor-room thresholds; tune with representative scans if room heights vary widely.
+        return when {
+            views >= 6 && column.pointCount >= 12 && verticalSpan >= 2.0f -> COVERAGE_LIGHT_BLUE
+            verticalSpan >= 2.0f -> COVERAGE_GREEN
+            views >= 2 || (views >= 1 && verticalSpan >= 0.45f) -> COVERAGE_YELLOW
+            else -> COVERAGE_ORANGE
         }
     }
 
@@ -227,5 +437,29 @@ class CoverageWorker(voxelSizeM: Float = DEFAULT_VOXEL_SIZE_M) {
          * is furniture bases nobody needs a panorama of, above head height is ceiling. */
         const val FRONTIER_MIN_HEIGHT_M = 0.3f
         const val FRONTIER_MAX_HEIGHT_M = 2.0f
+
+        const val COVERAGE_ORANGE: Byte = 0
+        const val COVERAGE_YELLOW: Byte = 1
+        const val COVERAGE_GREEN: Byte = 2
+        const val COVERAGE_LIGHT_BLUE: Byte = 3
+
+        const val COVERAGE_COLUMN_SIZE_M = 0.5f
+        private const val MAX_COVERAGE_LANDMARKS = 35000
+        private const val MIN_FRUSTUM_DISTANCE_SQ = 0.09f
+        private const val MAX_FRUSTUM_DISTANCE_SQ = 64f
+        private const val MIN_FRUSTUM_RANGE_M = 0.3f
+        private const val MAX_FRUSTUM_RANGE_M = 8.0f
+        private const val VIEW_REFERENCE_HEIGHT_M = 1.2f
+        private const val MIN_VIEW_TRANSLATION_M = 0.20f
+        private const val MIN_VIEW_ANGLE_DEG = 8.0f
+        private const val MAX_DISTINCT_VIEWS = 8
+        private const val MAX_VERTICAL_SPAN_M = 3.0f
+
+        fun coverageColumnKey(x: Float, z: Float): Long = coverageColumnKey(
+            floor(x / COVERAGE_COLUMN_SIZE_M).toInt(), floor(z / COVERAGE_COLUMN_SIZE_M).toInt(),
+        )
+
+        private fun coverageColumnKey(ix: Int, iz: Int): Long =
+            (ix.toLong() shl 32) or (iz.toLong() and 0xffffffffL)
     }
 }

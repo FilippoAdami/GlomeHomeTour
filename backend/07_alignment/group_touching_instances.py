@@ -9,6 +9,8 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
 
+from object_alignment_geometry import fitting_mesh
+
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parents[1] / "current_scene/scan_0/objects_alignment"
 
@@ -31,11 +33,15 @@ def build_groups(output_dir, contact_distance=0.02):
     for item in report["object_instances"]:
         path = instance_dir / item["path"]
         mesh = o3d.io.read_triangle_mesh(str(path))
-        vertices = np.asarray(mesh.vertices)
+        fit_mesh = fitting_mesh(mesh)
+        vertices = np.asarray(fit_mesh.vertices)
         if not len(vertices):
+            items.append(item)
+            trees.append(None)
+            bounds.append(None)
             continue
         items.append(item)
-        trees.append(cKDTree(contact_samples(mesh)))
+        trees.append(cKDTree(contact_samples(fit_mesh)))
         bounds.append((vertices.min(axis=0), vertices.max(axis=0)))
 
     parent = list(range(len(items)))
@@ -48,8 +54,12 @@ def build_groups(output_dir, contact_distance=0.02):
 
     pairs = []
     for i in range(len(items)):
+        if trees[i] is None:
+            continue
         min_a, max_a = bounds[i]
         for j in range(i + 1, len(items)):
+            if trees[j] is None:
+                continue
             min_b, max_b = bounds[j]
             if np.any(max_a + contact_distance < min_b) or np.any(max_b + contact_distance < min_a):
                 continue
@@ -92,7 +102,7 @@ def build_groups(output_dir, contact_distance=0.02):
 
     manifest = {"status": "contact_groups_candidate", "source_report": str(report_path),
                 "contact_distance_m": contact_distance,
-                "method": "AABB-pruned nearest distance between mesh vertices and sampled triangle centers",
+                "method": "AABB-pruned nearest distance between non-elongated mesh vertices and sampled triangle centers",
                 "limitation": "Approximate surface contact test; increase sampling or use triangle intersection testing if review reveals missed contacts.",
                 "instance_count": len(items), "contact_pair_count": len(pairs),
                 "group_count": len(manifest_groups), "contact_pairs": pairs, "groups": manifest_groups}

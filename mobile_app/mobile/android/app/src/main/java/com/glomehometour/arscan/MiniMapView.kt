@@ -16,13 +16,17 @@ import android.view.View
  *
  * Pure, uncluttered visual elements:
  * 1. Starting doorway anchor position (loop-closure reference).
- * 2. Real-time online 2D landmark points (Emerald Green #10B981) populated dynamically as objects are orbited.
+ * 2. Real-time verified 2D feature points colored by their sparse column's vertical/view coverage.
  * 3. Cardinal North "N" indicator at the top center.
  * 4. Fixed physical screen-size user navigation arrow indicating live position and heading.
  */
 class MiniMapView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null,
 ) : View(context, attrs) {
+
+    init {
+        contentDescription = "Feature coverage map: orange is low, yellow is developing, green is good, and light blue is strong."
+    }
 
     private var userX: Float = 0f
     private var userZ: Float = 0f
@@ -41,10 +45,12 @@ class MiniMapView @JvmOverloads constructor(
     private val doorwayZ = FloatArray(32)
     private var doorwayCount = 0
 
-    // Live active room landmarks (updated online at 60 Hz during scanning)
+    // Live active room landmarks and their per-column coverage colors.
     private val activeLandmarksX = FloatArray(35000)
     private val activeLandmarksZ = FloatArray(35000)
+    private val activeLandmarkQualities = ByteArray(35000)
     private var activeLandmarkCount = 0
+    private var activeCoverageQuality: Map<Long, Byte> = emptyMap()
     private var activeMinMagX = Float.MAX_VALUE
     private var activeMaxMagX = -Float.MAX_VALUE
     private var activeMinMagZ = Float.MAX_VALUE
@@ -53,6 +59,7 @@ class MiniMapView @JvmOverloads constructor(
     // Persistent archived landmarks across previous rooms
     private val archivedLandmarksX = FloatArray(35000)
     private val archivedLandmarksZ = FloatArray(35000)
+    private val archivedLandmarkQualities = ByteArray(35000)
     private var archivedLandmarkCount = 0
     private var archivedMinMagX = Float.MAX_VALUE
     private var archivedMaxMagX = -Float.MAX_VALUE
@@ -79,15 +86,29 @@ class MiniMapView @JvmOverloads constructor(
         color = 0x4094A3B8.toInt() // Slate 400 subtle border
         strokeWidth = 1.5f * resources.displayMetrics.density
     }
-    private val activeLandmarkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xF034D399.toInt() // Vibrant Emerald 400 (matches 3D emerald gems in AR view)
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
+    private val activeLandmarkPaints = intArrayOf(
+        0xFFF97316.toInt(), // Orange: newly captured / sparse
+        0xFFFACC15.toInt(), // Yellow: some vertical or view support
+        0xFF34D399.toInt(), // Green: good coverage
+        0xFF38BDF8.toInt(), // Light blue: strong, redundant coverage
+    ).map { color ->
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
     }
-    private val archivedLandmarkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xB3059669.toInt() // Softer Emerald 600 for previous rooms
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
+    private val archivedLandmarkPaints = intArrayOf(
+        0xBFF97316.toInt(),
+        0xBFFACC15.toInt(),
+        0xB334D399.toInt(),
+        0xB338BDF8.toInt(),
+    ).map { color ->
+        Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+        }
     }
     private val startPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = 0xFFF59E0B.toInt() // Amber 500 active doorway marker
@@ -213,12 +234,35 @@ class MiniMapView @JvmOverloads constructor(
         doorwayCount = 0
         hasStart = false
         activeLandmarkCount = 0
+        activeCoverageQuality = emptyMap()
         archivedLandmarkCount = 0
         activeMinMagX = Float.MAX_VALUE; activeMaxMagX = -Float.MAX_VALUE
         activeMinMagZ = Float.MAX_VALUE; activeMaxMagZ = -Float.MAX_VALUE
         archivedMinMagX = Float.MAX_VALUE; archivedMaxMagX = -Float.MAX_VALUE
         archivedMinMagZ = Float.MAX_VALUE; archivedMaxMagZ = -Float.MAX_VALUE
         initializedBounds = false
+        postInvalidate()
+    }
+
+    fun resetActiveLandmarks() {
+        activeLandmarkCount = 0
+        activeCoverageQuality = emptyMap()
+        activeMinMagX = Float.MAX_VALUE; activeMaxMagX = -Float.MAX_VALUE
+        activeMinMagZ = Float.MAX_VALUE; activeMaxMagZ = -Float.MAX_VALUE
+        postInvalidate()
+    }
+
+    fun updateCurrentDoorway(x: Float, z: Float) {
+        startX = x
+        startZ = z
+        hasStart = true
+        if (doorwayCount > 0) {
+            doorwayX[doorwayCount - 1] = x
+            doorwayZ[doorwayCount - 1] = z
+        } else {
+            addDoorway(x, z)
+            return
+        }
         postInvalidate()
     }
 
@@ -256,6 +300,7 @@ class MiniMapView @JvmOverloads constructor(
     fun updateActiveLandmarks(xs: FloatArray, zs: FloatArray, count: Int) {
         val inliers = filterOutliers(xs, zs, count, activeLandmarksX, activeLandmarksZ)
         activeLandmarkCount = inliers
+        updateActiveLandmarkQualities()
         if (inliers > 0) {
             var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
             var minZ = Float.MAX_VALUE; var maxZ = -Float.MAX_VALUE
@@ -276,6 +321,21 @@ class MiniMapView @JvmOverloads constructor(
         postInvalidate()
     }
 
+    fun updateCoverageQuality(levels: Map<Long, Byte>) {
+        if (activeCoverageQuality === levels) return
+        activeCoverageQuality = levels
+        updateActiveLandmarkQualities()
+        postInvalidate()
+    }
+
+    private fun updateActiveLandmarkQualities() {
+        for (i in 0 until activeLandmarkCount) {
+            activeLandmarkQualities[i] = activeCoverageQuality[
+                CoverageWorker.coverageColumnKey(activeLandmarksX[i], activeLandmarksZ[i]),
+            ] ?: CoverageWorker.COVERAGE_ORANGE
+        }
+    }
+
     /**
      * Commit active landmarks to persistent multi-room archive (called when moving to next room).
      */
@@ -284,6 +344,7 @@ class MiniMapView @JvmOverloads constructor(
         if (toCopy > 0) {
             System.arraycopy(activeLandmarksX, 0, archivedLandmarksX, archivedLandmarkCount, toCopy)
             System.arraycopy(activeLandmarksZ, 0, archivedLandmarksZ, archivedLandmarkCount, toCopy)
+            System.arraycopy(activeLandmarkQualities, 0, archivedLandmarkQualities, archivedLandmarkCount, toCopy)
             archivedLandmarkCount += toCopy
             if (activeMinMagX < archivedMinMagX) archivedMinMagX = activeMinMagX
             if (activeMaxMagX > archivedMaxMagX) archivedMaxMagX = activeMaxMagX
@@ -291,6 +352,7 @@ class MiniMapView @JvmOverloads constructor(
             if (activeMaxMagZ > archivedMaxMagZ) archivedMaxMagZ = activeMaxMagZ
         }
         activeLandmarkCount = 0
+        activeCoverageQuality = emptyMap()
         activeMinMagX = Float.MAX_VALUE; activeMaxMagX = -Float.MAX_VALUE
         activeMinMagZ = Float.MAX_VALUE; activeMaxMagZ = -Float.MAX_VALUE
         postInvalidate()
@@ -302,6 +364,7 @@ class MiniMapView @JvmOverloads constructor(
         if (toCopy > 0) {
             System.arraycopy(scratchProjectedX, 0, archivedLandmarksX, archivedLandmarkCount, toCopy)
             System.arraycopy(scratchProjectedZ, 0, archivedLandmarksZ, archivedLandmarkCount, toCopy)
+            archivedLandmarkQualities.fill(CoverageWorker.COVERAGE_ORANGE, archivedLandmarkCount, archivedLandmarkCount + toCopy)
             for (i in 0 until toCopy) {
                 val mx = toMagX(scratchProjectedX[i], scratchProjectedZ[i])
                 val mz = toMagZ(scratchProjectedX[i], scratchProjectedZ[i])
@@ -412,31 +475,43 @@ class MiniMapView @JvmOverloads constructor(
         // Point radius scales smoothly with overall scene extent, bounded by a safe minimum size
         val minPtRadius = 1.8f * density
         val ptRadius = maxOf(scale * 0.05f, minPtRadius)
-        archivedLandmarkPaint.strokeWidth = ptRadius * 1.7f
-        activeLandmarkPaint.strokeWidth = ptRadius * 2.0f
+        for (paint in archivedLandmarkPaints) paint.strokeWidth = ptRadius * 1.7f
+        for (paint in activeLandmarkPaints) paint.strokeWidth = ptRadius * 2.0f
 
-        // 1. Draw archived landmarks from previous rooms (softer emerald green)
+        // 1. Draw archived landmarks from previous rooms with muted coverage colors.
         if (archivedLandmarkCount > 0) {
-            val n = minOf(archivedLandmarkCount, drawPointsBuffer.size / 2)
-            for (i in 0 until n) {
-                val mx = toMagX(archivedLandmarksX[i], archivedLandmarksZ[i])
-                val mz = toMagZ(archivedLandmarksX[i], archivedLandmarksZ[i])
-                drawPointsBuffer[i * 2] = toScreenX(mx)
-                drawPointsBuffer[i * 2 + 1] = toScreenY(mz)
+            for (quality in archivedLandmarkPaints.indices) {
+                var count = 0
+                for (i in 0 until archivedLandmarkCount) {
+                    if (archivedLandmarkQualities[i].toInt() != quality) continue
+                    val mx = toMagX(archivedLandmarksX[i], archivedLandmarksZ[i])
+                    val mz = toMagZ(archivedLandmarksX[i], archivedLandmarksZ[i])
+                    drawPointsBuffer[count * 2] = toScreenX(mx)
+                    drawPointsBuffer[count * 2 + 1] = toScreenY(mz)
+                    count++
+                }
+                if (count > 0) {
+                    canvas.drawPoints(drawPointsBuffer, 0, count * 2, archivedLandmarkPaints[quality])
+                }
             }
-            canvas.drawPoints(drawPointsBuffer, 0, n * 2, archivedLandmarkPaint)
         }
 
-        // 2. Draw active landmarks for current room live online (vibrant emerald green)
+        // 2. Draw active landmarks grouped by coverage color; empty columns have no point to draw.
         if (activeLandmarkCount > 0) {
-            val n = minOf(activeLandmarkCount, drawPointsBuffer.size / 2)
-            for (i in 0 until n) {
-                val mx = toMagX(activeLandmarksX[i], activeLandmarksZ[i])
-                val mz = toMagZ(activeLandmarksX[i], activeLandmarksZ[i])
-                drawPointsBuffer[i * 2] = toScreenX(mx)
-                drawPointsBuffer[i * 2 + 1] = toScreenY(mz)
+            for (quality in activeLandmarkPaints.indices) {
+                var count = 0
+                for (i in 0 until activeLandmarkCount) {
+                    if (activeLandmarkQualities[i].toInt() != quality) continue
+                    val mx = toMagX(activeLandmarksX[i], activeLandmarksZ[i])
+                    val mz = toMagZ(activeLandmarksX[i], activeLandmarksZ[i])
+                    drawPointsBuffer[count * 2] = toScreenX(mx)
+                    drawPointsBuffer[count * 2 + 1] = toScreenY(mz)
+                    count++
+                }
+                if (count > 0) {
+                    canvas.drawPoints(drawPointsBuffer, 0, count * 2, activeLandmarkPaints[quality])
+                }
             }
-            canvas.drawPoints(drawPointsBuffer, 0, n * 2, activeLandmarkPaint)
         }
 
         // 3. Draw doorway anchors (starting point position and previous doorways)

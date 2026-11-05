@@ -5,7 +5,7 @@ Extract Unobstructed Cross-Section Views.
 Captures direct, unobstructed 2D projection frames from the aligned original scene mesh:
 - Applies canonical axis-alignment R_axis (if axis_alignment_transform.json is present) to align
   major planes strictly along the Cartesian axes (Dir A -> +X, Dir B -> +Z).
-- Applies rigid baseline alignment (R, t) between the original sealed mesh and the regularized shell.
+- Optionally applies a legacy rigid-baseline alignment report when one is supplied.
 - Removes highest roof/ceiling using its fitted plane equation (with vertical/normal tilt-aware padding)
   to ensure ZERO ceiling floaters in top-down view.
 - Removes mezzanine level and underside ceiling with downward padding to ensure ZERO mezzanine floaters.

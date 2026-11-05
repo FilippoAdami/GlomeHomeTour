@@ -208,6 +208,7 @@ app and to MTP without any storage permission (API 29+; `minSdk` is 30).
 - **Target Room Landmarks:** 350–500 points (200 point bare minimum to finish).
 - **Orbiting UX:** Dynamically instructs the operator to orbit objects of interest, lighting up green landmarks as parallax confirms 3D surface geometry.
 - **2D Top-Down Mini-Map:** Real-time bird's-eye view showing operator position, heading, and room footprint.
+- **Coverage coloring (2026-11-03):** The map still draws only verified feature points. A hidden sparse 0.5 m XZ column combines their vertical spread with distinct accepted camera views that contain retained features inside the camera frustum. The background worker refreshes at most every 1.5 seconds; empty columns remain blank and neither cells nor frustums are drawn. Orange → yellow → green → light blue indicate increasing evidence; thresholds are initial indoor heuristics and need field calibration.
 
 ### 4.3 5-Second Lighting & Auto White-Balance Calibration
 - Automatically determines balanced joint ISO and shutter speeds (ISO 100-800, 1/120s shutter baseline) during an initial 5-second multi-angle sweep.

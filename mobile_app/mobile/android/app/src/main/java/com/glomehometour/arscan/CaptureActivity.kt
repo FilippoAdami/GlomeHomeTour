@@ -62,7 +62,7 @@ class CaptureActivity : AppCompatActivity() {
         REALIGNED, TRACKING_LOST, FINDING_POSITION, RELOCALIZE,
         TOO_BRIGHT, LIGHT_TRANSITION, TOO_FAST, TURN_SLOWLY,
     }
-    private enum class Pending { START, PREFLIGHT_NEXT, FINISH, RESUME, NEXT_ROOM, START_NEW_ROOM, SET_POSITION, ADD_CONNECTED_ROOM }
+    private enum class Pending { START, PREFLIGHT_NEXT, FINISH, RESUME, NEXT_ROOM, START_NEW_ROOM, SET_POSITION, ADD_CONNECTED_ROOM, RESTART_SCAN }
 
     private var roomIndex = 0
     private var isLoopClosedLatched = false
@@ -72,6 +72,10 @@ class CaptureActivity : AppCompatActivity() {
     private val scratchLmX = FloatArray(35000)
     private val scratchLmY = FloatArray(35000)
     private val scratchLmZ = FloatArray(35000)
+    private val coverageLmX = FloatArray(35000)
+    private val coverageLmY = FloatArray(35000)
+    private val coverageLmZ = FloatArray(35000)
+    private lateinit var restartButton: Button
     private lateinit var secondaryButton: Button
     private lateinit var alignmentOverlay: FrameLayout
     private lateinit var alignmentGhostImage: ImageView
@@ -296,6 +300,7 @@ class CaptureActivity : AppCompatActivity() {
     private var camMinZ = Float.MAX_VALUE
     private var camMaxZ = -Float.MAX_VALUE
     private var lastDimensionCheckNanos = 0L
+    private var lastLandmarkCoverageUpdateNanos = 0L
     private var currentDimensions: FeatureParallaxTracker.ScanDimensions? = null
 
     // Tracking recovery & relocalization state. The actual point-matching/RANSAC search
@@ -398,6 +403,7 @@ class CaptureActivity : AppCompatActivity() {
         wbResetButton = findViewById(R.id.wbResetButton)
         instructionTitle = findViewById(R.id.instructionTitle)
         instructionBody = findViewById(R.id.instructionBody)
+        restartButton = findViewById(R.id.restartButton)
         primaryButton = findViewById(R.id.primaryButton)
         secondaryButton = findViewById(R.id.secondaryButton)
         alignmentOverlay = findViewById(R.id.alignmentOverlay)
@@ -432,6 +438,11 @@ class CaptureActivity : AppCompatActivity() {
                 }
             }
             false
+        }
+
+        restartButton.setOnClickListener { view ->
+            view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            promptRestartScan()
         }
 
         primaryButton.setOnClickListener { view ->
@@ -761,6 +772,107 @@ class CaptureActivity : AppCompatActivity() {
                     }
                 }
             }
+            Pending.RESTART_SCAN -> {
+                restartCurrentArea(currentPose)
+            }
+        }
+    }
+
+    private fun promptRestartScan() {
+        val areaName = roomLabelsByIndex[roomIndex] ?: currentRoomName
+        AlertDialog.Builder(this)
+            .setTitle("Restart scan?")
+            .setMessage("Are you sure you want to restart the scan for $areaName? All captured progress for this area will be deleted.")
+            .setPositiveButton("Restart") { _, _ ->
+                pending = Pending.RESTART_SCAN
+                pendingAtNanos = System.nanoTime()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun restartCurrentArea(pose: Pose?) {
+        val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
+        val areaName = roomLabelsByIndex[roomIndex] ?: currentRoomName
+
+        // 1. Reset dataset writer for active room (clears keyframes and deletes saved files for this room)
+        writer?.resetCurrentRoom()
+
+        // 2. Reset coverage worker voxel grid
+        worker?.shutdown()
+        worker = CoverageWorker(
+            if (renderer?.depthSupported == true) CoverageWorker.DEFAULT_VOXEL_SIZE_M
+            else CoverageWorker.MONO_VOXEL_SIZE_M
+        )
+        lastLandmarkCoverageUpdateNanos = 0L
+
+        // 3. Reset photometric gate
+        gate = PhotometricGate()
+
+        // 4. Reset landmarks and triangulation
+        parallaxTracker.reset()
+
+        // 5. Re-anchor starting position to current pose
+        activePose.getTranslation(startPosition, 0)
+        activePose.getTranslation(lastPathPos, 0)
+        floorY = activePose.ty() - PHONE_HEIGHT_M
+
+        // 6. Reset mini-map active landmarks and doorway
+        miniMapView.post {
+            miniMapView.resetActiveLandmarks()
+            if (roomIndex == 0) {
+                miniMapView.resetDoorways()
+                miniMapView.addDoorway(startPosition[0], startPosition[2])
+            } else {
+                miniMapView.updateCurrentDoorway(startPosition[0], startPosition[2])
+            }
+            miniMapView.setStart(startPosition[0], startPosition[2])
+        }
+
+        // 7. Reset scanning metrics and flags
+        camMinX = Float.MAX_VALUE; camMaxX = -Float.MAX_VALUE
+        camMinY = Float.MAX_VALUE; camMaxY = -Float.MAX_VALUE
+        camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
+        lastDimensionCheckNanos = 0L
+        currentDimensions = null
+
+        interrupted = false
+        isLoopClosedLatched = false
+        roomPathLengthM = 0f
+
+        hapticMilestoneTarget = false
+        hapticMilestoneGood = false
+        hapticMilestoneVeryGood = false
+        hapticMilestoneExcellent = false
+        hapticLoopClosed = false
+
+        isTrackingLost = false
+        trackingLossWarningShown = false
+        trackingLostTimestampNs = 0L
+        consecutiveLostFrames = 0
+
+        speedMetresPerSec = 0f
+        angularRateDegPerSec = 0f
+        instantSpeedMetresPerSec = 0f
+        instantAngularRateDegPerSec = 0f
+        prevForward = null
+        prevPosition = null
+
+        sessionStartNanos = System.nanoTime()
+        framesSeen = 0
+        droppedDark = 0; droppedBlown = 0; droppedTransition = 0; droppedMotion = 0
+        trackingLosses = 0
+        gatePassedCounter = 0L
+
+        needsRelocalizationCheck = false
+        lastRelocalizationNanos = 0L
+        relocalizedToastUntilNanos = 0L
+        resetWarningQueue()
+
+        state = State.SCANNING
+
+        runOnUiThread {
+            Toast.makeText(this, "Scan restarted for $areaName", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -807,6 +919,8 @@ class CaptureActivity : AppCompatActivity() {
         val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
         archiveCurrentRoomLandmarks2D()
         parallaxTracker.reset()
+        worker?.resetLandmarkCoverage()
+        lastLandmarkCoverageUpdateNanos = 0L
         camMinX = Float.MAX_VALUE; camMaxX = -Float.MAX_VALUE
         camMinY = Float.MAX_VALUE; camMaxY = -Float.MAX_VALUE
         camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
@@ -943,6 +1057,7 @@ class CaptureActivity : AppCompatActivity() {
             if (renderer?.depthSupported == true) CoverageWorker.DEFAULT_VOXEL_SIZE_M
             else CoverageWorker.MONO_VOXEL_SIZE_M
         )
+        lastLandmarkCoverageUpdateNanos = 0L
         writer = DatasetWriter(this, name)
         gate = PhotometricGate()
         // The operator holds the phone at roughly chest height; the floor is that far below the
@@ -1247,7 +1362,26 @@ class CaptureActivity : AppCompatActivity() {
             renderer?.trackingState ?: "?", exported,
         )
 
-
+        val coverageRenderer = renderer
+        val coverageWorker = worker
+        val coverageTimeNs = sample.timestampNs
+        if (exported && coverageWorker != null && coverageRenderer != null &&
+            (lastLandmarkCoverageUpdateNanos == 0L ||
+                coverageTimeNs - lastLandmarkCoverageUpdateNanos >= LANDMARK_COVERAGE_INTERVAL_NS)
+        ) {
+            val landmarkCount = parallaxTracker.getLandmarkData(coverageLmX, coverageLmY, coverageLmZ)
+            if (coverageWorker.submitLandmarkCoverage(
+                    coverageLmX, coverageLmY, coverageLmZ, landmarkCount,
+                    translation, quaternion,
+                    coverageRenderer.imageWidth, coverageRenderer.imageHeight,
+                    coverageRenderer.focalX, coverageRenderer.focalY,
+                    coverageRenderer.principalX, coverageRenderer.principalY,
+                    floorY,
+                )
+            ) {
+                lastLandmarkCoverageUpdateNanos = coverageTimeNs
+            }
+        }
 
         val w = worker
         if (w != null) {
@@ -1546,6 +1680,7 @@ class CaptureActivity : AppCompatActivity() {
             // Real-time online 2D feature landmarks updated dynamically as objects are orbited.
             val lmCount = parallaxTracker.getLandmarkData(scratchLmX, scratchLmY, scratchLmZ)
             miniMapView.updateActiveLandmarks(scratchLmX, scratchLmZ, lmCount)
+            miniMapView.updateCoverageQuality(worker?.landmarkCoverage ?: emptyMap())
 
             miniMapView.updateUser(translation[0], translation[2], arcoreBearingDeg)
         }
@@ -1624,6 +1759,13 @@ class CaptureActivity : AppCompatActivity() {
         var label: String
         var hint: String? = null
         var enabled = true
+        val isScanning = (state == State.SCANNING) && !fatal
+        restartButton.setVisible(isScanning)
+        restartButton.isEnabled = isScanning
+        if (isScanning) {
+            restartButton.backgroundTintList = ColorStateList.valueOf(color(R.color.card))
+            restartButton.setTextColor(color(R.color.danger))
+        }
         if (state != State.SCANNING && state != State.ALIGNMENT && state != State.DONE && state != State.TRANSITION) {
             secondaryButton.setVisible(false)
             secondaryButton.isEnabled = false
@@ -1954,6 +2096,7 @@ class CaptureActivity : AppCompatActivity() {
         const val DEPTH_EVERY_N_FRAMES = 3L
         const val IMAGE_EVERY_N_FRAMES = 2L
         const val UI_EVERY_N_FRAMES = 5L
+        private const val LANDMARK_COVERAGE_INTERVAL_NS = 1_500_000_000L
 
         /** Operator-facing kinematic limits (projet.md §2.4): warn here. */
         const val MAX_WALK_SPEED_MS = 0.40f

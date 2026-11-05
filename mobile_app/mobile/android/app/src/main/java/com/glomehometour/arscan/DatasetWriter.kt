@@ -244,6 +244,39 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     }
 
     /**
+     * Resets the active room, clearing its keyframes and trajectory, and asynchronously
+     * deletes any images/manifests written for this room so far.
+     */
+    fun resetCurrentRoom() {
+        val folder = activeRoom.folderName
+        activeRoom = RoomData(activeRoom.roomIndex)
+        written.set(completedRooms.sumOf { it.keyframes.size })
+        handler.post {
+            deleteFolder(folder)
+        }
+    }
+
+    private fun deleteFolder(folder: String) {
+        if (!useMediaStore) {
+            val target = File(File(context.getExternalFilesDir(null), sessionName), folder)
+            if (target.exists()) {
+                target.deleteRecursively()
+            }
+            return
+        }
+        val filesUri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val prefix = "${sessionName}_${folder.replace('/', '_')}"
+        try {
+            val selection = "(${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?) AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?"
+            val selectionArgs = arrayOf(mediaAlbumPath, "$mediaAlbumPath/", "${prefix}%")
+            val deleted = context.contentResolver.delete(filesUri, selection, selectionArgs)
+            Log.d(TAG, "Deleted $deleted MediaStore files for $folder")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to delete MediaStore files for $folder", e)
+        }
+    }
+
+    /**
      * GL thread. Serialises the manifests and flushes them once the keyframe queue drains (the
      * writer is a single ordered handler thread, so posting last is enough to be last).
      * Once everything is on disk it's re-packed as a single "$sessionName.zip" next to the

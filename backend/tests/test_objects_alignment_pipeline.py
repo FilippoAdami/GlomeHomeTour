@@ -8,7 +8,7 @@ import numpy as np
 import open3d as o3d
 import pytest
 
-STAGE07 = Path(__file__).resolve().parents[1] / "07_objecs_alignment"
+STAGE07 = Path(__file__).resolve().parents[1] / "07_alignment"
 sys.path.insert(0, str(STAGE07))
 spec = importlib.util.spec_from_file_location("step_objects_alignment", STAGE07 / "step_objects_alignment.py")
 driver = importlib.util.module_from_spec(spec)
@@ -16,9 +16,9 @@ spec.loader.exec_module(driver)
 from fit_contact_groups_inside import containment_candidate_allowed
 
 
-def test_support_candidate_allows_five_percent_outside_per_instance():
-    assert containment_candidate_allowed([95.0, 100.0], has_support=True)
-    assert not containment_candidate_allowed([94.99, 100.0], has_support=True)
+def test_support_candidate_allows_at_most_two_percent_outside_per_instance():
+    assert containment_candidate_allowed([98.0, 100.0], has_support=True)
+    assert not containment_candidate_allowed([97.99, 100.0], has_support=True)
     assert containment_candidate_allowed([94.0, 80.0], has_support=False)
 
 
@@ -155,11 +155,15 @@ def test_objects_alignment_end_to_end(tmp_path, monkeypatch):
     fit_report = json.loads(fit_report_path.read_text())
     assert fit_report["group_count"] == 3
     assert fit_report["transformed_groups"] == 2
-    assert fit_report["minimum_instance_contained_surface_percent"] == 95.0
+    assert fit_report["minimum_instance_contained_surface_percent"] == 98.0
     assert (output_dir / "structural_fit" / "structural_fit_scene.ply").is_file()
+
+    assert not (output_dir / "plane_snap_report.json").exists()
+
     final_dir = output_dir / "aligned_instances"
     manifest = json.loads((final_dir / "manifest.json").read_text())
-    assert all(item["contained_surface_percent"] >= 95.0
+    assert manifest["status"] == "aligned_non_structural_instances"
+    assert all(item["contained_surface_percent"] >= 98.0
                for item in manifest["instances"] if np.linalg.norm(item["placement_translation_m"]) > 1e-6)
     assert {item["role"] for item in manifest["instances"]} == {"object"}
     assert {item["category"] for item in manifest["instances"]} == {"table", "television", None}
@@ -168,6 +172,7 @@ def test_objects_alignment_end_to_end(tmp_path, monkeypatch):
 
     table = o3d.io.read_triangle_mesh(str(final_dir / "class_100" / "instance_000.ply"))
     tv = o3d.io.read_triangle_mesh(str(final_dir / "class_102" / "instance_000.ply"))
+    # Contact blocks stop at the support fitter's 0.005 m gap; no per-instance snap follows.
     np.testing.assert_allclose(table.get_min_bound()[1], 0.005, atol=0.002)
     np.testing.assert_allclose(tv.get_min_bound()[0], 0.005, atol=0.002)
     floating = o3d.io.read_triangle_mesh(str(final_dir / "class_103" / "instance_000.ply"))
@@ -176,3 +181,163 @@ def test_objects_alignment_end_to_end(tmp_path, monkeypatch):
     assert tv_report["surface_intersection_edge_hits_before"] > 0
     assert tv_report["surface_intersection_edge_hits_after"] == 0
     assert all(item["surface_intersection_edge_hits_after"] == 0 for item in fit_report["groups"])
+
+
+def test_snap_instance_to_wall_within_10cm(tmp_path):
+    """Verify an object placed 6 cm from a wall snaps flush along cardinal axis."""
+    from snap_instances_to_planes import run_snap_instances_to_planes
+
+    # Create box room [0..4] x [0..3] x [0..4]
+    shell_mesh = o3d.geometry.TriangleMesh()
+    shell_mesh += o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.1, depth=4.0)
+    shell_path = tmp_path / "complete.ply"
+    o3d.io.write_triangle_mesh(str(shell_path), shell_mesh)
+
+    elements_dir = tmp_path / "elements"
+    elements_dir.mkdir()
+    floor_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "floor_level_00.ply"), floor_elem)
+    ceiling_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    ceiling_elem.translate([0.0, 3.0, 0.0])
+    o3d.io.write_triangle_mesh(str(elements_dir / "ceiling_group_00.ply"), ceiling_elem)
+    wall_elem = o3d.geometry.TriangleMesh.create_box(width=0.02, height=3.0, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "walls.ply"), wall_elem)
+
+    # Instance placed 6 cm away from wall face (wall face at X=0.02, instance at X=0.08)
+    align_dir = tmp_path / "objects_alignment"
+    inst_dir = align_dir / "aligned_instances" / "class_050"
+    inst_dir.mkdir(parents=True)
+    box_m = o3d.geometry.TriangleMesh.create_box(width=0.5, height=0.5, depth=0.5)
+    box_m.translate([0.08, 0.5, 1.0])
+    o3d.io.write_triangle_mesh(str(inst_dir / "instance_000.ply"), box_m)
+
+    manifest = {
+        "status": "aligned_non_structural_instances",
+        "source_shell": str(shell_path),
+        "instances": [{
+            "class_id": 50,
+            "role": "object",
+            "category": "table",
+            "path": "class_050/instance_000.ply",
+            "placement_translation_m": [0.0, 0.0, 0.0],
+            "contained_surface_percent": 100.0,
+        }],
+    }
+    (align_dir / "aligned_instances" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    res = run_snap_instances_to_planes(
+        alignment_dir=align_dir,
+        shell_path=shell_path,
+        max_distance_m=0.10,
+        min_containment_percent=97.0,
+    )
+    assert res["snapped_instances_count"] == 1
+
+    updated_m = o3d.io.read_triangle_mesh(str(inst_dir / "instance_000.ply"))
+    # Min X should now be adjacent to wall inner face at X=0.02 (with target gap ~0.002)
+    np.testing.assert_allclose(updated_m.get_min_bound()[0], 0.02 + 0.002, atol=0.002)
+    assert res["instances"][0]["final_contained_surface_percent"] >= 97.0
+
+
+def test_snap_instance_farther_than_10cm_ignored(tmp_path):
+    """Verify an object placed 15 cm from a wall is NOT snapped when max_distance is 10 cm."""
+    from snap_instances_to_planes import run_snap_instances_to_planes
+
+    shell_mesh = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.1, depth=4.0)
+    shell_path = tmp_path / "complete.ply"
+    o3d.io.write_triangle_mesh(str(shell_path), shell_mesh)
+
+    elements_dir = tmp_path / "elements"
+    elements_dir.mkdir()
+    wall_elem = o3d.geometry.TriangleMesh.create_box(width=0.02, height=3.0, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "walls.ply"), wall_elem)
+    floor_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "floor_level_00.ply"), floor_elem)
+    ceiling_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    ceiling_elem.translate([0.0, 3.0, 0.0])
+    o3d.io.write_triangle_mesh(str(elements_dir / "ceiling_group_00.ply"), ceiling_elem)
+
+    # Placed 15 cm away from wall face (wall face at X=0.02, instance at X=0.17)
+    align_dir = tmp_path / "objects_alignment"
+    inst_dir = align_dir / "aligned_instances" / "class_050"
+    inst_dir.mkdir(parents=True)
+    box_m = o3d.geometry.TriangleMesh.create_box(width=0.5, height=0.5, depth=0.5)
+    box_m.translate([0.17, 0.5, 1.0])
+    o3d.io.write_triangle_mesh(str(inst_dir / "instance_000.ply"), box_m)
+
+    manifest = {
+        "status": "aligned_non_structural_instances",
+        "source_shell": str(shell_path),
+        "instances": [{
+            "class_id": 50,
+            "role": "object",
+            "category": "table",
+            "path": "class_050/instance_000.ply",
+            "placement_translation_m": [0.0, 0.0, 0.0],
+            "contained_surface_percent": 100.0,
+        }],
+    }
+    (align_dir / "aligned_instances" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    res = run_snap_instances_to_planes(
+        alignment_dir=align_dir,
+        shell_path=shell_path,
+        max_distance_m=0.10,
+        min_containment_percent=97.0,
+    )
+    assert res["snapped_instances_count"] == 0
+    updated_m = o3d.io.read_triangle_mesh(str(inst_dir / "instance_000.ply"))
+    np.testing.assert_allclose(updated_m.get_min_bound()[0], 0.17, atol=1e-5)
+
+
+def test_cardinal_translation_only_no_rotation(tmp_path):
+    """Verify that snap_instances_to_planes applies pure translations with 0 rotation."""
+    from snap_instances_to_planes import run_snap_instances_to_planes
+
+    shell_mesh = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.1, depth=4.0)
+    shell_path = tmp_path / "complete.ply"
+    o3d.io.write_triangle_mesh(str(shell_path), shell_mesh)
+
+    elements_dir = tmp_path / "elements"
+    elements_dir.mkdir()
+    wall_elem = o3d.geometry.TriangleMesh.create_box(width=0.02, height=3.0, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "walls.ply"), wall_elem)
+    floor_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    o3d.io.write_triangle_mesh(str(elements_dir / "floor_level_00.ply"), floor_elem)
+    ceiling_elem = o3d.geometry.TriangleMesh.create_box(width=4.0, height=0.02, depth=4.0)
+    ceiling_elem.translate([0.0, 3.0, 0.0])
+    o3d.io.write_triangle_mesh(str(elements_dir / "ceiling_group_00.ply"), ceiling_elem)
+
+    # Place an asymmetric wedge/box 8 cm from wall
+    align_dir = tmp_path / "objects_alignment"
+    inst_dir = align_dir / "aligned_instances" / "class_050"
+    inst_dir.mkdir(parents=True)
+    box_m = o3d.geometry.TriangleMesh.create_box(width=0.4, height=0.6, depth=0.8)
+    box_m.translate([0.10, 0.5, 1.0])
+    orig_vertices = np.asarray(box_m.vertices).copy()
+    o3d.io.write_triangle_mesh(str(inst_dir / "instance_000.ply"), box_m)
+
+    manifest = {
+        "status": "aligned_non_structural_instances",
+        "source_shell": str(shell_path),
+        "instances": [{
+            "class_id": 50,
+            "role": "object",
+            "category": "table",
+            "path": "class_050/instance_000.ply",
+            "placement_translation_m": [0.0, 0.0, 0.0],
+            "contained_surface_percent": 100.0,
+        }],
+    }
+    (align_dir / "aligned_instances" / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    res = run_snap_instances_to_planes(alignment_dir=align_dir, shell_path=shell_path, max_distance_m=0.15)
+    assert res["snapped_instances_count"] == 1
+
+    updated_m = o3d.io.read_triangle_mesh(str(inst_dir / "instance_000.ply"))
+    new_vertices = np.asarray(updated_m.vertices)
+    # The shift vector between all corresponding vertices must be identical (pure translation, R = I)
+    shifts = new_vertices - orig_vertices
+    np.testing.assert_allclose(shifts - shifts[0], 0.0, atol=1e-6)
+    # Rotation is strictly identity
+    assert np.allclose(shifts[:, 1:], 0.0, atol=1e-5)  # Y and Z shifts were 0, pure X translation

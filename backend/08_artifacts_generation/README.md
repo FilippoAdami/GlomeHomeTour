@@ -1,6 +1,6 @@
 # Stage 08 — views and artifact generation
 
-Stage 08 generates presentation and inspection products after mesh elaboration and object alignment. It owns top-down floor views, elevation sections, cutaway views, floorplan symbols, and image comparisons. Phase 06 may create temporary 2-D masks and contours when they are needed to build structural geometry; those internal mesh-building inputs remain in Phase 06.
+Stage 08 generates presentation and inspection products after mesh elaboration and Phase 07 scan alignment. It owns top-down floor views, elevation sections, cutaway views, floorplan symbols, and image comparisons. Phase 06 may create temporary 2-D masks and contours when they are needed to build structural geometry; those internal mesh-building inputs remain in Phase 06.
 
 ## Stage files
 
@@ -22,7 +22,6 @@ After Stages 06 and 07, render views from the scan mesh and the Stage 07 alignme
 backend/.venv/bin/python backend/08_artifacts_generation/extract_cross_section_views.py \
   --mesh-path backend/current_scene/scan_0/mesh.ply \
   --instances-dir backend/current_scene/scan_0/mesh_elaboration_steps \
-  --alignment-report backend/current_scene/scan_0/objects_alignment/rigid_baseline_report.json \
   --output-dir backend/current_scene/scan_0/artifacts/cross_sections
 ```
 

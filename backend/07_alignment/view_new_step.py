@@ -150,7 +150,7 @@ def main():
             unresolved = ({item["group_id"] for item in report["groups"]
                            if item.get("surface_intersection_edge_hits_after", 0) > 0
                            or item.get("minimum_instance_contained_surface_percent",
-                                       item.get("contained_surface_percent", 100.0)) < 95.0}
+                                       item.get("contained_surface_percent", 100.0)) < 98.0}
                           if mode == "structural_fit" else ())
             group_report, group_meshes = load_contact_group_meshes(group_report_path, ALIGNMENT_OUTPUT, unresolved)
             geometries = (shell, *group_meshes)
@@ -169,7 +169,7 @@ def main():
                       f"unresolved intersections: {report['unresolved_intersection_groups']}; "
                       f"partial: {report['partial_groups']}; mean contained surface: "
                       f"{report['mean_contained_surface_percent']:.2f}%.")
-                print("Nearby floor and wall contacts are fitted by translation only. Blocks with more than 5% of any instance outside are red.")
+                print("Nearby floor and wall contacts are fitted by translation only. Blocks with more than 2% of any instance outside are red.")
             print("Each color is one rigid block. Near-side shell triangles are hidden from the current view.")
             fallback = report_path
         if mode == "instance_translated":

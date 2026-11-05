@@ -5,10 +5,10 @@ Sequences:
   1. build_rigid_baseline: Rigid point-to-plane registration of Stage 05 object instances
      to the Stage 06 completed structural mesh (complete.ply).
   2. fit_contact_groups_inside: Infer nearby floor/wall supports and fit contact groups
-     only when the placement does not increase structural surface intersections.
+     using non-elongated object faces for placement evidence.
 
 CLI:
-  .venv/bin/python 07_objecs_alignment/step_objects_alignment.py --workspace current_scene/scan_1
+  .venv/bin/python 07_alignment/step_objects_alignment.py --workspace current_scene/scan_1
 """
 from __future__ import annotations
 
@@ -88,6 +88,8 @@ def run_pipeline_for_scene(
             (output / "step07_timings.json").write_text(json.dumps(timings, indent=2) + "\n")
         if code:
             return code
+    (output / "plane_snap_report.json").unlink(missing_ok=True)
+    (fit_dir / "plane_snap_report.json").unlink(missing_ok=True)
     return 0
 
 

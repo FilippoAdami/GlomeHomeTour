@@ -16,6 +16,7 @@ from shapely.ops import unary_union
 
 from structural_surfaces import load_role_meshes
 from translate_instances_inside import triangle_samples
+from object_alignment_geometry import fitting_mesh
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,9 +26,9 @@ MAX_SUPPORT_GAP_M = 0.05
 DISTANCE_EPSILON_M = 1e-4
 CONTACT_GAP_M = 0.005
 PENETRATION_TOLERANCE_M = 0.002
-MIN_INSTANCE_CONTAINED_SURFACE_PERCENT = 95.0
+MIN_INSTANCE_CONTAINED_SURFACE_PERCENT = 98.0
 MIN_CONTACT_AREA_M2 = 0.01
-MAX_LOCAL_CORRECTION_M = 0.10
+MAX_LOCAL_CORRECTION_M = 0.15
 WALL_NORMAL_DOT_MIN = float(np.cos(np.deg2rad(30)))
 WALL_CATEGORY_PRIORS = {"window", "radiator", "television"}
 FLOOR_CATEGORY_PRIORS = {
@@ -197,6 +198,8 @@ def edge_crossings(edges, vertices, target_scene):
 def intersection_edge_hits(mesh, shell_scene, shell_vertices, shell_edges):
     vertices = np.asarray(mesh.vertices)
     faces = np.asarray(mesh.triangles)
+    if not len(vertices) or not len(faces):
+        return 0
     object_scene = as_scene(mesh)
     forward = edge_crossings(unique_edges(faces), vertices, shell_scene)
     shell_start, shell_end = shell_vertices[shell_edges[:, 0]], shell_vertices[shell_edges[:, 1]]
@@ -217,6 +220,8 @@ def contained_surface_percent(mesh, floor_scene, ceiling_scene, footprint, ray_t
                               translation=(0.0, 0.0, 0.0)):
     vertices = np.asarray(mesh.vertices) + np.asarray(translation, dtype=np.float64)
     faces = np.asarray(mesh.triangles)
+    if not len(faces):
+        return 100.0
     triangles = vertices[faces]
     areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0],
                                     triangles[:, 2] - triangles[:, 0]), axis=1) / 2
@@ -239,9 +244,14 @@ def support_weight(kind, categories):
     return 1.0
 
 
-def containment_candidate_allowed(percentages, has_support):
-    """Keep the no-op baseline; require supported moves to leave 95% of every instance inside."""
-    return not has_support or all(value >= MIN_INSTANCE_CONTAINED_SURFACE_PERCENT for value in percentages)
+def containment_candidate_allowed(percentages, has_support, baseline_percentages=None):
+    """Keep supported moves within 2% exterior, or improve a starting violation without regressions."""
+    if not has_support or all(value >= MIN_INSTANCE_CONTAINED_SURFACE_PERCENT for value in percentages):
+        return True
+    if baseline_percentages is None:
+        return False
+    return (all(value >= baseline - 1e-6 for value, baseline in zip(percentages, baseline_percentages))
+            and any(value > baseline + 1e-6 for value, baseline in zip(percentages, baseline_percentages)))
 
 
 def publish_directory(staging, destination):
@@ -301,12 +311,16 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
                 if instance.is_empty() or not len(instance.triangles):
                     raise ValueError(f"Instance mesh is empty or missing: {item['path']}")
                 member_meshes.append(instance)
+            fit_member_meshes = [fitting_mesh(instance) for instance in member_meshes]
+            fit_group_mesh = o3d.geometry.TriangleMesh()
+            for instance in fit_member_meshes:
+                fit_group_mesh += instance
             categories = {str(item.get("category")) for item in members if item.get("category")}
             baseline_instance_containment = [contained_surface_percent(
                 instance, floor_scene, ceiling_scene, footprint, ray_top, ray_bottom)
-                for instance in member_meshes]
-            floor_fit = floor_candidate(mesh, floor_scene)
-            wall_fit = wall_candidate(mesh, wall_scene)
+                for instance in fit_member_meshes]
+            floor_fit = floor_candidate(fit_group_mesh, floor_scene)
+            wall_fit = wall_candidate(fit_group_mesh, wall_scene)
             options = [(False, False)]
             if floor_fit:
                 options.append((True, False))
@@ -315,7 +329,7 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
             if floor_fit and wall_fit:
                 options.append((True, True))
 
-            baseline_hits = intersection_edge_hits(mesh, shell_scene, shell_vertices, shell_edges)
+            baseline_hits = intersection_edge_hits(fit_group_mesh, shell_scene, shell_vertices, shell_edges)
             candidates = []
             for use_floor, use_wall in options:
                 shift = np.zeros(3, dtype=np.float64)
@@ -326,19 +340,32 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
                 if use_wall:
                     shift += np.asarray(wall_fit["translation_m"])
                     support_score += support_weight("wall", categories)
-                moved = apply_translation(mesh, shift)
+                moved = apply_translation(fit_group_mesh, shift)
                 hits = intersection_edge_hits(moved, shell_scene, shell_vertices, shell_edges)
                 label = "+".join(name for name, enabled in (("floor", use_floor), ("wall", use_wall)) if enabled) or "none"
                 instance_containment = [contained_surface_percent(
                     instance, floor_scene, ceiling_scene, footprint, ray_top, ray_bottom, shift)
-                    for instance in member_meshes]
+                    for instance in fit_member_meshes]
                 has_support = use_floor or use_wall
-                eligible = containment_candidate_allowed(instance_containment, has_support)
+                eligible = containment_candidate_allowed(
+                    instance_containment, has_support, baseline_instance_containment
+                )
                 candidates.append(((hits, -support_score, float(np.linalg.norm(shift))),
                                    shift, moved, hits, use_floor, use_wall, label, support_score,
                                    instance_containment, eligible))
-            selected_candidate = min((row for row in candidates if row[9]), key=lambda row: row[0])
-            _, shift, moved_group, hits_after, use_floor, use_wall, _, _, selected_containment, _ = selected_candidate
+            eligible_candidates = [row for row in candidates if row[9]]
+            if min(baseline_instance_containment, default=100.0) >= MIN_INSTANCE_CONTAINED_SURFACE_PERCENT:
+                selected_candidate = min(
+                    eligible_candidates,
+                    key=lambda row: (row[3], -row[7], -sum(row[8]), float(np.linalg.norm(row[1]))),
+                )
+            else:
+                selected_candidate = min(
+                    eligible_candidates,
+                    key=lambda row: (-sum(row[8]), row[3], -row[7], float(np.linalg.norm(row[1]))),
+                )
+            _, shift, fit_moved_group, hits_after, use_floor, use_wall, _, _, selected_containment, _ = selected_candidate
+            moved_group = apply_translation(mesh, shift)
 
             group_file = f"group_{int(group['group_id']):03d}.ply"
             if not o3d.io.write_triangle_mesh(str(group_dir / group_file), moved_group, write_ascii=False):
@@ -366,9 +393,9 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
                                floor_fit["gap_before_m"] if floor_fit else None)
             wall_gap_after = (CONTACT_GAP_M if use_wall else
                               wall_fit["gap_before_m"] if wall_fit else None)
-            before_contained = contained_surface_percent(mesh, floor_scene, ceiling_scene,
+            before_contained = contained_surface_percent(fit_group_mesh, floor_scene, ceiling_scene,
                                                           footprint, ray_top, ray_bottom)
-            after_contained = contained_surface_percent(moved_group, floor_scene, ceiling_scene,
+            after_contained = contained_surface_percent(fit_moved_group, floor_scene, ceiling_scene,
                                                          footprint, ray_top, ray_bottom)
             support_candidates = [row for row in candidates if row[4] or row[5]]
             rejected_by_containment = bool(support_candidates) and not any(row[9] for row in support_candidates)
@@ -408,7 +435,7 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
                            "support_gap_threshold_m": MAX_SUPPORT_GAP_M,
                            "target_contact_gap_m": CONTACT_GAP_M,
                            "minimum_instance_contained_surface_percent": MIN_INSTANCE_CONTAINED_SURFACE_PERCENT,
-                           "containment_measure": "area-weighted samples from each instance surface",
+                           "containment_measure": "area-weighted samples from each instance's non-elongated faces",
                            "instances": instance_records}
         (staging / "manifest.json").write_text(json.dumps(staged_manifest, indent=2) + "\n")
         publish_directory(staging, alignment_dir / "aligned_instances")
@@ -426,7 +453,7 @@ def build(alignment_dir=DEFAULT_ALIGNMENT, output_dir=DEFAULT_OUTPUT):
         raise IOError(f"Could not write fitted scene: {output_dir / 'structural_fit_scene.ply'}")
 
     report = {"status": "support_contact_fit", "method":
-              "snap eligible contact groups to nearby horizontal floor and parallel wall surfaces; choose the candidate with fewest transverse mesh-edge intersections, then strongest category-weighted support and least movement",
+              "fit contact groups to nearby floor and wall surfaces using non-elongated object faces for support, intersection, and containment scores; preserve all source faces in aligned outputs",
               "support_gap_threshold_m": MAX_SUPPORT_GAP_M, "target_contact_gap_m": CONTACT_GAP_M,
               "penetration_tolerance_m": PENETRATION_TOLERANCE_M,
               "internal_structural_surfaces_included": True,
