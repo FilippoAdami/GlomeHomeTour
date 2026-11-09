@@ -61,6 +61,11 @@ final mesh and sealed Gaussian model. The transform is recorded in `mesh.json`;
 Stage 03 and forced Phase 04 rebuilds use it to recover source-frame camera
 inputs. Re-running Stage 01 regenerates its source model and starts a new frame.
 
+The sparse `points3D.ply` receives the same correction. Publishing aligned text
+poses removes superseded binary and rig/frame records so COLMAP readers use the
+aligned model. Phase 07 subsequently writes synchronized text and binary models.
+Pose publication rolls back all affected files if any part fails.
+
 ```text
 scan_N/
 ├── ingestion_results.json

@@ -5,11 +5,11 @@ matching the optimal mesh-derived camera poses, and generate side-by-side compar
 
 Outputs:
   1. Matched real images:
-     <workspace>/artifacts/real_frame_matches/real/class_XXX_real.jpg
+     <scene_root>/artifacts/real_frame_matches/<scan_id>/real/class_XXX_real.jpg
   2. Side-by-side comparison images (Mesh vs. Best Real Video Frame):
-     <workspace>/artifacts/real_frame_matches/comparisons/class_XXX_comparison.png
+     <scene_root>/artifacts/real_frame_matches/<scan_id>/comparisons/class_XXX_comparison.png
   3. Real frame matching manifest:
-     <workspace>/artifacts/real_frame_matches/real/non_structural_frames_real_manifest.json
+     <scene_root>/artifacts/real_frame_matches/<scan_id>/real/non_structural_frames_real_manifest.json
 """
 
 from __future__ import annotations
@@ -183,12 +183,14 @@ def run_real_frame_matching(
     if not extracted_classes:
         raise ValueError(f"Manifest at {manifest_path} contains 0 extracted classes.")
 
+    scene_root = workspace.parent if workspace.name.startswith("scan_") else workspace
+    scan_artifact_dir = scene_root / "artifacts" / "real_frame_matches" / workspace.name
     if output_real_dir is None:
-        output_real_dir = workspace / "artifacts" / "real_frame_matches" / "real"
+        output_real_dir = scan_artifact_dir / "real"
     output_real_dir.mkdir(parents=True, exist_ok=True)
 
     if output_sbs_dir is None:
-        output_sbs_dir = workspace / "artifacts" / "real_frame_matches" / "comparisons"
+        output_sbs_dir = scan_artifact_dir / "comparisons"
     output_sbs_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("Loading real video cameras from the active COLMAP pose set...")

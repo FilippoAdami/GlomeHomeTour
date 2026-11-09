@@ -27,8 +27,11 @@ from extract_non_structural_frames import (
     assign_instance_to_floor_level,
     identify_instance_biggest_side,
     compute_non_structural_purity,
+    _target_mesh_visibility,
+    _target_triangle_incidence_quality,
     validate_rendered_frame,
 )
+from extract_non_structural_frames_gs import load_gaussian_splats
 
 
 def test_is_structural_role():
@@ -83,8 +86,8 @@ def test_decompose_class_instances():
     ], dtype=np.int32)
     mask = np.array([True, True], dtype=bool)
 
-    # With min_area=0.01, tiny component is filtered
-    instances = decompose_class_instances(vertices, triangles, mask, min_faces=1, min_area=0.01)
+    # The 0.3 m² production floor keeps the 0.5 m² component and drops the tiny floater.
+    instances = decompose_class_instances(vertices, triangles, mask, min_faces=1, min_area=0.3)
     assert len(instances) == 1
     assert instances[0]["instance_id"] == 0
     assert abs(instances[0]["area_m2"] - 0.5) < 1e-4
@@ -136,7 +139,7 @@ def test_render_synthetic_in_context_frame():
     )
     assert len(instances) == 1
 
-    square_png, meta = render_synthetic_in_context_frame(
+    views = render_synthetic_in_context_frame(
         instance=instances[0],
         all_vertices=vertices,
         all_triangles=triangles,
@@ -150,6 +153,8 @@ def test_render_synthetic_in_context_frame():
         padding_color="transparent",
     )
 
+    assert list(views) == ["base", "up", "down", "left", "right"]
+    square_png, meta = views["base"]
     assert square_png.mode == "RGBA"
     w, h = square_png.size
     assert w == h
@@ -157,9 +162,86 @@ def test_render_synthetic_in_context_frame():
     assert "camera_eye" in meta
     assert "camera_target" in meta
     assert 15.0 <= abs(meta["camera_pitch_deg"]) <= 75.0
-    assert 5.0 <= abs(meta["camera_azimuth_deg"]) <= 20.0
+    assert -180.0 <= meta["camera_azimuth_deg"] <= 180.0
+    camera_y = meta["camera_eye"][1]
+    assert instances[0]["bbox_min"][1] + 1.0 <= camera_y <= instances[0]["bbox_max"][1] + 1.5
+    assert 0.0 <= meta["target_mesh_visibility"] <= 1.0
+    assert 0.0 <= meta["very_good_triangle_area_fraction"] <= 1.0
+    assert meta["very_good_triangle_area_fraction"] <= meta["good_triangle_area_fraction"] <= 1.0
+    assert 0.0 <= meta["triangle_incidence_penalty"] <= 50.0
     assert meta["camera_roll_deg"] == 0.0
     assert meta["frame_orientation"] in ("portrait", "landscape")
+
+
+def test_target_mesh_visibility_rejects_occluded_sampled_faces():
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector([
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [0.0, 1.0, 1.0],
+        [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+    ])
+    mesh.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [3, 4, 5]])
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    instance = {
+        "triangle_indices": np.array([1]),
+        "visibility_points": np.array([[0.0, 0.0, 0.0]]),
+        "visibility_weights": np.array([1.0]),
+    }
+
+    assert _target_mesh_visibility(scene, np.array([0.0, 0.0, 2.0]), instance) == 0.0
+
+    target_only = o3d.geometry.TriangleMesh()
+    target_only.vertices = o3d.utility.Vector3dVector([
+        [-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0],
+    ])
+    target_only.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
+    unobstructed = o3d.t.geometry.RaycastingScene()
+    unobstructed.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(target_only))
+    instance["triangle_indices"] = np.array([0])
+    assert _target_mesh_visibility(unobstructed, np.array([0.0, 0.0, 2.0]), instance) == 1.0
+
+
+def test_target_triangle_incidence_penalty_prefers_frontal_faces_and_requested_bands():
+    vertices = np.array([
+        [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+    ])
+    triangles = np.array([[0, 1, 2]])
+    instance = {
+        "visibility_points": np.array([[0.0, 0.0, 0.0]]),
+        "visibility_weights": np.array([1.0]),
+        "visibility_triangle_indices": np.array([0]),
+    }
+    elevations = np.radians([0.0, 30.0, 40.0, 50.0, 90.0, 180.0])
+    eyes = np.column_stack((np.sin(elevations), np.zeros(len(elevations)), np.cos(elevations)))
+
+    penalty, very_good_fraction, good_fraction = _target_triangle_incidence_quality(
+        eyes, instance, vertices, triangles
+    )
+
+    assert np.allclose(penalty, [0.0, 0.0, 0.5, 1.0, 1.0, 0.0], atol=1e-5)
+    assert np.allclose(very_good_fraction, [1.0, 1.0, 0.0, 0.0, 0.0, 1.0], atol=1e-5)
+    assert np.allclose(good_fraction, [1.0, 1.0, 1.0, 0.0, 0.0, 1.0], atol=1e-5)
+
+
+def test_target_triangle_incidence_uses_area_weighted_quality_fractions():
+    vertices = np.array([
+        [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        [3.0, 0.0, 0.0], [3.0, 1.0, 0.0], [3.0, 0.0, 1.0],
+    ])
+    triangles = np.array([[0, 1, 2], [3, 4, 5]])
+    instance = {
+        "visibility_points": np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        "visibility_weights": np.array([9.0, 1.0]),
+        "visibility_triangle_indices": np.array([0, 1]),
+    }
+
+    penalty, very_good_fraction, good_fraction = _target_triangle_incidence_quality(
+        np.array([0.0, 0.0, 2.0]), instance, vertices, triangles
+    )
+
+    assert penalty == pytest.approx(0.1)
+    assert very_good_fraction == pytest.approx(0.9)
+    assert good_fraction == pytest.approx(0.9)
 
 
 def test_end_to_end_extraction_synthetic(tmp_path):
@@ -218,7 +300,7 @@ def test_end_to_end_extraction_synthetic(tmp_path):
 
     class10_info = manifest["extracted_classes"]["10"]
     assert class10_info["role"] == "object"
-    png_path = output_dir / "class_010_inst_000.png"
+    png_path = output_dir / "class_010_inst_000_base.png"
     assert png_path.exists()
     assert not (output_dir / "class_010.png").exists()
     assert not (output_dir / "class_010_object.png").exists()
@@ -294,8 +376,8 @@ def test_end_to_end_multi_instance_extraction(tmp_path):
     assert manifest["extracted_classes"]["10"]["num_instances"] == 2
 
     # Both instances rendered to separate files with matching naming convention
-    inst0_path = output_dir / "class_010_inst_000.png"
-    inst1_path = output_dir / "class_010_inst_001.png"
+    inst0_path = output_dir / "class_010_inst_000_base.png"
+    inst1_path = output_dir / "class_010_inst_001_base.png"
 
     assert inst0_path.exists()
     assert inst1_path.exists()
@@ -537,7 +619,7 @@ def test_min_triangle_distance_constraint():
     raycast_scene.add_triangles(mesh_t)
 
     min_tri_dist = 0.10
-    img, meta = render_synthetic_in_context_frame(
+    views = render_synthetic_in_context_frame(
         instance=instance,
         all_vertices=vertices,
         all_triangles=triangles,
@@ -552,8 +634,7 @@ def test_min_triangle_distance_constraint():
         min_triangle_distance=min_tri_dist,
     )
 
-    assert "camera_distance_to_nearest_triangle_m" in meta
-    assert meta["camera_distance_to_nearest_triangle_m"] >= min_tri_dist
+    assert views["base"][1]["camera_distance_to_nearest_triangle_m"] >= min_tri_dist
 
 
 def test_validate_rendered_frame_single_color():
@@ -604,6 +685,18 @@ def test_validate_rendered_frame_featureless():
     assert not ok
 
 
+def test_validate_rendered_frame_rejects_smooth_high_diversity_blur():
+    y, x = np.mgrid[:256, :256]
+    img = np.stack([x, y, (x + y) // 2], axis=2).astype(np.uint8)
+
+    ok, reason, metrics = validate_rendered_frame(img)
+
+    assert metrics["unique_colors"] >= 28
+    assert metrics["lap_var"] < 0.05
+    assert not ok
+    assert "flat_or_blurry_surface" in reason
+
+
 def test_validate_rendered_frame_valid():
     # Image with clear edges, contrast, and structure
     img = np.zeros((120, 120, 3), dtype=np.uint8)
@@ -615,9 +708,25 @@ def test_validate_rendered_frame_valid():
     assert reason == "valid"
 
 
+def test_validate_rendered_frame_rejects_overexposure_and_elongated_triangle_views():
+    y, x = np.mgrid[:120, :120]
+    textured = np.stack([x * 2, y * 2, (x + y)], axis=2).astype(np.uint8)
+    overexposed = np.full_like(textured, 255)
+
+    ok, reason, metrics = validate_rendered_frame(overexposed)
+    assert not ok and reason.startswith("overexposed:")
+    assert metrics["overexposed_pixel_ratio"] >= 0.20
+
+    ok, reason, metrics = validate_rendered_frame(textured, elongated_triangle_area_ratio=0.25)
+    assert not ok and reason.startswith("mesh_artifact:")
+    assert metrics["elongated_triangle_area_ratio"] == 0.25
+
+
 def test_quality_filter_routing_to_discarded_folder(tmp_path):
     output_dir = tmp_path / "mesh_out"
     discarded_dir = tmp_path / "mesh_out_discarded"
+    output_dir.mkdir()
+    Image.new("RGB", (8, 8), (120, 80, 40)).save(output_dir / "class_010_inst_000_base.png")
 
     # Create synthetic mesh with 1 instance of class 10 and 1 wall
     mesh = o3d.geometry.TriangleMesh()
@@ -658,17 +767,54 @@ def test_quality_filter_routing_to_discarded_folder(tmp_path):
     )
 
     # Output dir should NOT contain the discarded image
-    assert not (output_dir / "class_010_inst_000.png").exists()
+    assert not (output_dir / "class_010_inst_000_base.png").exists()
 
     # Discarded dir SHOULD contain the discarded image and manifest
-    assert (discarded_dir / "class_010_inst_000.png").exists()
+    assert (discarded_dir / "class_010_inst_000_base.png").exists()
     assert (discarded_dir / "discarded_manifest.json").exists()
 
     with open(discarded_dir / "discarded_manifest.json") as f:
         dm = json.load(f)
-    assert dm["total_discarded"] == 1
-    assert "10_0" in dm["discarded_instances"]
-    assert "single_color" in dm["discarded_instances"]["10_0"]["reason"]
+    assert dm["total_discarded"] == 5
+    assert "10_0:base" in dm["discarded_instances"]
+    assert "single_color" in dm["discarded_instances"]["10_0:base"]["reason"]
+
+
+def test_gaussian_checkpoint_uses_phase07_scan_transform(tmp_path):
+    import torch
+
+    scan_dir = tmp_path / "scene" / "scan_2"
+    scan_dir.mkdir(parents=True)
+    (scan_dir / "mesh.json").write_text("{}")
+    transform = np.array([
+        [0.0, 0.0, 1.0, 3.0],
+        [0.0, 1.0, 0.0, 0.5],
+        [-1.0, 0.0, 0.0, 2.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+    manifest = scan_dir.parent / "multi_room_alignment" / "stats" / "aligned_scans_transforms.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"scans": {"scan_2": {"transform_matrix": transform.tolist()}}}))
+    checkpoint = scan_dir / "gaussian_splat" / "checkpoint_sealed.pt"
+    checkpoint.parent.mkdir()
+    torch.save({
+        "sh_degree": 0,
+        "splats": {
+            "means": torch.tensor([[1.0, 2.0, 3.0]]),
+            "quats": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            "scales": torch.zeros((1, 3)),
+            "opacities": torch.zeros(1),
+            "sh0": torch.zeros((1, 1, 3)),
+            "shN": torch.empty((1, 0, 3)),
+        },
+    }, checkpoint)
+
+    splats, _ = load_gaussian_splats(checkpoint, device="cpu", workspace=scan_dir)
+
+    torch.testing.assert_close(splats["means"], torch.tensor([[6.0, 2.5, 1.0]]))
+    torch.testing.assert_close(
+        splats["quats"], torch.tensor([[2 ** -0.5, 0.0, 2 ** -0.5, 0.0]]), atol=1e-6, rtol=0
+    )
 
 
 

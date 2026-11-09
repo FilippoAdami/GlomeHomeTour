@@ -522,6 +522,7 @@ def main() -> None:
 
     workspace = args.workspace.resolve()
     scan_paths = resolve_scans(workspace)
+    scene_root = workspace.parent if workspace.name.startswith("scan_") else workspace
     import torch
     if not torch.cuda.is_available():
         raise RuntimeError("Gaussian rendering requires the configured CUDA/ROCm GPU")
@@ -550,7 +551,7 @@ def main() -> None:
         face_data = mesh_face_geometry(vertices, triangles)
         axes = wall_axes(vertices, triangles, face_data)
         cut_planes = optimize_cut_planes(vertices, axes, face_data)
-        artifacts = scan_path / "artifacts"
+        artifacts = scene_root / "artifacts" / "scene_views" / scan_path.name
         write_cut_plane_report(cut_planes, artifacts / "cut_planes.json")
         render_cut_plane_map(
             vertices, axes, face_data, cut_planes,

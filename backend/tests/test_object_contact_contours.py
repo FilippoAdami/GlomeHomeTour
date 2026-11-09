@@ -26,6 +26,31 @@ def test_only_instance_faces_touching_different_owners_are_boundary_faces():
     np.testing.assert_array_equal(boundary, [False, True, True])
 
 
+def test_split_instance_faces_map_back_to_their_sealed_parent(tmp_path):
+    vertices = np.array([
+        [0, 0, 0], [1, 0, 0], [0, 1, 0],
+        [0, 0, 1], [1, 0, 1], [0, 1, 1],
+    ], dtype=float)
+    sealed = o3d.geometry.TriangleMesh()
+    sealed.vertices = o3d.utility.Vector3dVector(vertices)
+    sealed.triangles = o3d.utility.Vector3iVector([[0, 1, 2], [3, 4, 5]])
+    source = o3d.geometry.TriangleMesh()
+    source.vertices = o3d.utility.Vector3dVector(vertices[3:])
+    source.triangles = o3d.utility.Vector3iVector([[0, 1, 2]])
+    source_path = tmp_path / "split-door.ply"
+    o3d.io.write_triangle_mesh(str(source_path), source)
+
+    face_indices, source_faces = MODULE.instance_face_indices(
+        source_path, sealed, np.array([2, 2]), np.array([1, 1]), 2, 1
+    )
+
+    np.testing.assert_array_equal(face_indices, [1])
+    np.testing.assert_array_equal(
+        np.asarray(sealed.vertices)[np.asarray(sealed.triangles)[face_indices]],
+        np.asarray(source.vertices)[source_faces],
+    )
+
+
 def test_red_contour_faces_keep_other_instance_rgb(tmp_path):
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(

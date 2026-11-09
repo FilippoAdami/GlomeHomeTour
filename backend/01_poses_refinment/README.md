@@ -45,6 +45,10 @@ The step writes or updates:
 | `<scan>/trajectory.csv` | Original ARCore capture trajectory, retained unchanged as metadata; it does not align with the image-only COLMAP world. |
 | `<scan>/ingestion_results.json` | Updated to `poses_format: colmap` and point `colmap_model_path` to `sparse/0` after this stage succeeds. `source_format` still records how ingestion received the capture. |
 
+After editing text poses, the stage removes old binary and rig/frame records before
+rebuilding the binary model. COLMAP infers fresh per-image frames from the final
+image poses; stale `frames.txt` would otherwise override `images.txt`.
+
 COLMAP databases, reports, and intermediate models stay in scratch storage. Visualizations, stage-specific folders, and discard folders are not produced. On ARCore-origin scans, images with fewer than 200 extracted SIFT keypoints are removed from the feature database before matching, saving matching and mapping work; this does not save feature-extraction time. The prefilter is not applied to direct-COLMAP scans, which skip SIFT extraction. Both routes then remove frames with fewer than 30 triangulated 3D observations. The stage repeats this second check after pruning tracks, since deleting one image can lower another image's observation count. Monocular COLMAP starts with arbitrary scale; wall alignment and moving minimum Y to zero only set orientation and origin. A validated ARCore calibration converts the output to metres; direct-COLMAP inputs remain in arbitrary units. When it replaces a model, the stage clears downstream `depth`, `train`, and `mesh` completion records so the pipeline recomputes them, while leaving their existing artifacts on disk.
 
 ## Coordinate and processing notes

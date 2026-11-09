@@ -11,6 +11,7 @@ Sequentially executes:
      inside each regularized shell, then performs bounded plane and per-wall median pulls.
   4. Outlier Replacement: Applies the locked area/depth/seam/rectangle cutoffs, classifies each
      retained region, removes it from object and sealed meshes, and inserts silver panels.
+  5. Window Panels: Independently exports audit panels from accepted Phase 05 window instances.
 
 CLI Usage:
   backend/.venv/bin/python backend/07_alignment/step_alignment.py --workspace backend/current_scene
@@ -329,6 +330,33 @@ def run_phase07_alignment(
     logger.info("    Replaced %d retained regions; regularized meshes were left untouched.",
                 len(replacement_summary["regions"]))
 
+    from door_plane_regularization import generate_aligned_door_panel_artifacts
+
+    door_panel_ply, door_panel_metadata, door_panel_count = timed(
+        "step5.export_aligned_door_panels",
+        lambda: generate_aligned_door_panel_artifacts(workspace, output_dir, transforms_final),
+    )
+    exported_assets["aligned_door_panels"] = door_panel_ply
+    exported_assets["aligned_door_panels_metadata"] = door_panel_metadata
+    exported_assets["door_panel_regularization_report"] = (
+        output_dir / "stats" / "door_panel_regularization_report.json")
+    logger.info("    Exported %d door verification panels to %s (kept out of scene PLYs).",
+                door_panel_count, door_panel_ply)
+
+    # Keep window regularization automatic and additive, immediately after door-panel export.
+    from window_panel_regularization import generate_aligned_window_panel_artifacts
+
+    window_panel_ply, window_panel_metadata, window_panel_count = timed(
+        "step5.export_aligned_window_panels",
+        lambda: generate_aligned_window_panel_artifacts(workspace, output_dir),
+    )
+    exported_assets["aligned_window_panels"] = window_panel_ply
+    exported_assets["aligned_window_panels_metadata"] = window_panel_metadata
+    exported_assets["window_panel_regularization_report"] = (
+        output_dir / "stats" / "window_panel_regularization_report.json")
+    logger.info("    Exported %d independent window verification panels to %s.",
+                window_panel_count, window_panel_ply)
+
     if not keep_temporary_outputs:
         timed("step5.cleanup_temporary_outputs", lambda: cleanup_temporary_outputs(output_dir))
         exported_assets = {
@@ -338,6 +366,12 @@ def run_phase07_alignment(
             "aligned_sealed_gaussians": output_dir / "aligned_sealed_gaussians.ply",
             "aligned_sealed_meshes": output_dir / "aligned_sealed_meshes.ply",
             "aligned_sealed_meshes_glb": output_dir / "aligned_sealed_meshes.glb",
+            "aligned_door_panels": output_dir / "aligned_door_panels.ply",
+            "aligned_door_panels_metadata": output_dir / "stats" / "aligned_door_panels.json",
+            "door_panel_regularization_report": output_dir / "stats" / "door_panel_regularization_report.json",
+            "aligned_window_panels": output_dir / "aligned_window_panels.ply",
+            "aligned_window_panels_metadata": output_dir / "stats" / "aligned_window_panels.json",
+            "window_panel_regularization_report": output_dir / "stats" / "window_panel_regularization_report.json",
             "phase07_region_replacements_manifest": output_dir / "stats" / "phase07_region_replacements.json",
             "phase07_panel_instances_dir": output_dir / "objects",
             "scans_dir": output_dir / "scans",

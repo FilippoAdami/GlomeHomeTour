@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -71,7 +72,7 @@ def run_final_category_classification(scan_dir: Path, mesh_path: Path, stage_out
         "--workspace", str(scan_dir),
         "--mesh-path", str(mesh_path),
         "--labels-path", str(stage_out_dir / "triangle_class_labels.npy"),
-        "--structural-json", str(stage_out_dir / "class_metadata.json"),
+        "--structural-json", str(stage_out_dir / "structural_classes.json"),
         "--output-dir", str(mesh_frames),
         "--gs-output-dir", str(gs_frames),
         "--include-structural",
@@ -92,7 +93,91 @@ def run_final_category_classification(scan_dir: Path, mesh_path: Path, stage_out
     ])
     if not (output_dir / "valid_class_associations.json").is_file():
         raise RuntimeError(f"Category matcher did not write associations for {scan_dir}")
+    sync_fixed_class_wall_objects(stage_out_dir)
     return associations
+
+
+def _remove_generated_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def sync_fixed_class_wall_objects(stage_out_dir: Path) -> list[dict[str, Any]]:
+    """Duplicate fixed-class wall instances into object-role exports for Stage 07."""
+    stage_out_dir = Path(stage_out_dir)
+    similarity_dir = stage_out_dir / "non_structural_similarity"
+    association_path = similarity_dir / "valid_class_associations.json"
+    categories_path = similarity_dir / "categories.json"
+    metadata_path = stage_out_dir / "class_metadata.json"
+    if not all(path.is_file() for path in (association_path, categories_path, metadata_path)):
+        raise FileNotFoundError("Fixed-class wall copies need associations, categories, and class metadata")
+
+    associations = json.loads(association_path.read_text(encoding="utf-8"))["associations"]
+    categories = {int(item["id"]): str(item["name"])
+                  for item in json.loads(categories_path.read_text(encoding="utf-8"))}
+    class_metadata = json.loads(metadata_path.read_text(encoding="utf-8")).get("classes", {})
+    desired = {
+        int(class_id): int(category_id)
+        for class_id, category_id in associations
+        if class_metadata.get(str(class_id), {}).get("structural_role") == "wall"
+    }
+
+    manifest_path = stage_out_dir / "fixed_class_object_copies.json"
+    previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    previous_ids = {int(item["class_id"]) for item in previous.get("copies", [])}
+    instances_root = stage_out_dir / "Instances PLYs"
+    non_structural_root = instances_root / "Non-Structural"
+    masks_root = stage_out_dir / "3d_masks"
+
+    for class_id in previous_ids - desired.keys():
+        if class_metadata.get(str(class_id), {}).get("structural_role") == "wall":
+            _remove_generated_path(non_structural_root / str(class_id))
+            _remove_generated_path(masks_root / f"class_{class_id:03d}_object")
+
+    copies = []
+    for class_id, category_id in sorted(desired.items()):
+        source_dir = masks_root / f"class_{class_id:03d}_wall"
+        sources = sorted(source_dir.glob("instance_*.ply"))
+        if not sources:
+            raise FileNotFoundError(f"No wall instance PLYs for fixed class {class_id}: {source_dir}")
+
+        copy_dir = non_structural_root / str(class_id)
+        object_dir = masks_root / f"class_{class_id:03d}_object"
+        if copy_dir.exists() or copy_dir.is_symlink():
+            _remove_generated_path(copy_dir)
+        if object_dir.exists() or object_dir.is_symlink():
+            _remove_generated_path(object_dir)
+
+        copy_dir.mkdir(parents=True)
+        object_dir.mkdir(parents=True)
+        copied_paths = []
+        for source in sources:
+            destination = copy_dir / source.name
+            shutil.copy2(source, destination)
+            link = object_dir / source.name
+            try:
+                link.symlink_to(os.path.relpath(destination, object_dir))
+            except OSError:
+                shutil.copy2(destination, link)
+            copied_paths.append(str(destination.relative_to(stage_out_dir)))
+
+        copies.append({
+            "class_id": class_id,
+            "category_id": category_id,
+            "category": categories[category_id],
+            "source_role": "wall",
+            "source_directory": str(source_dir.relative_to(stage_out_dir)),
+            "object_directory": str(object_dir.relative_to(stage_out_dir)),
+            "copied_instances": copied_paths,
+        })
+
+    result = {"schema_version": 1, "copies": copies}
+    temporary_path = manifest_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    temporary_path.replace(manifest_path)
+    return copies
 
 
 def run_segmentation_pipeline_for_scan(
@@ -551,6 +636,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             if not (args.force or args.recompute_2d or args.recompute_projection) and current_version and is_done(scan, "segmentation", base_outputs):
                 associations_path = stage_out / "non_structural_similarity" / "valid_class_associations.json"
                 if associations_path.is_file():
+                    try:
+                        sync_fixed_class_wall_objects(stage_out)
+                    except Exception as exc:
+                        failures.append(scan.name)
+                        parent_ctx.note(f"Scan {scan.name} fixed-class object copies failed: {exc}")
+                        print(f"ERROR fixed-class object copies for scan {scan.name}: {exc}")
+                        continue
                     print(f"\nScan {scan.name}: Stage 05 already completed and verified. Skipping (use --force to re-run).")
                     continue
                 print(f"\nScan {scan.name}: Segmentation is current; generating the missing final category associations.")

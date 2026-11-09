@@ -19,6 +19,7 @@ import argparse
 import json
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -42,12 +43,15 @@ if str(CURRENT_DIR) not in sys.path:
 from visualize_doors_alignment import get_door_classes_from_phase5
 from render_aligned_result_topdown import render_orthographic_mesh_topdown
 
+DOOR_PANEL_DEPTH_M = 0.10
+OVERLAP_REGULARIZATION_MIN_FRACTION = 0.60
+
 
 def load_and_classify_door_instances(
     scene_dir: Path,
     transforms_dict: Dict[str, np.ndarray],
     door_classes: Dict[str, List[int]],
-    min_width: float = 0.50,
+    min_width: float = 0.60,
     min_height: float = 1.20,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Loads door instances from Phase 05, decomposes multi-plane clusters, and filters outliers."""
@@ -221,6 +225,9 @@ def compute_standardized_and_regularized_dimensions(
     3. Overlap constraint: segments must be at least 90% overlapping with the downprojection
        of the geometry (at most 10% non-supported). If a door exceeds this, snap down to highest multiple of 5 cm.
     """
+    if not validated_doors:
+        return 0.0, 0.0, validated_doors
+
     raw_widths = [d["raw_width_m"] for d in validated_doors]
     raw_heights = [d["raw_height_m"] for d in validated_doors]
 
@@ -273,6 +280,7 @@ def fit_axis_aligned_door_segments(
     validated_doors: List[Dict[str, Any]],
     transforms_dict: Dict[str, np.ndarray],
     scene_dir: Path,
+    enforce_proximity: bool = True,
 ) -> List[Dict[str, Any]]:
     """Fits strictly axis-aligned 2D segments in global Manhattan coordinates.
 
@@ -290,11 +298,14 @@ def fit_axis_aligned_door_segments(
     4. Support & Overlap: Segments must be at least 90% overlapping with the downprojection
        of the geometry (at most 10% of segment length non-supported).
     5. At Most 10cm Inside Geometry: Segment endpoints can be at most 10 cm inside geometry boundaries.
+    6. Door Width: Proximity fitting never shortens a segment below 60 cm; unresolved conflicts are recorded.
     """
     # 1. Compute bounding perimeters for each scan in global coordinates
     scan_bounds: Dict[str, Dict[str, float]] = {}
-    for sname in ["scan_0", "scan_1", "scan_2"]:
-        mesh_p = scene_dir / sname / "mesh.ply"
+    for sname in sorted(transforms_dict):
+        mesh_p = scene_dir / sname / ".raw_unaligned" / "mesh.ply"
+        if not mesh_p.is_file():
+            mesh_p = scene_dir / sname / "mesh.ply"
         if mesh_p.is_file():
             m = trimesh.load(mesh_p, process=False)
             T = transforms_dict.get(sname, np.eye(4))
@@ -352,9 +363,10 @@ def fit_axis_aligned_door_segments(
                     pe[0] = round(sb["x_max"], 4)
         d["perimeter_clipping"] = clipping_notes
 
-    # 4. Enforce minimum 15 cm separation and non-overlap
+    # 4. Enforce minimum 15 cm separation without shrinking a door below 60 cm.
     min_dist = 0.15
-    for it in range(40):
+    min_door_width = 0.60
+    for it in (range(40) if enforce_proximity else ()):
         worst_pair = None
         min_d = 1e9
         for i in range(len(validated_doors)):
@@ -364,7 +376,10 @@ def fit_axis_aligned_door_segments(
                 l1 = LineString([d1["segment_start"], d1["segment_end"]])
                 l2 = LineString([d2["segment_start"], d2["segment_end"]])
                 dist = l1.distance(l2)
-                if dist < min_dist - 1e-4:
+                l1_len = float(np.linalg.norm(np.array(d1["segment_end"]) - np.array(d1["segment_start"])))
+                l2_len = float(np.linalg.norm(np.array(d2["segment_end"]) - np.array(d2["segment_start"])))
+                can_shorten = max(l1_len, l2_len) > min_door_width + 1e-4
+                if dist < min_dist - 1e-4 and can_shorten:
                     if dist < min_d:
                         min_d = dist
                         worst_pair = (i, j)
@@ -378,17 +393,18 @@ def fit_axis_aligned_door_segments(
         l1_len = float(np.linalg.norm(np.array(d1["segment_end"]) - np.array(d1["segment_start"])))
         l2_len = float(np.linalg.norm(np.array(d2["segment_end"]) - np.array(d2["segment_start"])))
 
-        # Longest segment gets shortened
-        target = d1 if l1_len >= l2_len else d2
-        other = d2 if l1_len >= l2_len else d1
+        # Shorten the longest segment that still has room above the door minimum.
+        candidates = [(l1_len, d1, d2), (l2_len, d2, d1)]
+        _, target, other = max(
+            (candidate for candidate in candidates if candidate[0] > min_door_width + 1e-4),
+            key=lambda candidate: candidate[0],
+        )
 
         lo = LineString([other["segment_start"], other["segment_end"]])
         ps = np.array(target["segment_start"], dtype=float)
         pe = np.array(target["segment_end"], dtype=float)
         dir_vec = pe - ps
         cur_len = float(np.linalg.norm(dir_vec))
-        if cur_len < 0.2:
-            break
         u = dir_vec / cur_len
 
         d_start = lo.distance(LineString([ps, ps]))
@@ -396,15 +412,17 @@ def fit_axis_aligned_door_segments(
 
         step = 0.002
         if d_start < d_end:
-            while cur_len > 0.2:
-                ps += u * step
-                cur_len -= step
+            while cur_len > min_door_width + 1e-4:
+                move = min(step, cur_len - min_door_width)
+                ps += u * move
+                cur_len -= move
                 if LineString([ps, pe]).distance(lo) >= min_dist:
                     break
         else:
-            while cur_len > 0.2:
-                pe -= u * step
-                cur_len -= step
+            while cur_len > min_door_width + 1e-4:
+                move = min(step, cur_len - min_door_width)
+                pe -= u * move
+                cur_len -= move
                 if LineString([ps, pe]).distance(lo) >= min_dist:
                     break
 
@@ -415,6 +433,22 @@ def fit_axis_aligned_door_segments(
         target["proximity_shortenings"].append(
             f"Shortened against {other['description']} to maintain >=15cm clearance"
         )
+
+    for d in validated_doors:
+        d["proximity_conflicts"] = []
+    for i, d1 in enumerate(validated_doors):
+        l1 = LineString([d1["segment_start"], d1["segment_end"]])
+        for d2 in validated_doors[i + 1:]:
+            l2 = LineString([d2["segment_start"], d2["segment_end"]])
+            dist = float(l1.distance(l2))
+            if dist < min_dist - 1e-4:
+                for door, other in ((d1, d2), (d2, d1)):
+                    door["proximity_conflicts"].append({
+                        "other_door": other["description"],
+                        "distance_m": round(dist, 3),
+                        "required_distance_m": min_dist,
+                        "minimum_segment_width_m": min_door_width,
+                    })
 
     # 5. Compute final spans, centers, overlap & indent metrics, and perpendicular end-caps
     cap_len = 0.08  # 8 cm perpendicular cap on each side
@@ -458,6 +492,609 @@ def fit_axis_aligned_door_segments(
         d["cap_end"] = [[round(p[0], 3), round(p[1], 3)] for p in cap_end]
 
     return validated_doors
+
+
+def _sample_aligned_floor(
+    floor_meshes: List[Tuple[Path, trimesh.Trimesh]], x: float, z: float, reference_y: float
+) -> Dict[str, Any] | None:
+    """Interpolate a Phase 06 floor triangle at XZ, with nearest-triangle fallback."""
+    samples = []
+    point = np.array([x, z], dtype=np.float64)
+    for path, mesh in floor_meshes:
+        triangles = np.asarray(mesh.vertices, dtype=np.float64)[np.asarray(mesh.faces)]
+        projected = triangles[:, :, [0, 2]]
+        a, b, c = projected[:, 0], projected[:, 1], projected[:, 2]
+        ab, ac, ap = b - a, c - a, point - a
+        denominator = ab[:, 0] * ac[:, 1] - ab[:, 1] * ac[:, 0]
+        valid = np.abs(denominator) > 1e-12
+        wb = np.zeros(len(triangles))
+        wc = np.zeros(len(triangles))
+        wb[valid] = (ap[valid, 0] * ac[valid, 1] - ap[valid, 1] * ac[valid, 0]) / denominator[valid]
+        wc[valid] = (ab[valid, 0] * ap[valid, 1] - ab[valid, 1] * ap[valid, 0]) / denominator[valid]
+        wa = 1.0 - wb - wc
+        inside = valid & (wa >= -1e-7) & (wb >= -1e-7) & (wc >= -1e-7)
+        if np.any(inside):
+            y_values = np.sum(np.stack((wa, wb, wc), axis=1)[inside] * triangles[inside, :, 1], axis=1)
+            samples.append({
+                "elevation_m": float(np.median(y_values)), "source_path": str(path),
+                "method": "phase06_floor_triangle", "horizontal_distance_m": 0.0,
+            })
+        else:
+            # shortcut: use the nearest triangle centroid outside coverage; upgrade to closest-point projection if gaps become common.
+            centers = projected.mean(axis=1)
+            nearest = int(np.argmin(np.linalg.norm(centers - point, axis=1)))
+            samples.append({
+                "elevation_m": float(np.median(triangles[nearest, :, 1])), "source_path": str(path),
+                "method": "nearest_phase06_floor_triangle",
+                "horizontal_distance_m": float(np.linalg.norm(centers[nearest] - point)),
+            })
+    if not samples:
+        return None
+    return min(samples, key=lambda item: (
+        item["method"] != "phase06_floor_triangle", item["horizontal_distance_m"],
+        abs(item["elevation_m"] - reference_y), item["source_path"],
+    ))
+
+
+def _nearest_step(value: float, step: float) -> float:
+    return round(float(np.floor(value / step + 0.5) * step), 2)
+
+
+def _dimension_mode(values: List[float]) -> Tuple[float | None, List[Dict[str, Any]]]:
+    counts = Counter(round(float(value), 2) for value in values)
+    if not counts:
+        return None, []
+    highest_count = max(counts.values())
+    mode = min(value for value, count in counts.items() if count == highest_count)
+    distribution = [
+        {"dimension_m": value, "panel_count": counts[value]}
+        for value in sorted(counts)
+    ]
+    return mode, distribution
+
+
+def _panel_overlap_ratio(first: Dict[str, Any], second: Dict[str, Any]) -> float:
+    if first["orientation"] != second["orientation"]:
+        return 0.0
+    tangent_overlap = max(0.0, min(first["t_max"], second["t_max"]) - max(first["t_min"], second["t_min"]))
+    vertical_overlap = max(0.0, min(first["y_max"], second["y_max"]) - max(first["y_min"], second["y_min"]))
+    smaller_area = min(first["width"] * first["height"], second["width"] * second["height"])
+    return tangent_overlap * vertical_overlap / smaller_area if smaller_area > 0.0 else 0.0
+
+
+def _panel_face_to_face_distance(first: Dict[str, Any], second: Dict[str, Any]) -> float:
+    center_distance = abs(first["plane_offset"] - second["plane_offset"])
+    return max(0.0, center_distance - (first["depth"] + second["depth"]) / 2.0)
+
+
+def generate_aligned_door_panel_artifacts(
+    scene_dir: Path,
+    alignment_dir: Path,
+    transforms_dict: Dict[str, np.ndarray],
+) -> Tuple[Path, Path, int]:
+    """Build auditable door panels, merging duplicates and regularizing wall, floor, and size."""
+    manifest_path = alignment_dir / "stats" / "aligned_objects_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    floor_cache: Dict[str, List[Tuple[Path, trimesh.Trimesh]]] = {}
+    doors: List[Dict[str, Any]] = []
+    for record in manifest.get("objects", []):
+        if record.get("category") != "door" or int(record.get("text_class_id", 0)) != 1:
+            continue
+        source_path = Path(record["source_instance_path"])
+        try:
+            instance_index = int(source_path.stem.removeprefix("instance_"))
+        except ValueError as exc:
+            raise ValueError(f"Unexpected door instance filename: {source_path}") from exc
+        mesh_path = Path(record["global_instance_path"])
+        mesh = trimesh.load(mesh_path, process=False)
+        if not isinstance(mesh, trimesh.Trimesh) or not len(mesh.faces):
+            raise ValueError(f"Expected a non-empty aligned door instance: {mesh_path}")
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)[np.unique(mesh.faces)]
+        bmin, bmax = vertices.min(axis=0), vertices.max(axis=0)
+        span = bmax - bmin
+        if np.any(span <= 0.0) or not np.isfinite(vertices).all():
+            raise ValueError(f"Invalid aligned door bounds: {mesh_path}")
+        x_forward = vertices[:, 0]
+        z_forward = -vertices[:, 2]
+        orientation = "Vertical" if np.ptp(z_forward) >= np.ptp(x_forward) else "Horizontal"
+        span_values = z_forward if orientation == "Vertical" else x_forward
+        downproj_min, downproj_max = map(float, np.percentile(span_values, [1.0, 99.0]))
+        width = downproj_max - downproj_min
+        if width <= 0.0:
+            raise ValueError(f"Door has no horizontal span: {mesh_path}")
+        scan_id = str(record["scan_id"])
+        if scan_id not in floor_cache:
+            floor_cache[scan_id] = []
+            floor_dir = alignment_dir / "scans" / scan_id / "mesh_elaboration" / "elements"
+            for floor_path in sorted(floor_dir.glob("floor_level_*.ply")):
+                floor = trimesh.load(floor_path, process=False)
+                if isinstance(floor, trimesh.Trimesh) and len(floor.faces):
+                    floor_cache[scan_id].append((floor_path, floor))
+        center_t = (downproj_min + downproj_max) / 2.0
+        plane_offset = float(np.median(x_forward if orientation == "Vertical" else z_forward))
+        center_x = plane_offset if orientation == "Vertical" else center_t
+        center_z = -center_t if orientation == "Vertical" else -plane_offset
+        y_min, y_max = float(bmin[1]), float(bmax[1])
+        floor = _sample_aligned_floor(floor_cache[scan_id], center_x, center_z, y_min)
+        if floor is None:
+            # shortcut: use source bottom only when Phase 06 has no floor asset for the scan.
+            floor = {
+                "elevation_m": y_min, "source_path": None,
+                "method": "instance_bottom_fallback_missing_phase06_floor",
+                "horizontal_distance_m": None,
+            }
+        description = f"{scan_id}/class_{int(record['class_id']):03d}/instance_{instance_index:03d}"
+        source_info = {
+            "scan_id": scan_id, "class_id": int(record["class_id"]),
+            "instance_id": instance_index - 1, "instance_index": instance_index,
+            "description": description, "source_instance_path": str(source_path),
+            "aligned_instance_path": str(mesh_path),
+            "original_bounds_xyz_m": [bmin.tolist(), bmax.tolist()],
+            "original_panel_dimensions_m": {"width": width, "height": float(span[1]), "depth": DOOR_PANEL_DEPTH_M},
+            "original_panel_center_xyz_m": [center_x, (y_min + y_max) / 2.0, center_z],
+            "original_floor_elevation_m": floor["elevation_m"],
+            "original_floor_source": floor["source_path"],
+        }
+        doors.append({
+            "scan": scan_id, "class_id": int(record["class_id"]),
+            "instance_id": instance_index - 1, "instance_index": instance_index,
+            "description": description, "raw_width_m": width,
+            "raw_height_m": float(span[1]), "area_m2": float(mesh.area),
+            "vertices_global": vertices, "orientation": orientation,
+            "wall_axis": "X" if orientation == "Vertical" else "Z",
+            "wall_coord": plane_offset, "geom_downproj_min": downproj_min,
+            "geom_downproj_max": downproj_max, "geom_downproj_len": width,
+            "regularized_width_m": width, "regularized_height_m": float(span[1]),
+            "source_info": source_info, "original_floor": floor,
+        })
+
+    fit_axis_aligned_door_segments(doors, transforms_dict, scene_dir, enforce_proximity=False)
+    candidates = []
+    for door in doors:
+        start, end = np.asarray(door["segment_start"], dtype=float), np.asarray(door["segment_end"], dtype=float)
+        width = float(np.linalg.norm(end - start))
+        if width <= 0.0:
+            raise ValueError(f"Regularized door segment has invalid length: {door['description']}")
+        center_2d = np.asarray(door["center_2d"], dtype=float)
+        bottom = float(door["vertices_global"][:, 1].min())
+        height = float(door["vertices_global"][:, 1].max() - bottom)
+        if height <= 0.0:
+            raise ValueError(f"Aligned door has invalid vertical span: {door['description']}")
+        candidates.append({
+            "orientation": door["orientation"], "plane_offset": float(door["wall_coord"]),
+            "center_2d": center_2d.tolist(),
+            "original_bottom_y": bottom, "original_floor": door["original_floor"],
+            "width": width, "height": height, "source_info": door["source_info"],
+            "depth": DOOR_PANEL_DEPTH_M,
+            "t_min": float(center_2d[1] - width / 2.0) if door["orientation"] == "Vertical" else float(center_2d[0] - width / 2.0),
+            "t_max": float(center_2d[1] + width / 2.0) if door["orientation"] == "Vertical" else float(center_2d[0] + width / 2.0),
+            "y_min": bottom, "y_max": bottom + height,
+            "perimeter_clipping": door.get("perimeter_clipping", []),
+        })
+    candidates.sort(key=lambda panel: (
+        panel["source_info"]["scan_id"], panel["source_info"]["class_id"],
+        panel["source_info"]["instance_index"],
+    ))
+
+    # Complete-link grouping keeps a chain of nearby but distinct openings from merging.
+    merge_groups: List[List[Dict[str, Any]]] = []
+    pair_checks = []
+    for candidate_index, candidate in enumerate(candidates):
+        for previous in candidates[:candidate_index]:
+            center_plane_distance = abs(candidate["plane_offset"] - previous["plane_offset"])
+            face_to_face_distance = _panel_face_to_face_distance(candidate, previous)
+            overlap = _panel_overlap_ratio(candidate, previous)
+            eligible = (
+                candidate["orientation"] == previous["orientation"]
+                and face_to_face_distance <= 0.25 + 1e-8 and overlap >= 0.15 - 1e-8
+            )
+            pair_checks.append({
+                "source_a": previous["source_info"]["description"],
+                "source_b": candidate["source_info"]["description"],
+                "parallel": candidate["orientation"] == previous["orientation"],
+                "center_plane_distance_m": center_plane_distance,
+                "face_to_face_distance_m": face_to_face_distance,
+                "smaller_panel_overlap_fraction": overlap,
+                "meets_merge_criteria": eligible,
+            })
+        group = next((group for group in merge_groups if all(
+            panel["orientation"] == candidate["orientation"]
+            and _panel_face_to_face_distance(panel, candidate) <= 0.25 + 1e-8
+            and _panel_overlap_ratio(panel, candidate) >= 0.15 - 1e-8
+            for panel in group
+        )), None)
+        if group is None:
+            merge_groups.append([candidate])
+        else:
+            group.append(candidate)
+
+    source_merge_groups = {
+        panel["source_info"]["description"]: f"merge_{group_index:03d}"
+        for group_index, group in enumerate(merge_groups)
+        for panel in group
+    }
+    for check in pair_checks:
+        check["same_merge_group"] = (
+            source_merge_groups[check["source_a"]] == source_merge_groups[check["source_b"]]
+        )
+
+    merged_panels, merge_report = [], []
+    for group_index, group in enumerate(merge_groups):
+        winner = max(group, key=lambda panel: (
+            panel["width"] * panel["height"], panel["source_info"]["description"]
+        ))
+        center_2d = np.mean([panel["center_2d"] for panel in group], axis=0)
+        original_floor_values = [panel["original_floor"]["elevation_m"] for panel in group]
+        panel = {
+            "merge_group_id": f"merge_{group_index:03d}",
+            "orientation": winner["orientation"], "plane_offset": float(np.mean([p["plane_offset"] for p in group])),
+            "center_2d": center_2d.tolist(), "width": winner["width"], "height": winner["height"],
+            "size_source": winner["source_info"]["description"],
+            "sources": [p["source_info"] for p in group],
+            "source_scans": sorted({p["source_info"]["scan_id"] for p in group}),
+            "source_floor_mean_y": float(np.mean(original_floor_values)),
+            "perimeter_clipping": [note for p in group for note in p["perimeter_clipping"]],
+        }
+        merged_panels.append(panel)
+        merge_report.append({
+            "merge_group_id": panel["merge_group_id"],
+            "merged": len(group) > 1,
+            "source_instances": [p["source_info"] for p in group],
+            "midpoint_x_z_forward_before_plane_snap_m": center_2d.tolist(),
+            "selected_whole_panel_size_source": panel["size_source"],
+            "selected_original_dimensions_m": {"width": panel["width"], "height": panel["height"], "depth": DOOR_PANEL_DEPTH_M},
+        })
+
+    plane_groups: List[List[Dict[str, Any]]] = []
+    for orientation in ("Vertical", "Horizontal"):
+        oriented = sorted((p for p in merged_panels if p["orientation"] == orientation), key=lambda p: p["plane_offset"])
+        for panel in oriented:
+            group = next((group for group in reversed(plane_groups) if group[0]["orientation"] == orientation
+                          and panel["plane_offset"] - group[0]["plane_offset"] <= 0.15 + 1e-8), None)
+            if group is None:
+                plane_groups.append([panel])
+            else:
+                group.append(panel)
+
+    plane_report = []
+    for group_index, group in enumerate(plane_groups):
+        offsets = [panel["plane_offset"] for panel in group]
+        target_plane = float(np.mean(offsets))
+        winner = max(group, key=lambda panel: (
+            panel["width"] * panel["height"], panel["size_source"]
+        ))
+        plane_group_id = f"plane_{group_index:03d}"
+        for panel in group:
+            panel["plane_group_id"] = plane_group_id
+            panel["plane_offset_before_m"] = panel["plane_offset"]
+            panel["plane_offset"] = target_plane
+            panel["width_before_size_snap_m"] = winner["width"]
+            panel["height_before_size_snap_m"] = winner["height"]
+            panel["size_source"] = winner["size_source"]
+        plane_report.append({
+            "plane_group_id": plane_group_id,
+            "orientation": group[0]["orientation"],
+            "merge_group_ids": [panel["merge_group_id"] for panel in group],
+            "source_instances": [source for panel in group for source in panel["sources"]],
+            "plane_offsets_before_m": offsets, "plane_offset_after_m": target_plane,
+            "selected_whole_panel_size_source": winner["size_source"],
+            "shared_dimensions_before_global_snap_m": {"width": winner["width"], "height": winner["height"]},
+        })
+
+    panel_layouts = []
+    for index, panel_data in enumerate(merged_panels):
+        width_5cm = _nearest_step(panel_data["width_before_size_snap_m"], 0.05)
+        height_5cm = _nearest_step(panel_data["height_before_size_snap_m"], 0.05)
+        width = max(0.60, _nearest_step(width_5cm, 0.20))
+        height = _nearest_step(height_5cm, 0.20)
+        if height <= 0.0:
+            raise ValueError(f"Regularized door panel has invalid height: {panel_data['merge_group_id']}")
+        panel_data["width_snap_5cm_m"] = width_5cm
+        panel_data["height_snap_5cm_m"] = height_5cm
+        panel_data["width_final_m"] = width
+        panel_data["height_final_m"] = height
+
+        center_2d = np.asarray(panel_data["center_2d"], dtype=float)
+        if panel_data["orientation"] == "Vertical":
+            center_2d[0] = panel_data["plane_offset"]
+            center_x, center_z = float(center_2d[0]), -float(center_2d[1])
+        else:
+            center_2d[1] = panel_data["plane_offset"]
+            center_x, center_z = float(center_2d[0]), -float(center_2d[1])
+        floor_samples = []
+        for scan_id in panel_data["source_scans"]:
+            sample = _sample_aligned_floor(floor_cache.get(scan_id, []), center_x, center_z, panel_data["source_floor_mean_y"])
+            if sample is not None:
+                floor_samples.append((scan_id, sample))
+        if floor_samples:
+            scan_id, floor = min(floor_samples, key=lambda item: (
+                item[1]["method"] != "phase06_floor_triangle", item[1]["horizontal_distance_m"],
+                abs(item[1]["elevation_m"] - panel_data["source_floor_mean_y"]), item[0],
+            ))
+            floor["scan_id"] = scan_id
+        else:
+            floor = {
+                "elevation_m": panel_data["source_floor_mean_y"], "source_path": None,
+                "method": "source_floor_elevation_fallback_missing_phase06_floor",
+                "horizontal_distance_m": None, "scan_id": None,
+            }
+        panel_data["floor_data"] = floor
+        center_y = float(floor["elevation_m"] + height / 2.0)
+        tangent_axis = 1 if panel_data["orientation"] == "Vertical" else 0
+        center_t = float(center_2d[tangent_axis])
+        panel_layouts.append({
+            "panel_index": index,
+            "panel_data": panel_data,
+            "orientation": panel_data["orientation"],
+            "plane_offset": float(panel_data["plane_offset"]),
+            "depth": DOOR_PANEL_DEPTH_M,
+            "width": width,
+            "height": height,
+            "center_t": center_t,
+            "center_y": center_y,
+            "t_min": center_t - width / 2.0,
+            "t_max": center_t + width / 2.0,
+            "y_min": center_y - height / 2.0,
+            "y_max": center_y + height / 2.0,
+        })
+
+    common_width, width_distribution = _dimension_mode([layout["width"] for layout in panel_layouts])
+    common_height, height_distribution = _dimension_mode([layout["height"] for layout in panel_layouts])
+    overlap_pair_checks = []
+    overlap_adjacency = [set() for _ in panel_layouts]
+    for first_index, first in enumerate(panel_layouts):
+        for second_index in range(first_index + 1, len(panel_layouts)):
+            second = panel_layouts[second_index]
+            overlap = _panel_overlap_ratio(first, second)
+            qualifies = (
+                first["orientation"] == second["orientation"]
+                and overlap >= OVERLAP_REGULARIZATION_MIN_FRACTION - 1e-8
+            )
+            if qualifies:
+                overlap_adjacency[first_index].add(second_index)
+                overlap_adjacency[second_index].add(first_index)
+            overlap_pair_checks.append({
+                "panel_index_a": first_index,
+                "panel_index_b": second_index,
+                "merge_group_id_a": first["panel_data"]["merge_group_id"],
+                "merge_group_id_b": second["panel_data"]["merge_group_id"],
+                "parallel": first["orientation"] == second["orientation"],
+                "center_plane_distance_before_m": abs(first["plane_offset"] - second["plane_offset"]),
+                "projected_overlap_before_fraction": overlap,
+                "qualifies": qualifies,
+            })
+
+    overlap_groups = []
+    # shortcut: connected overlap chains share one target; use complete-link grouping if endpoints over-align distinct panels.
+    unseen = {index for index, neighbors in enumerate(overlap_adjacency) if neighbors}
+    while unseen:
+        stack = [min(unseen)]
+        group = []
+        unseen.remove(stack[0])
+        while stack:
+            current = stack.pop()
+            group.append(current)
+            for neighbor in sorted(overlap_adjacency[current] & unseen):
+                unseen.remove(neighbor)
+                stack.append(neighbor)
+        group.sort()
+        group_id = f"overlap_{len(overlap_groups):03d}"
+        target_t = float(np.mean([panel_layouts[index]["center_t"] for index in group]))
+        target_y = float(np.mean([panel_layouts[index]["center_y"] for index in group]))
+        member_reports = []
+        for index in group:
+            layout = panel_layouts[index]
+            panel_data = layout["panel_data"]
+            center_2d = np.asarray(panel_data["center_2d"], dtype=float)
+            tangent_axis = 1 if layout["orientation"] == "Vertical" else 0
+            center_before_t_y = [layout["center_t"], layout["center_y"]]
+            dimensions_before = {"width": layout["width"], "height": layout["height"]}
+            plane_offset = layout["plane_offset"]
+            if layout["orientation"] == "Vertical":
+                center_before_xyz = [plane_offset, layout["center_y"], -layout["center_t"]]
+            else:
+                center_before_xyz = [layout["center_t"], layout["center_y"], -plane_offset]
+
+            center_2d[tangent_axis] = target_t
+            panel_data["center_2d"] = center_2d.tolist()
+            panel_data["center_y_after_overlap_m"] = target_y
+            panel_data["width_final_m"] = common_width
+            panel_data["height_final_m"] = common_height
+            panel_data["overlap_regularization"] = {
+                "group_id": group_id,
+                "center_before_tangent_y_m": center_before_t_y,
+                "center_after_tangent_y_m": [target_t, target_y],
+                "dimensions_before_m": dimensions_before,
+                "dimensions_after_m": {"width": common_width, "height": common_height},
+                "center_plane_offset_before_m": plane_offset,
+                "center_plane_offset_after_m": plane_offset,
+            }
+            layout.update({
+                "width": common_width,
+                "height": common_height,
+                "center_t": target_t,
+                "center_y": target_y,
+                "t_min": target_t - common_width / 2.0,
+                "t_max": target_t + common_width / 2.0,
+                "y_min": target_y - common_height / 2.0,
+                "y_max": target_y + common_height / 2.0,
+            })
+            if layout["orientation"] == "Vertical":
+                center_after_xyz = [plane_offset, target_y, -target_t]
+            else:
+                center_after_xyz = [target_t, target_y, -plane_offset]
+            member_reports.append({
+                "panel_index": index,
+                "merge_group_id": panel_data["merge_group_id"],
+                "source_instances": panel_data["sources"],
+                "center_before_xyz_m": center_before_xyz,
+                "center_after_xyz_m": center_after_xyz,
+                "dimensions_before_m": dimensions_before,
+                "dimensions_after_m": {"width": common_width, "height": common_height},
+                "center_plane_offset_before_m": plane_offset,
+                "center_plane_offset_after_m": plane_offset,
+            })
+        overlap_groups.append({
+            "overlap_group_id": group_id,
+            "panel_indices": group,
+            "target_center_tangent_y_m": [target_t, target_y],
+            "projected_overlap_after_fraction": 1.0,
+            "members": member_reports,
+        })
+
+    for pair in overlap_pair_checks:
+        first, second = panel_layouts[pair["panel_index_a"]], panel_layouts[pair["panel_index_b"]]
+        first_group = first["panel_data"].get("overlap_regularization", {}).get("group_id")
+        second_group = second["panel_data"].get("overlap_regularization", {}).get("group_id")
+        pair["overlap_group_id"] = first_group if first_group == second_group else None
+        pair["projected_overlap_after_fraction"] = _panel_overlap_ratio(first, second)
+        pair["center_plane_distance_after_m"] = abs(first["plane_offset"] - second["plane_offset"])
+        pair["center_plane_distance_unchanged"] = bool(np.isclose(
+            pair["center_plane_distance_before_m"], pair["center_plane_distance_after_m"], atol=1e-10
+        ))
+
+    width_clusters: Dict[float, List[int]] = {}
+    height_clusters: Dict[float, List[int]] = {}
+    for index, panel_data in enumerate(merged_panels):
+        width_clusters.setdefault(round(panel_data["width_final_m"], 2), []).append(index)
+        height_clusters.setdefault(round(panel_data["height_final_m"], 2), []).append(index)
+
+    panel_meshes: List[trimesh.Trimesh] = []
+    door_metadata = []
+    for index, panel_data in enumerate(merged_panels):
+        width = panel_data["width_final_m"]
+        height = panel_data["height_final_m"]
+        center_2d = np.asarray(panel_data["center_2d"], dtype=float)
+        floor = panel_data["floor_data"]
+        if panel_data["orientation"] == "Vertical":
+            center_2d[0] = panel_data["plane_offset"]
+            center_x, center_z = float(center_2d[0]), -float(center_2d[1])
+        else:
+            center_2d[1] = panel_data["plane_offset"]
+            center_x, center_z = float(center_2d[0]), -float(center_2d[1])
+        center_y = float(panel_data.get("center_y_after_overlap_m", floor["elevation_m"] + height / 2.0))
+        center = np.array([center_x, center_y, center_z])
+        tangent = np.array([0.0, 0.0, -1.0]) if panel_data["orientation"] == "Vertical" else np.array([1.0, 0.0, 0.0])
+        up = np.array([0.0, 1.0, 0.0])
+        normal = np.cross(tangent, up)
+        normal /= np.linalg.norm(normal)
+        panel_mesh = trimesh.creation.box(extents=[width, height, DOOR_PANEL_DEPTH_M])
+        transform = np.eye(4)
+        transform[:3, :3] = np.column_stack((tangent, up, normal))
+        transform[:3, 3] = center
+        panel_mesh.apply_transform(transform)
+        panel_mesh.visual.vertex_colors = np.tile([190, 205, 220, 255], (len(panel_mesh.vertices), 1))
+        panel_meshes.append(panel_mesh)
+        panel_bounds = np.stack((panel_mesh.vertices.min(axis=0), panel_mesh.vertices.max(axis=0)))
+        sources = panel_data["sources"]
+        representative = next((source for source in sources if source["description"] == panel_data["size_source"]), sources[0])
+        start = center_2d.copy()
+        end = center_2d.copy()
+        tangent_axis = 1 if panel_data["orientation"] == "Vertical" else 0
+        start[tangent_axis] -= width / 2.0
+        end[tangent_axis] += width / 2.0
+        door_metadata.append({
+            "panel_index": index, "merge_group_id": panel_data["merge_group_id"],
+            "plane_group_id": panel_data["plane_group_id"],
+            "scan_id": representative["scan_id"], "source_class_id": representative["class_id"],
+            "instance_id": representative["instance_id"], "instance_index": representative["instance_index"],
+            "description": representative["description"], "source_instances": sources,
+            "selected_whole_panel_size_source": panel_data["size_source"],
+            "orientation": panel_data["orientation"],
+            "segment_start_x_z_forward_m": start.tolist(), "segment_end_x_z_forward_m": end.tolist(),
+            "segment_length_m": width,
+            "panel_dimensions_m": {"width": width, "height": height, "depth": DOOR_PANEL_DEPTH_M},
+            "dimension_snaps_m": {
+                "width_after_5cm_m": panel_data["width_snap_5cm_m"],
+                "height_after_5cm_m": panel_data["height_snap_5cm_m"],
+                "width_final_20cm_m": width, "height_final_20cm_m": height,
+            },
+            "panel_center_before_regularization_xyz_m": list(np.mean(
+                [source["original_panel_center_xyz_m"] for source in sources], axis=0
+            )),
+            "dimensions_before_global_snap_m": {
+                "width": panel_data["width_before_size_snap_m"],
+                "height": panel_data["height_before_size_snap_m"], "depth": DOOR_PANEL_DEPTH_M,
+            },
+            "panel_center_xyz_m": center.tolist(), "panel_plane_normal_xyz": normal.tolist(),
+            "panel_bounds_xyz_m": panel_bounds.tolist(),
+            "panel_bottom_elevation_m": float(panel_bounds[0, 1]),
+            "overlap_regularization": panel_data.get("overlap_regularization"),
+            "plane_offset_before_m": panel_data["plane_offset_before_m"],
+            "plane_offset_after_m": panel_data["plane_offset"],
+            "floor_elevation_m": floor["elevation_m"],
+            "floor_adjustment_from_source_mean_m": floor["elevation_m"] - panel_data["source_floor_mean_y"],
+            "floor_source": floor, "perimeter_clipping": panel_data["perimeter_clipping"],
+            "coordinate_frame": "phase07_aligned_global_y_up",
+        })
+
+    for dimension, clusters in (("width", width_clusters), ("height", height_clusters)):
+        for value, members in clusters.items():
+            for panel_index in members:
+                door_metadata[panel_index][f"{dimension}_dimension_cluster"] = f"{dimension}_{value:.2f}m"
+
+    panel_path = alignment_dir / "aligned_door_panels.ply"
+    panel_staging_path = panel_path.with_name(f".{panel_path.stem}.phase07.tmp.ply")
+    panel_mesh = trimesh.util.concatenate(panel_meshes) if panel_meshes else trimesh.Trimesh(process=False)
+    panel_mesh.export(str(panel_staging_path))
+    panel_staging_path.replace(panel_path)
+
+    metadata_path = alignment_dir / "stats" / "aligned_door_panels.json"
+    report_path = alignment_dir / "stats" / "door_panel_regularization_report.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "merge_criteria": {"maximum_face_to_face_distance_m": 0.25, "panel_depth_m": DOOR_PANEL_DEPTH_M,
+                           "minimum_smaller_panel_overlap_fraction": 0.15,
+                           "distance_measure": "gap between nearest panel faces, computed from center-plane distance minus half of each panel depth",
+                           "overlap_measure": "intersection area of width-by-height rectangles projected into the shared wall plane"},
+        "plane_regularization": {"maximum_center_plane_offset_range_m": 0.15, "target": "mean center-plane offset of the grouped panels"},
+        "overlap_regularization": {
+            "minimum_projected_overlap_fraction_of_smaller_panel": OVERLAP_REGULARIZATION_MIN_FRACTION,
+            "center_plane_distance_limit_m": None,
+            "grouping_method": "connected components of qualifying parallel-panel overlap pairs",
+            "dimension_mode_source": "all panels after preceding merge, plane, and 20 cm size regularization",
+            "dimensions_applied_to": "overlap groups only",
+            "dimension_mode_tie_break": "smallest dimension value",
+            "global_dimension_modes_m": {
+                "width": {"mode_m": common_width, "distribution": width_distribution},
+                "height": {"mode_m": common_height, "distribution": height_distribution},
+            },
+            "positioning": "connected overlap groups share their mean tangent and vertical center; each panel center-plane offset is preserved",
+            "groups": overlap_groups,
+            "pair_checks": overlap_pair_checks,
+        },
+        "floor_source": "aligned Phase 06 floor_level_*.ply; panel bottoms start at the sampled floor elevation before overlap-position alignment",
+        "dimension_regularization": {"order": ["nearest 0.05 m", "nearest 0.20 m"], "depth_m": DOOR_PANEL_DEPTH_M},
+        "pair_checks": pair_checks, "merge_groups": merge_report, "plane_groups": plane_report,
+        "dimension_clusters": {
+            "width": [{"dimension_m": value, "panel_indices": members} for value, members in sorted(width_clusters.items())],
+            "height": [{"dimension_m": value, "panel_indices": members} for value, members in sorted(height_clusters.items())],
+        },
+        "panels": [{
+            "panel_index": item["panel_index"], "merge_group_id": item["merge_group_id"],
+            "plane_group_id": item["plane_group_id"], "source_instances": item["source_instances"],
+            "center_before_xyz_m": item["panel_center_before_regularization_xyz_m"],
+            "center_after_xyz_m": item["panel_center_xyz_m"],
+            "dimensions_before_m": item["dimensions_before_global_snap_m"],
+            "dimensions_after_m": item["panel_dimensions_m"],
+            "panel_bottom_elevation_m": item["panel_bottom_elevation_m"],
+            "floor_adjustment_m": item["floor_adjustment_from_source_mean_m"],
+            "plane_offset_before_m": item["plane_offset_before_m"],
+            "plane_offset_after_m": item["plane_offset_after_m"],
+        } for item in door_metadata],
+    }
+    report_staging_path = report_path.with_name(f".{report_path.stem}.phase07.tmp.json")
+    report_staging_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_staging_path.replace(report_path)
+    metadata_staging_path = metadata_path.with_name(f".{metadata_path.stem}.phase07.tmp.json")
+    metadata_staging_path.write_text(json.dumps({
+        "schema_version": 2, "verification_ply": str(panel_path),
+        "regularization_report": str(report_path), "panel_depth_m": DOOR_PANEL_DEPTH_M,
+        "panel_placement": "center thickness on the regularized wall plane; bottom starts at aligned Phase 06 floor and may move during global overlap regularization",
+        "panels": door_metadata,
+    }, indent=2) + "\n", encoding="utf-8")
+    metadata_staging_path.replace(metadata_path)
+    return panel_path, metadata_path, len(door_metadata)
 
 
 def render_regularized_segments_topdown(
@@ -824,10 +1461,10 @@ def main() -> None:
     # 1. Door classes from Phase 05
     door_classes = get_door_classes_from_phase5(scene_dir)
 
-    # 2. Load instances, decompose multi-plane clusters, and filter outliers (min 50 cm x 1.2 m)
-    print("Loading door instances and filtering outliers (min 50 cm x 1.2 m)...")
+    # 2. Load instances, decompose multi-plane clusters, and filter outliers (min 60 cm x 1.2 m)
+    print("Loading door instances and filtering outliers (min 60 cm x 1.2 m)...")
     validated_doors, rejected_outliers = load_and_classify_door_instances(
-        scene_dir, transforms_dict, door_classes, min_width=0.50, min_height=1.20
+        scene_dir, transforms_dict, door_classes, min_width=0.60, min_height=1.20
     )
     print(f"Validated {len(validated_doors)} doors. Rejected {len(rejected_outliers)} outliers.")
 

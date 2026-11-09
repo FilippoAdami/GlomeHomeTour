@@ -202,7 +202,16 @@ def transform_depth_poses_in_place(path: Path, transform: np.ndarray) -> None:
 
 def publish_aligned_poses(staged_sparse: Path, sparse_dir: Path,
                           depth_poses: Path, transform: np.ndarray) -> None:
+    # These derived records override the edited text poses in COLMAP readers.
+    stale_models = [sparse_dir / name for name in (
+        "cameras.bin", "images.bin", "points3D.bin", "frames.bin", "rigs.bin",
+        "frames.txt", "rigs.txt",
+    ) if (sparse_dir / name).is_file()]
     paths = [sparse_dir / "images.txt", sparse_dir / "points3D.txt"]
+    sparse_ply = sparse_dir / "points3D.ply"
+    if sparse_ply.is_file():
+        paths.append(sparse_ply)
+    paths.extend(stale_models)
     if depth_poses.is_file():
         paths.append(depth_poses)
     original = {path: path.read_bytes() for path in paths}
@@ -210,6 +219,10 @@ def publish_aligned_poses(staged_sparse: Path, sparse_dir: Path,
         (staged_sparse / "images.txt").replace(sparse_dir / "images.txt")
         (staged_sparse / "points3D.txt").replace(sparse_dir / "points3D.txt")
         transform_depth_poses_in_place(depth_poses, transform)
+        if sparse_ply.is_file():
+            transform_mesh_ply(sparse_ply, transform)
+        for path in stale_models:
+            path.unlink()
     except BaseException:
         for path, data in original.items():
             temporary = path.with_name(path.name + ".restore.tmp")

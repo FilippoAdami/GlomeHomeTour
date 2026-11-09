@@ -62,8 +62,9 @@ class Drawing:
         self.root = ET.Element('svg', xmlns=SVG_NS, width=f'{length:g}mm',
                                height=f'{width:g}mm', viewBox=f'0 0 {length:g} {width:g}')
         ET.SubElement(self.root, 'rect', width=f'{length:g}', height=f'{width:g}', fill='white')
+        stroke_width = min(16, max(8, length / 100, width / 100))
         self.group = ET.SubElement(self.root, 'g', fill='white', stroke='black',
-                                   **{'stroke-width': f'{min(7, length / 150, width / 150):g}',
+                                   **{'stroke-width': f'{stroke_width:g}',
                                       'stroke-linejoin': 'round', 'stroke-linecap': 'round'})
 
     def element(self, tag, **attrs):
@@ -88,10 +89,17 @@ def positions(start, end, spacing):
     return [start + (end - start) * i / count for i in range(1, count)]
 
 
-def sized_svg(class_id: int, width_m: float, length_m: float) -> str:
+def sized_svg(
+    class_id: int,
+    width_m: float,
+    length_m: float,
+    *,
+    validate_dimensions: bool = True,
+) -> str:
     """Return a standalone SVG. Length runs along X; width/depth runs along Y.
 
-    Out-of-range footprints raise ValueError; bounds in DIMENSION_LIMITS are inclusive.
+    Out-of-range footprints raise ValueError by default; bounds in DIMENSION_LIMITS are inclusive.
+    Set validate_dimensions=False only when an upstream step already accepted the instance.
     Fixed details shrink only when a valid footprint is too small to contain them.
     All classes use explicit geometry rules; no anisotropic SVG scaling is used.
     """
@@ -100,16 +108,17 @@ def sized_svg(class_id: int, width_m: float, length_m: float) -> str:
     for name, value in (('width', width_m), ('length', length_m)):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f'{name} must be a finite positive number of metres')
-    min_width, max_width, min_length, max_length = DIMENSION_LIMITS[class_id]
-    for name, value, lower, upper in (
-        ('width/depth (Y)', width_m, min_width, max_width),
-        ('length (X)', length_m, min_length, max_length),
-    ):
-        if not lower <= value <= upper:
-            raise ValueError(
-                f'class {class_id} ({CLASS_NAMES[class_id]}): {name} must be '
-                f'between {lower:g} and {upper:g} m inclusive; got {value:g} m'
-            )
+    if validate_dimensions:
+        min_width, max_width, min_length, max_length = DIMENSION_LIMITS[class_id]
+        for name, value, lower, upper in (
+            ('width/depth (Y)', width_m, min_width, max_width),
+            ('length (X)', length_m, min_length, max_length),
+        ):
+            if not lower <= value <= upper:
+                raise ValueError(
+                    f'class {class_id} ({CLASS_NAMES[class_id]}): {name} must be '
+                    f'between {lower:g} and {upper:g} m inclusive; got {value:g} m'
+                )
     w, h = length_m * 1000, width_m * 1000
     d = Drawing(w, h)
     # Small uniform inset keeps strokes within the exact requested canvas.

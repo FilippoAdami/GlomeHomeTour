@@ -177,6 +177,29 @@ class MultiAssetSynchronizer:
             T = transforms[sname]
             scan_dir = scan.info.scan_dir
             instances_to_process = []
+            scene_manifest = scan_dir / "segmentation" / "segmentation.json"
+            door_categories = {}
+            if scene_manifest.is_file():
+                scene_data = json.loads(scene_manifest.read_text(encoding="utf-8"))
+                door_categories = {
+                    (int(item["class_id"]), int(item["instance_index"]) - 1): item
+                    for item in scene_data.get("door_instances", [])
+                }
+
+            def object_metadata(class_id: int, instance_path: Path, category: str, relative_dir: str) -> Dict[str, Any]:
+                instance_id = int(instance_path.stem.removeprefix("instance_")) - 1
+                item = {
+                    "class_id": class_id,
+                    "category": category,
+                    "role": "object",
+                    "path": f"{relative_dir}/{instance_path.name}",
+                }
+                door = door_categories.get((class_id, instance_id))
+                if door:
+                    item["category"] = str(door["category"])
+                    item["text_class_id"] = int(door["text_class_id"])
+                return item
+
             masks_dir = scan_dir / "segmentation" / "3d_masks"
             if masks_dir.is_dir():
                 for class_dir in sorted(masks_dir.iterdir()):
@@ -185,12 +208,7 @@ class MultiAssetSynchronizer:
                     parts = class_dir.name.split("_")
                     class_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
                     for inst_ply in sorted(class_dir.glob("instance_*.ply")):
-                        instances_to_process.append((inst_ply, {
-                            "class_id": class_id,
-                            "category": class_dir.name,
-                            "role": "object",
-                            "path": f"{class_dir.name}/{inst_ply.name}",
-                        }))
+                        instances_to_process.append((inst_ply, object_metadata(class_id, inst_ply, class_dir.name, class_dir.name)))
             else:
                 legacy_dir = scan_dir / "segmentation" / "Instances PLYs" / "Non-Structural"
                 for class_dir in sorted(legacy_dir.iterdir()) if legacy_dir.is_dir() else []:
@@ -201,12 +219,7 @@ class MultiAssetSynchronizer:
                     except ValueError:
                         continue
                     for inst_ply in sorted(class_dir.glob("instance_*.ply")):
-                        instances_to_process.append((inst_ply, {
-                            "class_id": class_id,
-                            "category": class_dir.name,
-                            "role": "object",
-                            "path": f"{class_dir.name}/{inst_ply.name}",
-                        }))
+                        instances_to_process.append((inst_ply, object_metadata(class_id, inst_ply, class_dir.name, class_dir.name)))
 
             logger.info(f"Processing {len(instances_to_process)} object instances for {sname}...")
             scan_target_dir = output_objects_dir / sname
@@ -225,7 +238,7 @@ class MultiAssetSynchronizer:
                 m.export(str(target_ply))
 
                 v = m.vertices
-                manifest_records.append({
+                record = {
                     "scan_id": sname,
                     "class_id": item["class_id"],
                     "category": item["category"],
@@ -238,7 +251,10 @@ class MultiAssetSynchronizer:
                     "local_placement_translation_m": [0.0, 0.0, 0.0],
                     "global_bounding_box": v.min(axis=0).tolist() + v.max(axis=0).tolist(),
                     "global_centroid": v.mean(axis=0).tolist(),
-                })
+                }
+                if "text_class_id" in item:
+                    record["text_class_id"] = item["text_class_id"]
+                manifest_records.append(record)
                 all_object_meshes.append(m)
 
         # Export combined scene of all aligned objects

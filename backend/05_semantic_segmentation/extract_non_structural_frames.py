@@ -62,6 +62,15 @@ except Exception as _e:
 
 
 STRUCTURAL_ROLES = {"floor", "ceiling", "wall", "stair", "stairs"}
+ELONGATED_TRIANGLE_ASPECT_RATIO = 12.0
+MAX_ELONGATED_TRIANGLE_AREA_RATIO = 0.25
+OVEREXPOSED_PIXEL_VALUE = 250
+MAX_OVEREXPOSED_PIXEL_RATIO = 0.20
+MIN_TARGET_MESH_VISIBILITY = 0.0
+MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION = 0.75
+VERY_GOOD_INCIDENCE_DEVIATION_DEG = 30.0
+GOOD_INCIDENCE_DEVIATION_DEG = 45.0
+MAX_INCIDENCE_PENALTY = 50.0
 
 
 def is_structural_role(role: str) -> bool:
@@ -121,7 +130,7 @@ def decompose_class_instances(
     triangles: np.ndarray,
     class_tri_mask: np.ndarray,
     min_faces: int = 30,
-    min_area: float = 0.005,
+    min_area: float = 0.3,
 ) -> List[Dict[str, Any]]:
     """
     Cluster class triangles into connected components and filter small floaters.
@@ -143,6 +152,7 @@ def decompose_class_instances(
     clusters, comp_counts, comp_areas = sub_mesh.cluster_connected_triangles()
     clusters = np.asarray(clusters)
     comp_counts = np.asarray(comp_counts)
+    # Open3D sums each triangle face once, which also works for open meshes.
     comp_areas = np.asarray(comp_areas)
 
     if len(comp_counts) == 0:
@@ -153,7 +163,10 @@ def decompose_class_instances(
         if comp_counts[i] >= min_faces and comp_areas[i] >= min_area
     ]
     if not valid_indices:
-        valid_indices = [int(np.argmax(comp_areas))]
+        largest = int(np.argmax(comp_areas))
+        if comp_areas[largest] < min_area:
+            return []
+        valid_indices = [largest]
 
     valid_indices = sorted(valid_indices, key=lambda idx: comp_areas[idx], reverse=True)
 
@@ -163,6 +176,19 @@ def decompose_class_instances(
         comp_tri = remapped_tri[faces_in_comp]
         comp_v_local = np.unique(comp_tri)
         comp_pts = c_vertices[comp_v_local]
+        component_tri_indices = c_tri_indices[faces_in_comp]
+        component_triangles = vertices[triangles[component_tri_indices]]
+        component_centers = component_triangles.mean(axis=1)
+        component_areas = 0.5 * np.linalg.norm(
+            np.cross(
+                component_triangles[:, 1] - component_triangles[:, 0],
+                component_triangles[:, 2] - component_triangles[:, 0],
+            ),
+            axis=1,
+        )
+        sample_indices = np.linspace(
+            0, len(component_centers) - 1, min(128, len(component_centers)), dtype=int
+        )
 
         b_min = comp_pts.min(axis=0)
         b_max = comp_pts.max(axis=0)
@@ -177,6 +203,10 @@ def decompose_class_instances(
             "bbox_min": b_min,
             "bbox_max": b_max,
             "dimensions": b_max - b_min,
+            "triangle_indices": component_tri_indices,
+            "visibility_points": component_centers[sample_indices],
+            "visibility_weights": component_areas[sample_indices],
+            "visibility_triangle_indices": component_tri_indices[sample_indices],
         })
 
     return instances
@@ -249,6 +279,7 @@ def validate_rendered_frame(
     min_autocorr: float = 0.35,
     min_p95_grad: float = 1.25,
     min_edge_density: float = 1.0,
+    elongated_triangle_area_ratio: Optional[float] = None,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Validate that a rendered frame contains meaningful, non-degenerate visual content.
@@ -257,7 +288,8 @@ def validate_rendered_frame(
     - Empty or have fewer than `min_fg_pixels` foreground pixels.
     - Pure noise (lag-1 spatial autocorrelation < min_autocorr for high-variance crops).
     - Just a single color (< min_unique_colors 16-bin quantized colors, dynamic range < min_dynamic_range, or gray std < min_color_std).
-    - Featureless flat / blurry surfaces (few quantized colors with low gradient edges: p95_grad < min_p95_grad or edge_density < min_edge_density).
+    - Featureless / blurry surfaces (low p95 gradient together with low color diversity or low Laplacian sharpness).
+    - Frames dominated by overexposed pixels or visible elongated mesh triangles.
     - Ragged noise floaters / mesh artifacts (fill_pct < 85% with low contrast and low gradient).
 
     All spatial feature calculations (std, dynamic range, gradients, quantized palette) are evaluated
@@ -303,6 +335,7 @@ def validate_rendered_frame(
     gray_valid = gray[eroded]
     gray_std = float(gray_valid.std())
     gray_ptp = float(gray_valid.max() - gray_valid.min())
+    overexposed_ratio = float(np.all(crop[eroded, :3] >= OVEREXPOSED_PIXEL_VALUE, axis=1).mean())
 
     # Quantized colors (16-step bins -> 4096 bins to ignore vertex interpolation noise)
     fg_rgb = crop[eroded, :3]
@@ -356,7 +389,26 @@ def validate_rendered_frame(
         "lap_var": round(lap_var, 4),
         "autocorr": round(autocorr, 3),
         "fill_pct": round(fill_pct, 1),
+        "overexposed_pixel_ratio": round(overexposed_ratio, 3),
     }
+
+    if elongated_triangle_area_ratio is not None:
+        metrics["elongated_triangle_area_ratio"] = round(float(elongated_triangle_area_ratio), 3)
+        if elongated_triangle_area_ratio >= MAX_ELONGATED_TRIANGLE_AREA_RATIO:
+            return (
+                False,
+                "mesh_artifact: excessive_elongated_triangles "
+                f"(area_ratio={elongated_triangle_area_ratio:.3f} >= {MAX_ELONGATED_TRIANGLE_AREA_RATIO:.2f})",
+                metrics,
+            )
+
+    if overexposed_ratio >= MAX_OVEREXPOSED_PIXEL_RATIO:
+        return (
+            False,
+            "overexposed: clipped_highlights "
+            f"(pixel_ratio={overexposed_ratio:.3f} >= {MAX_OVEREXPOSED_PIXEL_RATIO:.2f})",
+            metrics,
+        )
 
     # 1. Pure noise check:
     if autocorr < min_autocorr and gray_std > 8.0:
@@ -389,10 +441,14 @@ def validate_rendered_frame(
         )
 
     # 3. No recognizable features (flat or blurry surfaces):
-    if uniq_q < 28 and p95_grad < min_p95_grad:
+    if (
+        p95_grad < min_p95_grad
+        and (uniq_q < 28 or lap_var < min_laplacian_var)
+    ):
         return (
             False,
-            f"no_recognizable_features: flat_or_blurry_surface (uniq_q={uniq_q} < 28, p95_grad={p95_grad:.2f} < {min_p95_grad:.2f})",
+            "no_recognizable_features: flat_or_blurry_surface "
+            f"(unique_colors={uniq_q}, lap_var={lap_var:.4f}, p95_grad={p95_grad:.2f})",
             metrics,
         )
 
@@ -990,6 +1046,178 @@ def compute_non_structural_purity(
     return float(purity), float(visibility)
 
 
+def _target_mesh_visibility(
+    raycast_scene: Optional[o3d.t.geometry.RaycastingScene],
+    cam_eyes: np.ndarray,
+    instance: Dict[str, Any],
+) -> Optional[float | np.ndarray]:
+    """Estimate visible target surface area from sampled face-center ray hits."""
+    if raycast_scene is None or not len(instance.get("triangle_indices", [])):
+        return None
+    points = np.asarray(instance.get("visibility_points", []), dtype=np.float32)
+    weights = np.asarray(instance.get("visibility_weights", []), dtype=np.float32)
+    if not len(points) or len(points) != len(weights) or float(weights.sum()) <= 0.0:
+        return None
+
+    eyes = np.asarray(cam_eyes, dtype=np.float32)
+    single_eye = eyes.ndim == 1
+    eyes = eyes.reshape(-1, 3)
+    directions = points[None, :, :] - eyes[:, None, :]
+    distances = np.linalg.norm(directions, axis=2)
+    valid = distances > 1e-5
+    directions = directions / np.maximum(distances[:, :, None], 1e-5)
+    origins = np.repeat(eyes[:, None, :], len(points), axis=1)
+    rays = o3d.core.Tensor(np.concatenate([origins, directions], axis=2).reshape(-1, 6))
+    primitive_ids = raycast_scene.cast_rays(rays)["primitive_ids"].numpy().reshape(len(eyes), len(points))
+    target_hits = np.isin(primitive_ids, np.asarray(instance["triangle_indices"])) & valid
+    visible_area = (target_hits * weights[None, :]).sum(axis=1)
+    total_area = (valid * weights[None, :]).sum(axis=1)
+    visibility = np.divide(visible_area, total_area, out=np.zeros_like(visible_area), where=total_area > 0.0)
+    return float(visibility[0]) if single_eye else visibility
+
+
+def _triangle_centroid_frustum_fov(
+    centroids: np.ndarray,
+    eye: np.ndarray,
+    forward: np.ndarray,
+    minimum_fov_deg: float,
+) -> tuple[float, float]:
+    """Choose the narrowest FOV that includes all target triangle centroids when possible."""
+    if not len(centroids):
+        return float(minimum_fov_deg), 0.0
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    right = np.cross(forward, up)
+    right /= max(float(np.linalg.norm(right)), 1e-6)
+    camera_up = np.cross(right, forward)
+    camera_up /= max(float(np.linalg.norm(camera_up)), 1e-6)
+    relative = centroids - eye
+    depth = relative @ forward
+    extent = np.full(len(centroids), np.inf, dtype=np.float64)
+    in_front = depth > 0.05
+    if np.any(in_front):
+        extent[in_front] = np.maximum(
+            np.abs((relative @ right)[in_front] / depth[in_front]),
+            np.abs((relative @ camera_up)[in_front] / depth[in_front]),
+        )
+
+    required_count = len(extent)
+    required_extent = np.partition(extent, required_count - 1)[required_count - 1]
+    max_fov_deg = 170.0
+    if np.isfinite(required_extent):
+        required_fov = float(np.degrees(2.0 * np.arctan(1.02 * required_extent)))
+    else:
+        required_fov = max_fov_deg
+    fov = float(np.clip(max(minimum_fov_deg, required_fov), minimum_fov_deg, max_fov_deg))
+    fraction = float(np.count_nonzero(extent <= np.tan(np.radians(fov / 2.0))) / max(1, len(extent)))
+    return fov, fraction
+
+
+def _target_triangle_incidence_quality(
+    cam_eyes: np.ndarray,
+    instance: Dict[str, Any],
+    all_vertices: np.ndarray,
+    all_triangles: np.ndarray,
+) -> Optional[tuple[float | np.ndarray, float | np.ndarray, float | np.ndarray]]:
+    """Return area-weighted incidence penalty and good/very-good face shares.
+
+    Face-on views are centered at 90 degrees: 60–120 degrees is very good,
+    45–135 degrees is good, and the remaining incidence angles are penalized.
+    Absolute normal alignment makes the measure insensitive to triangle winding.
+    """
+    points = np.asarray(instance.get("visibility_points", []), dtype=np.float64)
+    weights = np.asarray(instance.get("visibility_weights", []), dtype=np.float64)
+    triangle_ids = np.asarray(instance.get("visibility_triangle_indices", []), dtype=np.int64)
+    if not len(points) or len(points) != len(weights) or len(points) != len(triangle_ids):
+        return None
+
+    sampled_triangles = all_vertices[all_triangles[triangle_ids]]
+    normals = np.cross(
+        sampled_triangles[:, 1] - sampled_triangles[:, 0],
+        sampled_triangles[:, 2] - sampled_triangles[:, 0],
+    )
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    valid_faces = (weights > 0.0) & (normal_lengths > 1e-10)
+    normals /= np.maximum(normal_lengths[:, None], 1e-10)
+
+    eyes = np.asarray(cam_eyes, dtype=np.float64)
+    single_eye = eyes.ndim == 1
+    eyes = eyes.reshape(-1, 3)
+    rays = eyes[:, None, :] - points[None, :, :]
+    ray_lengths = np.linalg.norm(rays, axis=2)
+    valid_rays = ray_lengths > 1e-8
+    rays /= np.maximum(ray_lengths[:, :, None], 1e-8)
+    normal_alignment = np.clip(np.abs(np.einsum("mni,ni->mn", rays, normals)), 0.0, 1.0)
+    deviation_from_frontal = np.degrees(np.arccos(normal_alignment))
+    very_good = deviation_from_frontal <= VERY_GOOD_INCIDENCE_DEVIATION_DEG + 1e-6
+    good = deviation_from_frontal <= GOOD_INCIDENCE_DEVIATION_DEG + 1e-6
+
+    valid = valid_rays & valid_faces[None, :]
+    sampled_area = valid * weights[None, :]
+    total_area = sampled_area.sum(axis=1)
+    very_good_fraction = np.divide(
+        (sampled_area * very_good).sum(axis=1), total_area,
+        out=np.zeros_like(total_area), where=total_area > 0.0,
+    )
+    good_fraction = np.divide(
+        (sampled_area * good).sum(axis=1), total_area,
+        out=np.zeros_like(total_area), where=total_area > 0.0,
+    )
+    # Very-good triangles score 1, good-only triangles 0.5, and bad triangles 0.
+    quality = very_good_fraction + 0.5 * (good_fraction - very_good_fraction)
+    penalty = np.where(total_area > 0.0, 1.0 - quality, 0.0)
+    if single_eye:
+        return float(penalty[0]), float(very_good_fraction[0]), float(good_fraction[0])
+    return penalty, very_good_fraction, good_fraction
+
+
+def _visible_elongated_triangle_area_ratio(
+    raycast_scene: Optional[o3d.t.geometry.RaycastingScene],
+    cam_eyes: np.ndarray,
+    instance: Dict[str, Any],
+    all_vertices: np.ndarray,
+    all_triangles: np.ndarray,
+) -> Optional[float | np.ndarray]:
+    """Estimate the visible target-area share carried by highly elongated faces."""
+    if raycast_scene is None:
+        return None
+    points = np.asarray(instance.get("visibility_points", []), dtype=np.float32)
+    weights = np.asarray(instance.get("visibility_weights", []), dtype=np.float32)
+    if not len(points) or len(points) != len(weights):
+        return None
+
+    eyes = np.asarray(cam_eyes, dtype=np.float32)
+    single_eye = eyes.ndim == 1
+    eyes = eyes.reshape(-1, 3)
+    directions = points[None, :, :] - eyes[:, None, :]
+    distances = np.linalg.norm(directions, axis=2)
+    valid = distances > 1e-5
+    directions /= np.maximum(distances[:, :, None], 1e-5)
+    origins = np.repeat(eyes[:, None, :], len(points), axis=1)
+    rays = o3d.core.Tensor(np.concatenate([origins, directions], axis=2).reshape(-1, 6))
+    primitive_ids = raycast_scene.cast_rays(rays)["primitive_ids"].numpy().reshape(len(eyes), len(points))
+    hit_target = np.isin(primitive_ids, np.asarray(instance["triangle_indices"])) & valid
+    safe_ids = np.where(hit_target, primitive_ids, 0).astype(np.int64)
+    hit_triangles = all_vertices[all_triangles[safe_ids]]
+    edge_sq = np.stack((
+        np.sum((hit_triangles[:, :, 1] - hit_triangles[:, :, 0]) ** 2, axis=2),
+        np.sum((hit_triangles[:, :, 2] - hit_triangles[:, :, 1]) ** 2, axis=2),
+        np.sum((hit_triangles[:, :, 0] - hit_triangles[:, :, 2]) ** 2, axis=2),
+    ), axis=2)
+    double_area = np.linalg.norm(np.cross(
+        hit_triangles[:, :, 1] - hit_triangles[:, :, 0],
+        hit_triangles[:, :, 2] - hit_triangles[:, :, 0],
+    ), axis=2)
+    aspect = np.max(edge_sq, axis=2) / np.maximum(double_area, 1e-12)
+    weighted_visible_area = hit_target * weights[None, :]
+    total_visible = weighted_visible_area.sum(axis=1)
+    elongated_visible = (weighted_visible_area * (aspect >= ELONGATED_TRIANGLE_ASPECT_RATIO)).sum(axis=1)
+    ratios = np.divide(
+        elongated_visible, total_visible,
+        out=np.zeros_like(elongated_visible, dtype=np.float32), where=total_visible > 0.0,
+    )
+    return float(ratios[0]) if single_eye else ratios
+
+
 def render_synthetic_in_context_frame(
     instance: Dict[str, Any],
     all_vertices: np.ndarray,
@@ -1008,18 +1236,20 @@ def render_synthetic_in_context_frame(
     raycast_scene: Optional[o3d.t.geometry.RaycastingScene] = None,
     min_resolution: Optional[int] = None,
     padding_color: str = "black",
-    floor_levels: Optional[List[Dict[str, Any]]] = None,
-    human_height_offset: float = 1.50,
     min_wall_distance: float = 0.80,
     min_triangle_distance: float = 0.10,
     other_non_structural_instances: Optional[List[Dict[str, Any]]] = None,
     renderer: Optional[o3d.visualization.rendering.OffscreenRenderer] = None,
-) -> Tuple[Image.Image, Dict[str, Any]]:
+) -> Dict[str, Tuple[Image.Image, Dict[str, Any]]]:
     """
     Render a high-resolution synthetic in-context view of an instance.
     Features:
-    1. Human-Level Height Camera Positioning:
-       - Uses relative floor height of the instance's floor level + 1.50m.
+    1. Full-Surround Camera Search:
+       - Searches 360 degrees around the instance at 30-degree intervals.
+       - Samples camera heights from instance minimum +1m through maximum +1.5m.
+       - Frames all target triangle centroids when possible; keeps 75% as the minimum.
+       - Prefers the greatest jointly in-frame and unobstructed target coverage.
+       - Uses fewer elongated mesh triangles as a secondary view-quality preference.
     2. Wall Distance Clearance & Triangle Distance Clearance:
        - Enforces camera location to be at least 0.8m inside of the nearest wall.
        - Enforces camera location to be at least min_triangle_distance (default 0.10m = 10cm)
@@ -1046,19 +1276,17 @@ def render_synthetic_in_context_frame(
     inst_center = (inst_min + inst_max) / 2.0
     inst_dims = instance["dimensions"]
     radius = float(np.linalg.norm(inst_dims) / 2.0)
-
-    # 1. Floor level & human eye height
-    fl_list = floor_levels or [{"level_index": 0, "floor_y": float(all_vertices[:, 1].min())}]
-    floor_level = assign_instance_to_floor_level(inst_pts, fl_list)
-    relative_floor_y = float(floor_level["floor_y"])
-    level_index = int(floor_level["level_index"])
-    target_eye_y = relative_floor_y + human_height_offset
+    triangle_indices = np.asarray(instance.get("triangle_indices", []), dtype=np.int64)
+    triangle_centroids = all_vertices[all_triangles[triangle_indices]].mean(axis=1)
 
     room_pts_min = all_vertices.min(axis=0)
     room_pts_max = all_vertices.max(axis=0)
-    eye_y_min = room_pts_min[1] + 0.35
-    eye_y_max = room_pts_max[1] - 0.35
-    eye_y = float(np.clip(target_eye_y, eye_y_min, eye_y_max))
+    requested_min_camera_y = float(inst_min[1] + 1.0)
+    requested_max_camera_y = float(inst_max[1] + 1.5)
+    min_camera_y = requested_min_camera_y
+    max_camera_y = requested_max_camera_y
+    candidate_eye_ys = list(np.arange(min_camera_y, max_camera_y, 0.25)) + [max_camera_y]
+    candidate_eye_ys = sorted(set(round(float(value), 4) for value in candidate_eye_ys))
 
     # 2. Identify biggest side and its outward normal
     biggest_side_info = identify_instance_biggest_side(inst_pts, room_center, class_id=class_id)
@@ -1086,17 +1314,20 @@ def render_synthetic_in_context_frame(
 
     t_h = np.array([-norm_h[1], norm_h[0]])
 
-    az_angles = [-18.0, -12.0, -6.0, 6.0, 12.0, 18.0]
+    az_angles = list(range(0, 360, 30))
 
     base_dist = max(1.0, 1.2 * radius)
+    room_span_xz = float(np.linalg.norm(room_pts_max[[0, 2]] - room_pts_min[[0, 2]]))
+    max_camera_distance = min(8.0, max(3.2, 0.65 * room_span_xz))
     dists = [base_dist * f for f in [0.85, 1.15, 1.50]]
-    dists = sorted(list(set([float(np.clip(round(d, 2), 0.80, 3.20)) for d in dists])))
+    dists = sorted(set(float(np.clip(round(d, 2), 0.80, max_camera_distance)) for d in dists))
 
-    if inst_center[1] > (eye_y + 0.15):
-        target_pitches = [18.0, 28.0, 42.0]
+    room_direction = room_center[[0, 2]] - inst_center[[0, 2]]
+    room_direction_norm = float(np.linalg.norm(room_direction))
+    if room_direction_norm > 1e-4:
+        room_direction /= room_direction_norm
     else:
-        target_pitches = [-18.0, -28.0, -42.0]
-
+        room_direction = norm_h.copy()
     active_scene = raycast_scene if raycast_scene is not None else wall_scene
     up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
@@ -1120,33 +1351,25 @@ def render_synthetic_in_context_frame(
     cand_eyes_list = []
     eye_meta_list = []
 
-    for dist in dists:
-        for az in az_angles:
-            rad_az = np.radians(az)
-            dir_h_2d = norm_h * np.cos(rad_az) + t_h * np.sin(rad_az)
-            cand_eye = np.array([
-                inst_center[0] + dir_h_2d[0] * dist,
-                eye_y,
-                inst_center[2] + dir_h_2d[1] * dist,
-            ])
-            # Check basic perimeter bounds
-            if (
-                cand_eye[0] < room_pts_min[0] + 0.35
-                or cand_eye[0] > room_pts_max[0] - 0.35
-                or cand_eye[2] < room_pts_min[2] + 0.35
-                or cand_eye[2] > room_pts_max[2] - 0.35
-            ):
-                continue
+    for candidate_eye_y in candidate_eye_ys:
+        for dist in dists:
+            for az in az_angles:
+                rad_az = np.radians(az)
+                dir_h_2d = norm_h * np.cos(rad_az) + t_h * np.sin(rad_az)
+                cand_eye = np.array([
+                    inst_center[0] + dir_h_2d[0] * dist,
+                    candidate_eye_y,
+                    inst_center[2] + dir_h_2d[1] * dist,
+                ])
+                d_wall = min(
+                    float(cand_eye[0] - room_pts_min[0]),
+                    float(room_pts_max[0] - cand_eye[0]),
+                    float(cand_eye[2] - room_pts_min[2]),
+                    float(room_pts_max[2] - cand_eye[2]),
+                )
 
-            d_wall = min(
-                float(cand_eye[0] - room_pts_min[0]),
-                float(room_pts_max[0] - cand_eye[0]),
-                float(cand_eye[2] - room_pts_min[2]),
-                float(room_pts_max[2] - cand_eye[2]),
-            )
-
-            cand_eyes_list.append(cand_eye)
-            eye_meta_list.append((dir_h_2d, dist, az, d_wall))
+                cand_eyes_list.append(cand_eye)
+                eye_meta_list.append((dir_h_2d, dist, az, d_wall))
 
     # Constraint: Camera must be at least min_triangle_distance (>= 10cm) away from nearest triangle
     valid_eyes = []
@@ -1178,12 +1401,12 @@ def render_synthetic_in_context_frame(
 
     # 2. For surviving camera positions, build pitch and look proposals
     proposal_data = []
-    ray_batch = []
 
     for c_eye, (dir_h_2d, dist, az, d_wall, tri_dist) in zip(valid_eyes, valid_eye_meta):
         v_to_c = inst_center - c_eye
         d_to_c = float(np.linalg.norm(v_to_c))
         nat_pitch = float(np.degrees(np.arcsin(v_to_c[1] / max(1e-4, d_to_c))))
+        target_pitches = [18.0, 28.0, 42.0] if inst_center[1] > c_eye[1] + 0.15 else [-18.0, -28.0, -42.0]
 
         pitches_to_test = []
         if 15.0 <= abs(nat_pitch) <= 75.0:
@@ -1207,64 +1430,89 @@ def render_synthetic_in_context_frame(
             v_look /= l_dist
 
             proposal_data.append((c_eye, tgt_pt, v_look, pitch_val, az, dist, d_wall, nat_pitch, l_dist, tri_dist))
-            ray_batch.append(np.hstack([c_eye, v_look]))
 
-    # 3. Batched Raycasting for line-of-sight clearance (all rays in one SIMD call)
-    if active_scene is not None and ray_batch:
-        ray_tensor = o3d.core.Tensor(np.array(ray_batch, dtype=np.float32))
-        ans = active_scene.cast_rays(ray_tensor)
-        t_hits = ans["t_hit"].numpy()
-    else:
-        t_hits = np.full(len(proposal_data), np.inf, dtype=np.float32)
-
-    raw_candidates_strict = []
     raw_candidates_all = []
     target_norm_arr = np.array([target_normal[0], target_normal[1], target_normal[2]], dtype=np.float32)
 
     for idx, (c_eye, tgt_pt, v_look, pitch_val, az, dist, d_wall, nat_pitch, l_dist, tri_dist) in enumerate(proposal_data):
-        if t_hits[idx] < (l_dist - 0.25):
-            continue  # occluded along line of sight
-
-        pts_rel = inst_pts - c_eye
-        f_vec = v_look
-        r_vec = np.cross(f_vec, up)
-        r_norm = float(np.linalg.norm(r_vec))
-        if r_norm < 1e-4:
+        req_fov, triangle_frustum_fraction = _triangle_centroid_frustum_fov(
+            triangle_centroids, c_eye, v_look, fov_deg
+        )
+        if triangle_frustum_fraction < MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION:
             continue
-        r_vec /= r_norm
-        u_vec = np.cross(r_vec, f_vec)
-        u_vec /= np.maximum(float(np.linalg.norm(u_vec)), 1e-6)
-
-        p_cam_x = pts_rel @ r_vec
-        p_cam_y = pts_rel @ u_vec
-        p_cam_z = pts_rel @ f_vec
-        valid_z = p_cam_z > 0.05
-        if not np.any(valid_z):
-            continue
-
-        theta_x = float(np.max(np.abs(p_cam_x[valid_z] / p_cam_z[valid_z])))
-        theta_y = float(np.max(np.abs(p_cam_y[valid_z] / p_cam_z[valid_z])))
-        req_fov = float(np.degrees(2.0 * np.arctan(max(np.tan(np.radians(25.0)), 1.35 * max(theta_x, theta_y)))))
 
         geom_score = (
             25.0 * min(d_wall, 1.20)
+            + 5.0 * (d_wall >= min_wall_distance)
             + 15.0 * max(0.0, float(np.dot(v_look, -target_norm_arr)))
             - abs(dist - base_dist) * 8.0
             - abs(req_fov - 55.0) * 0.5
             - abs(pitch_val - nat_pitch) * 0.2
         )
-        item = (geom_score, c_eye, tgt_pt, v_look, pitch_val, az, dist, req_fov, d_wall, tri_dist)
+        item = (
+            geom_score, c_eye, tgt_pt, v_look, pitch_val, az, dist,
+            req_fov, d_wall, tri_dist, triangle_frustum_fraction,
+        )
         raw_candidates_all.append(item)
-        if d_wall >= min_wall_distance:
-            raw_candidates_strict.append(item)
 
-    # Sort geometrically best candidates and evaluate purity only on the top pool
-    pool = raw_candidates_strict if raw_candidates_strict else raw_candidates_all
+    # Compare sampled target-surface visibility across the full camera candidate set.
+    pool = raw_candidates_all
     pool.sort(key=lambda x: x[0], reverse=True)
-    top_candidates = pool[:5]
+    pool_visibility = _target_mesh_visibility(
+        active_scene, np.asarray([candidate[1] for candidate in pool]), instance
+    ) if pool else None
+    target_visibility_available = pool_visibility is not None
+    if pool_visibility is None:
+        pool_visibility = np.zeros(len(pool), dtype=np.float32)
+    pool_elongated_ratio = _visible_elongated_triangle_area_ratio(
+        active_scene, np.asarray([candidate[1] for candidate in pool]),
+        instance, all_vertices, all_triangles,
+    ) if pool else None
+    if pool_elongated_ratio is None:
+        pool_elongated_ratio = np.zeros(len(pool), dtype=np.float32)
+    pool_incidence = _target_triangle_incidence_quality(
+        np.asarray([candidate[1] for candidate in pool]), instance, all_vertices, all_triangles
+    ) if pool else None
+    if pool_incidence is None:
+        pool_incidence_penalty = np.zeros(len(pool), dtype=np.float32)
+        pool_very_good_fraction = np.zeros(len(pool), dtype=np.float32)
+        pool_good_fraction = np.zeros(len(pool), dtype=np.float32)
+    else:
+        pool_incidence_penalty, pool_very_good_fraction, pool_good_fraction = pool_incidence
+    candidates_by_height: Dict[float, List[tuple]] = {}
+    for candidate, mesh_visibility, elongated_ratio, incidence_penalty, very_good_fraction, good_fraction in zip(
+        pool, pool_visibility, pool_elongated_ratio, pool_incidence_penalty,
+        pool_very_good_fraction, pool_good_fraction,
+    ):
+        if target_visibility_available and mesh_visibility <= MIN_TARGET_MESH_VISIBILITY:
+            continue
+        height = round(float(candidate[1][1]), 3)
+        triangle_frustum_fraction = float(candidate[10])
+        priority = (
+            candidate[0] + 60.0 * float(mesh_visibility) - 80.0 * float(elongated_ratio)
+            - MAX_INCIDENCE_PENALTY * float(incidence_penalty)
+        )
+        candidates_by_height.setdefault(height, []).append(
+            (priority, float(mesh_visibility), triangle_frustum_fraction,
+             float(elongated_ratio), float(incidence_penalty),
+             float(very_good_fraction), float(good_fraction), candidate)
+        )
+    top_candidates = []
+    for height_candidates in candidates_by_height.values():
+        height_candidates.sort(
+            key=lambda item: (min(item[1], item[2]), item[2], item[1], item[0]),
+            reverse=True,
+        )
+        top_candidates.extend(
+            (mesh_visibility, triangle_frustum_fraction, elongated_ratio, incidence_penalty,
+             very_good_fraction, good_fraction, candidate)
+            for _, mesh_visibility, triangle_frustum_fraction, elongated_ratio, incidence_penalty,
+            very_good_fraction, good_fraction, candidate in height_candidates[:2]
+        )
 
     scored_candidates = []
-    for geom_score, c_eye, tgt_pt, v_look, pitch_val, az, dist, req_fov, d_wall, tri_dist in top_candidates:
+    for mesh_visibility, triangle_frustum_fraction, elongated_ratio, incidence_penalty, very_good_fraction, good_fraction, candidate in top_candidates:
+        geom_score, c_eye, tgt_pt, v_look, pitch_val, az, dist, req_fov, d_wall, tri_dist, _ = candidate
         purity, vis = compute_non_structural_purity(
             cam_eye=c_eye,
             cam_look=v_look,
@@ -1275,176 +1523,227 @@ def render_synthetic_in_context_frame(
             grid_size=64,
             target_inst_id=instance.get("instance_id"),
         )
-        total_score = geom_score + 120.0 * purity + 30.0 * vis
+        total_score = (
+            geom_score + 120.0 * purity + 30.0 * vis
+            + 60.0 * mesh_visibility - 100.0 * elongated_ratio
+            - MAX_INCIDENCE_PENALTY * incidence_penalty
+        )
         scored_candidates.append((
-            total_score, c_eye, tgt_pt, v_look, pitch_val, az, dist, req_fov, d_wall, purity, vis, tri_dist
+            total_score, mesh_visibility, triangle_frustum_fraction, elongated_ratio, incidence_penalty,
+            very_good_fraction, good_fraction, c_eye, tgt_pt, v_look, pitch_val,
+            az, dist, d_wall, purity, vis, tri_dist,
         ))
 
     if scored_candidates:
-        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        scored_candidates.sort(
+            key=lambda x: (min(x[1], x[2]), x[2], x[1], x[0]),
+            reverse=True,
+        )
         (
             best_score,
+            best_mesh_visibility,
+            _,
+            best_elongated_triangle_ratio,
+            best_incidence_penalty,
+            best_very_good_incidence_fraction,
+            best_good_incidence_fraction,
             best_eye,
             best_target,
             best_look,
             best_pitch,
             best_az,
             best_dist,
-            cam_fov_deg,
             best_d_wall,
             best_purity,
             best_vis,
             best_tri_dist,
         ) = scored_candidates[0]
+        camera_search_fallback = False
     else:
-        # Fallback candidate satisfying constraints
-        best_az = 15.0
-        rad_az = np.radians(best_az)
-        dir_h_2d = norm_h * np.cos(rad_az) + t_h * np.sin(rad_az)
-        best_eye = np.array([
-            inst_center[0] + dir_h_2d[0] * base_dist,
-            eye_y,
-            inst_center[2] + dir_h_2d[1] * base_dist,
-        ])
-        best_pitch = -20.0 if inst_center[1] <= eye_y else 20.0
-        rad_p = np.radians(best_pitch)
-        best_look = np.array([
-            -dir_h_2d[0] * np.cos(rad_p),
-            np.sin(rad_p),
-            -dir_h_2d[1] * np.cos(rad_p),
-        ])
-        best_look /= np.linalg.norm(best_look)
-        best_target = best_eye + best_look * base_dist
-        best_dist = base_dist
-        cam_fov_deg = 50.0
+        camera_search_fallback = True
+        best_az = 0.0
+        fallback_dist = min(max(base_dist, 0.80), max_camera_distance)
+        fallback_eye_xz = inst_center[[0, 2]] + room_direction * fallback_dist
+        min_eye_xz = room_pts_min[[0, 2]] + 0.35
+        max_eye_xz = room_pts_max[[0, 2]] - 0.35
+        if np.all(min_eye_xz <= max_eye_xz):
+            fallback_eye_xz = np.clip(fallback_eye_xz, min_eye_xz, max_eye_xz)
+        else:
+            fallback_eye_xz = room_center[[0, 2]].copy()
+        fallback_height = candidate_eye_ys[len(candidate_eye_ys) // 2]
+        best_eye = np.array([fallback_eye_xz[0], fallback_height, fallback_eye_xz[1]])
+        best_target = inst_center.copy()
+        best_look = best_target - best_eye
+        best_dist = float(np.linalg.norm(best_look))
+        best_look /= max(best_dist, 1e-6)
+        best_pitch = float(np.degrees(np.arcsin(np.clip(best_look[1], -1.0, 1.0))))
         best_d_wall = min(
-            float(best_eye[0] - room_pts_min[0]),
-            float(room_pts_max[0] - best_eye[0]),
-            float(best_eye[2] - room_pts_min[2]),
-            float(room_pts_max[2] - best_eye[2]),
+            float(best_eye[0] - room_pts_min[0]), float(room_pts_max[0] - best_eye[0]),
+            float(best_eye[2] - room_pts_min[2]), float(room_pts_max[2] - best_eye[2]),
         )
-        best_purity = 1.0
-        best_vis = 1.0
-        best_score = 100.0
-        best_tri_dist = 0.50
+        best_purity, best_vis = compute_non_structural_purity(
+            cam_eye=best_eye, cam_look=best_look, up=up, inst_pts=inst_pts,
+            target_cid=class_id, other_instances=relevant_other_instances,
+            grid_size=64, target_inst_id=instance.get("instance_id"),
+        )
+        visibility = _target_mesh_visibility(active_scene, best_eye, instance)
+        best_mesh_visibility = float(visibility) if visibility is not None else 0.0
+        elongated_ratio = _visible_elongated_triangle_area_ratio(
+            active_scene, best_eye, instance, all_vertices, all_triangles
+        )
+        best_elongated_triangle_ratio = float(elongated_ratio) if elongated_ratio is not None else 0.0
+        incidence = _target_triangle_incidence_quality(best_eye, instance, all_vertices, all_triangles)
+        if incidence is None:
+            best_incidence_penalty = best_very_good_incidence_fraction = best_good_incidence_fraction = 0.0
+        else:
+            best_incidence_penalty, best_very_good_incidence_fraction, best_good_incidence_fraction = incidence
+        if active_scene is not None:
+            distance = active_scene.compute_distance(
+                o3d.core.Tensor(best_eye[None, :], dtype=o3d.core.Dtype.Float32)
+            ).numpy()
+            best_tri_dist = float(distance[0])
+        else:
+            best_tri_dist = 0.0
+        best_score = (
+            120.0 * best_purity + 30.0 * best_vis
+            + 60.0 * best_mesh_visibility - 100.0 * best_elongated_triangle_ratio
+            - MAX_INCIDENCE_PENALTY * best_incidence_penalty
+        )
 
-    best_align = float(np.dot(best_look, -np.array([target_normal[0], target_normal[1], target_normal[2]]))) if not is_top_view else float(-best_look[1])
+    base_forward = (best_target - best_eye) / np.linalg.norm(best_target - best_eye)
+    camera_right = np.cross(base_forward, up)
+    camera_right_norm = float(np.linalg.norm(camera_right))
+    camera_right = camera_right / camera_right_norm if camera_right_norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+    offsets = {
+        "base": np.zeros(3, dtype=np.float64),
+        "up": up * 0.20,
+        "down": -up * 0.20,
+        "left": -camera_right * 0.20,
+        "right": camera_right * 0.20,
+    }
 
-    # 3b. Verify FOV dynamically fits target instance with margin
-    pts_rel = inst_pts - best_eye
-    f_vec = (best_target - best_eye) / np.linalg.norm(best_target - best_eye)
-    r_vec = np.cross(f_vec, up)
-    r_norm = float(np.linalg.norm(r_vec))
-    if r_norm > 1e-6:
-        r_vec /= r_norm
-    else:
-        r_vec = np.array([1.0, 0.0, 0.0])
-    u_vec = np.cross(r_vec, f_vec)
-    u_vec /= np.maximum(float(np.linalg.norm(u_vec)), 1e-6)
-
-    p_cam_x = pts_rel @ r_vec
-    p_cam_y = pts_rel @ u_vec
-    p_cam_z = pts_rel @ f_vec
-
-    valid_z = p_cam_z > 0.05
-    if np.any(valid_z):
-        theta_x = float(np.max(np.abs(p_cam_x[valid_z] / p_cam_z[valid_z])))
-        theta_y = float(np.max(np.abs(p_cam_y[valid_z] / p_cam_z[valid_z])))
-        theta_max = max(theta_x, theta_y)
-        req_fov_rad = 2.0 * np.arctan(max(np.tan(np.radians(fov_deg / 2.0)), 1.35 * theta_max))
-        cam_fov_deg = float(np.degrees(req_fov_rad))
-
-    culled_count = 0
-    culled_cids = []
-
-    # 4. Render with persistent renderer (fast) or temporary fallback renderer
-    if renderer is not None:
-        renderer.setup_camera(cam_fov_deg, best_target.tolist(), best_eye.tolist(), up.tolist())
-        img_o3d = renderer.render_to_image()
-        raw_arr = np.asarray(img_o3d)
-    else:
+    temp_renderer = renderer
+    if temp_renderer is None:
         render_mesh = o3d.geometry.TriangleMesh()
         render_mesh.vertices = o3d.utility.Vector3dVector(all_vertices)
         render_mesh.triangles = o3d.utility.Vector3iVector(all_triangles)
         if all_vertex_colors is not None and len(all_vertex_colors) > 0:
             render_mesh.vertex_colors = o3d.utility.Vector3dVector(all_vertex_colors)
         render_mesh.compute_vertex_normals()
-
         temp_renderer = o3d.visualization.rendering.OffscreenRenderer(render_res, render_res)
         mat = o3d.visualization.rendering.MaterialRecord()
         mat.shader = "defaultUnlit"
         temp_renderer.scene.set_background([0.0, 0.0, 0.0, 1.0], None)
         temp_renderer.scene.add_geometry("scene", render_mesh, mat)
-        temp_renderer.setup_camera(cam_fov_deg, best_target.tolist(), best_eye.tolist(), up.tolist())
 
-        img_o3d = temp_renderer.render_to_image()
-        raw_arr = np.asarray(img_o3d)
+    views: Dict[str, Tuple[Image.Image, Dict[str, Any]]] = {}
+    for view_name, offset in offsets.items():
+        view_eye = best_eye + offset
+        view_target = best_target if view_name == "base" else inst_center
+        f_vec = (view_target - view_eye) / np.linalg.norm(view_target - view_eye)
+        r_vec = np.cross(f_vec, up)
+        r_vec /= max(float(np.linalg.norm(r_vec)), 1e-6)
+        u_vec = np.cross(r_vec, f_vec)
+        u_vec /= max(float(np.linalg.norm(u_vec)), 1e-6)
 
-    # 5. Project instance points to 2D image coordinates to find tight bounding box
-    fov_rad = np.radians(cam_fov_deg)
-    fy = (render_res / 2.0) / np.tan(fov_rad / 2.0)
-    fx = fy
-    cx, cy = render_res / 2.0, render_res / 2.0
+        pts_rel = inst_pts - view_eye
+        p_cam_x = pts_rel @ r_vec
+        p_cam_y = pts_rel @ u_vec
+        p_cam_z = pts_rel @ f_vec
+        valid_z = p_cam_z > 0.05
+        if not np.any(valid_z):
+            raise ValueError(f"Camera pose {view_name} cannot see class {class_id} instance")
 
-    in_f = p_cam_z > 0.05
-    u_proj = fx * (p_cam_x[in_f] / p_cam_z[in_f]) + cx
-    v_proj = cy - fy * (p_cam_y[in_f] / p_cam_z[in_f])
+        min_fov = fov_deg
+        view_fov, triangle_frustum_fraction = _triangle_centroid_frustum_fov(
+            triangle_centroids, view_eye, f_vec, min_fov
+        )
 
-    u0, u1 = float(u_proj.min()), float(u_proj.max())
-    v0, v1 = float(v_proj.min()), float(v_proj.max())
-    bw = u1 - u0
-    bh = v1 - v0
+        temp_renderer.setup_camera(view_fov, view_target.tolist(), view_eye.tolist(), up.tolist())
+        raw_arr = np.asarray(temp_renderer.render_to_image())
 
-    # 6. Rectangular bounding box with padding along both dimensions:
-    min_dim = min(bw, bh)
-    box_pad = padding * min_dim
-    cu0 = max(0, int(np.floor(u0 - box_pad)))
-    cu1 = min(render_res, int(np.ceil(u1 + box_pad)))
-    cv0 = max(0, int(np.floor(v0 - box_pad)))
-    cv1 = min(render_res, int(np.ceil(v1 + box_pad)))
+        focal = (render_res / 2.0) / np.tan(np.radians(view_fov / 2.0))
+        u_proj = focal * (p_cam_x[valid_z] / p_cam_z[valid_z]) + render_res / 2.0
+        v_proj = render_res / 2.0 - focal * (p_cam_y[valid_z] / p_cam_z[valid_z])
+        bw = float(u_proj.max() - u_proj.min())
+        bh = float(v_proj.max() - v_proj.min())
+        box_pad = padding * min(bw, bh)
+        cu0 = max(0, int(np.floor(u_proj.min() - box_pad)))
+        cu1 = min(render_res, int(np.ceil(u_proj.max() + box_pad)))
+        cv0 = max(0, int(np.floor(v_proj.min() - box_pad)))
+        cv1 = min(render_res, int(np.ceil(v_proj.max() + box_pad)))
+        crop_arr = raw_arr[cv0:cv1, cu0:cu1]
+        crop_h, crop_w = crop_arr.shape[:2]
+        square_png = pad_crop_to_square(crop_arr, min_side=min_resolution, padding_color=padding_color)
 
-    crop_arr = raw_arr[cv0:cv1, cu0:cu1]
-    crop_h, crop_w = crop_arr.shape[:2]
+        pitch = float(np.degrees(np.arcsin(np.clip(f_vec[1], -1.0, 1.0))))
+        eye_to_instance = view_eye[[0, 2]] - inst_center[[0, 2]]
+        azimuth = float(np.degrees(np.arctan2(np.dot(eye_to_instance, t_h), np.dot(eye_to_instance, norm_h))))
+        alignment = float(np.dot(f_vec, -np.asarray(target_normal))) if not is_top_view else float(-f_vec[1])
+        view_mesh_visibility = _target_mesh_visibility(active_scene, view_eye, instance)
+        view_target_visibility_available = view_mesh_visibility is not None
+        if view_mesh_visibility is None:
+            view_mesh_visibility = best_mesh_visibility
+        if active_scene is not None:
+            view_tri_dist = float(active_scene.compute_distance(
+                o3d.core.Tensor(view_eye[None, :], dtype=o3d.core.Dtype.Float32)
+            ).numpy()[0])
+        else:
+            view_tri_dist = best_tri_dist
+        camera_pose_clearance_valid = view_tri_dist >= min_triangle_distance
+        view_elongated_ratio = _visible_elongated_triangle_area_ratio(
+            active_scene, view_eye, instance, all_vertices, all_triangles
+        )
+        if view_elongated_ratio is None:
+            view_elongated_ratio = best_elongated_triangle_ratio
+        view_incidence = _target_triangle_incidence_quality(view_eye, instance, all_vertices, all_triangles)
+        if view_incidence is None:
+            view_incidence_penalty = best_incidence_penalty
+            view_very_good_incidence_fraction = best_very_good_incidence_fraction
+            view_good_incidence_fraction = best_good_incidence_fraction
+        else:
+            view_incidence_penalty, view_very_good_incidence_fraction, view_good_incidence_fraction = view_incidence
+        meta = {
+            "view_name": view_name,
+            "camera_height_above_instance_top_m": round(float(view_eye[1] - inst_max[1]), 3),
+            "biggest_side": side_name,
+            "biggest_side_area_m2": biggest_side_info["area_m2"],
+            "biggest_side_alignment": round(alignment, 3),
+            "is_top_view": is_top_view,
+            "camera_eye": [round(float(v), 4) for v in view_eye],
+            "camera_target": [round(float(v), 4) for v in view_target],
+            "camera_distance_m": round(float(np.linalg.norm(view_eye - inst_center)), 3),
+            "camera_distance_to_nearest_wall_m": round(float(best_d_wall), 3),
+            "camera_distance_to_nearest_triangle_m": round(float(view_tri_dist), 3),
+            "camera_search_height_range_m": [round(min_camera_y, 3), round(max_camera_y, 3)],
+            "camera_pose_clearance_valid": camera_pose_clearance_valid,
+            "camera_pitch_deg": round(pitch, 1),
+            "camera_azimuth_deg": round(azimuth, 1),
+            "camera_roll_deg": 0.0,
+            "frame_orientation": "portrait" if crop_h >= crop_w else "landscape",
+            "camera_fov_deg": round(view_fov, 1),
+            "target_triangle_frustum_fraction": float(triangle_frustum_fraction),
+            "purity_ratio": round(float(best_purity), 3),
+            "target_visibility": round(float(best_vis), 3),
+            "target_mesh_visibility": float(view_mesh_visibility),
+            "target_mesh_visibility_available": view_target_visibility_available,
+            "visible_elongated_triangle_area_ratio": round(float(view_elongated_ratio), 3),
+            "triangle_incidence_penalty": round(float(MAX_INCIDENCE_PENALTY * view_incidence_penalty), 2),
+            "very_good_triangle_area_fraction": round(float(view_very_good_incidence_fraction), 3),
+            "good_triangle_area_fraction": round(float(view_good_incidence_fraction), 3),
+            "camera_search_fallback": camera_search_fallback,
+            "candidate_score": round(float(best_score), 2),
+            "raw_render_res": render_res,
+            "crop_coords": [cu0, cv0, cu1, cv1],
+            "crop_size": [crop_w, crop_h],
+            "square_size": square_png.size[0],
+            "padding_color": padding_color,
+            "is_square_padded_transparent": (padding_color == "transparent"),
+            "aspect_ratio_orig": round(bw / max(1.0, bh), 3),
+        }
+        views[view_name] = (square_png, meta)
 
-    # 7. Square padding with black (or transparent) pixels if square format is requested
-    square_png = pad_crop_to_square(
-        crop_arr, min_side=min_resolution, padding_color=padding_color
-    )
-
-    meta = {
-        "floor_level": level_index,
-        "relative_floor_elevation_m": round(relative_floor_y, 4),
-        "target_human_height_m": round(human_height_offset, 2),
-        "actual_camera_height_above_floor_m": round(float(best_eye[1] - relative_floor_y), 3),
-        "biggest_side": side_name,
-        "biggest_side_area_m2": biggest_side_info["area_m2"],
-        "biggest_side_alignment": round(best_align, 3),
-        "is_top_view": is_top_view,
-        "camera_eye": [round(float(v), 4) for v in best_eye],
-        "camera_target": [round(float(v), 4) for v in best_target],
-        "camera_distance_m": round(float(best_dist), 3),
-        "camera_distance_to_nearest_wall_m": round(float(best_d_wall), 3),
-        "camera_distance_to_nearest_triangle_m": round(float(best_tri_dist), 3),
-        "camera_pitch_deg": round(float(best_pitch), 1),
-        "camera_azimuth_deg": round(float(best_az), 1),
-        "camera_roll_deg": 0.0,
-        "frame_orientation": "portrait" if crop_h >= crop_w else "landscape",
-        "camera_fov_deg": round(cam_fov_deg, 1),
-        "purity_ratio": round(float(best_purity), 3),
-        "target_visibility": round(float(best_vis), 3),
-        "candidate_score": round(float(best_score), 2),
-        "culled_foreground_triangles": culled_count,
-        "culled_foreground_cids": culled_cids,
-        "raw_render_res": render_res,
-        "crop_coords": [cu0, cv0, cu1, cv1],
-        "crop_size": [crop_w, crop_h],
-        "square_size": square_png.size[0],
-        "padding_color": padding_color,
-        "is_square_padded_transparent": (padding_color == "transparent"),
-        "aspect_ratio_orig": round(bw / max(1.0, bh), 3),
-    }
-
-    return square_png, meta
+    return views
 
 
 
@@ -1552,20 +1851,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-instance-area",
         type=float,
-        default=0.005,
-        help="Minimum area (m^2) to qualify as an instance component",
+        default=0.3,
+        help="Minimum summed triangle surface area (m^2) to qualify as an instance component",
     )
     parser.add_argument(
         "--levels-manifest",
         type=Path,
         default=None,
         help="Optional structural levels manifest JSON; floor levels are otherwise detected from the scan mesh.",
-    )
-    parser.add_argument(
-        "--human-height-offset",
-        type=float,
-        default=1.50,
-        help="Target camera height in meters above relative floor level (default: 1.50m)",
     )
     parser.add_argument(
         "--min-wall-distance",
@@ -1659,7 +1952,6 @@ def run_extraction(
     skip_gs: bool = False,
     device: str = "cuda",
     levels_manifest_path: Optional[Path] = None,
-    human_height_offset: float = 1.50,
     min_wall_distance: float = 0.80,
     min_triangle_distance: float = 0.10,
     padding: float = 0.10,
@@ -1668,7 +1960,7 @@ def run_extraction(
     min_resolution: Optional[int] = None,
     padding_color: str = "black",
     min_instance_faces: int = 30,
-    min_instance_area: float = 0.005,
+    min_instance_area: float = 0.3,
     enable_quality_check: bool = True,
     mesh_discarded_dir: Optional[Path] = None,
     gs_discarded_dir: Optional[Path] = None,
@@ -1719,7 +2011,7 @@ def run_extraction(
             try:
                 ckpt_file = resolve_gs_checkpoint_path(workspace, checkpoint_path)
                 logger.info(f"Loading Gaussian Splats from {ckpt_file} onto {device}...")
-                splats, sh_degree = load_gaussian_splats(ckpt_file, device=device)
+                splats, sh_degree = load_gaussian_splats(ckpt_file, device=device, workspace=workspace)
                 enable_gs = True
                 gs_output_dir.mkdir(parents=True, exist_ok=True)
                 logger.info(f"Loaded {len(splats['means']):,} Gaussians (SH degree {sh_degree}).")
@@ -1765,11 +2057,7 @@ def run_extraction(
     )
     print(f"Detected {len(floor_levels)} floor level(s):")
     for fl in floor_levels:
-        eye_lvl_h = fl["floor_y"] + human_height_offset
-        print(
-            f"  Level {fl['level_index']}: floor elevation {fl['floor_y']:.3f}m -> "
-            f"human camera eye height {eye_lvl_h:.3f}m"
-        )
+        print(f"  Level {fl['level_index']}: floor elevation {fl['floor_y']:.3f}m")
 
     # Build RaycastingScene for line-of-sight clearance (structural and non-structural)
     raycast_scene = None
@@ -1802,7 +2090,6 @@ def run_extraction(
         "structural_metadata": str(structural_json_path),
         "levels_manifest": str(levels_manifest_path) if levels_manifest_path else None,
         "floor_levels": floor_levels,
-        "human_height_offset": human_height_offset,
         "min_wall_distance": min_wall_distance,
         "min_triangle_distance": min_triangle_distance,
         "mode": "synthetic_in_context_mesh_render",
@@ -1892,10 +2179,7 @@ def run_extraction(
         for inst in instances:
             inst_id = int(inst["instance_id"])
             inst_key = f"{cid}_{inst_id}"
-            inst_filename = f"class_{cid:03d}_inst_{inst_id:03d}.png"
-
-            # 1. Mesh Render
-            square_png, render_meta = render_synthetic_in_context_frame(
+            view_frames = render_synthetic_in_context_frame(
                 instance=inst,
                 all_vertices=vertices,
                 all_triangles=triangles,
@@ -1911,90 +2195,120 @@ def run_extraction(
                 wall_scene=raycast_scene,
                 min_resolution=effective_min_res,
                 padding_color=padding_color,
-                floor_levels=floor_levels,
-                human_height_offset=human_height_offset,
                 min_wall_distance=min_wall_distance,
                 min_triangle_distance=min_triangle_distance,
                 other_non_structural_instances=all_non_struct_instances,
                 renderer=shared_renderer,
             )
-
-            is_mesh_valid = True
-            mesh_reason = "valid"
-            mesh_metrics: Dict[str, Any] = {}
-            if enable_quality_check:
-                is_mesh_valid, mesh_reason, mesh_metrics = validate_rendered_frame(
-                    square_png,
-                    min_unique_colors=min_unique_colors,
-                    min_dynamic_range=min_dynamic_range,
-                    min_color_std=min_color_std,
-                    min_laplacian_var=min_laplacian_var,
-                    min_fg_pixels=min_fg_pixels,
-                    min_autocorr=min_autocorr,
-                    min_p95_grad=min_p95_grad,
-                    min_edge_density=min_edge_density,
-                )
-
-            mesh_png_path = mesh_output_dir / inst_filename
-            if is_mesh_valid:
-                save_futures.append(save_pool.submit(square_png.save, mesh_png_path, "PNG", compress_level=1))
-            else:
-                mesh_discarded_dir.mkdir(parents=True, exist_ok=True)
-                discard_mesh_path = mesh_discarded_dir / inst_filename
-                save_futures.append(save_pool.submit(square_png.save, discard_mesh_path, "PNG", compress_level=1))
-                if mesh_png_path.exists():
-                    try:
-                        mesh_png_path.unlink()
-                    except OSError:
-                        pass
-                mesh_manifest["discarded_instances"][inst_key] = {
-                    "class_id": cid,
-                    "instance_id": inst_id,
-                    "role": role,
-                    "file": inst_filename,
-                    "reason": mesh_reason,
-                    "metrics": mesh_metrics,
-                    **render_meta,
+            if not view_frames:
+                reason = "camera_search_produced_no_views"
+                for view_name in ("base", "up", "down", "left", "right"):
+                    filename = f"class_{cid:03d}_inst_{inst_id:03d}_{view_name}.png"
+                    for directory in (mesh_output_dir, mesh_discarded_dir, gs_output_dir, gs_discarded_dir):
+                        (directory / filename).unlink(missing_ok=True)
+                record = {
+                    "class_id": cid, "instance_id": inst_id, "role": role,
+                    "file": None, "reason": reason,
                 }
-                logger.info(f"  [DISCARDED MESH] Class {cid:3d} Inst {inst_id:2d}: {mesh_reason} -> saved to {discard_mesh_path}")
+                mesh_manifest["discarded_instances"][f"{inst_key}:camera_search"] = record
+                if gs_manifest is not None:
+                    gs_manifest["discarded_instances"][f"{inst_key}:camera_search"] = record
+                logger.warning("Skipping %s: %s", inst_key, reason)
+                continue
+            base_meta = view_frames["base"][1]
+            mesh_frame_records: Dict[str, Any] = {}
+            gs_frame_records: Dict[str, Any] = {}
+            mesh_valid_count = 0
+            gs_valid_count = 0
 
-            # 2. Gaussian Splat Render (if enabled)
-            gs_png_path: Optional[Path] = None
-            is_gs_valid = True
-            save_gs = False
-            gs_reason = "valid"
-            gs_metrics: Dict[str, Any] = {}
-            if enable_gs and splats is not None:
-                eye = np.array(render_meta["camera_eye"], dtype=np.float32)
-                target = np.array(render_meta["camera_target"], dtype=np.float32)
-                cam_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-                cam_fov = float(render_meta["camera_fov_deg"])
-                r_res = int(render_meta.get("raw_render_res", render_res))
-                crop_coords = render_meta.get("crop_coords")
+            for view_name, (square_png, render_meta) in view_frames.items():
+                inst_filename = f"class_{cid:03d}_inst_{inst_id:03d}_{view_name}.png"
+                target_visibility = render_meta["target_mesh_visibility"]
+                pose_reason = None
+                if not render_meta["camera_pose_clearance_valid"]:
+                    pose_reason = "camera_too_close_to_mesh"
+                elif render_meta["target_triangle_frustum_fraction"] < MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION:
+                    pose_reason = (
+                        "insufficient_target_triangle_frustum_coverage: "
+                        f"{render_meta['target_triangle_frustum_fraction']:.3f} "
+                        f"< {MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION:.2f}"
+                    )
+                elif (
+                    render_meta["target_mesh_visibility_available"]
+                    and target_visibility <= MIN_TARGET_MESH_VISIBILITY
+                ):
+                    pose_reason = (
+                        "fully_occluded: target_mesh_visibility "
+                        f"({target_visibility:.3f} <= {MIN_TARGET_MESH_VISIBILITY:.2f})"
+                    )
 
-                viewmat, K = compute_w2c_and_intrinsics(eye, target, cam_up, cam_fov, r_res)
-                raw_gs_rgb = render_gs_frame(
-                    splats=splats,
-                    viewmat=viewmat,
-                    K=K,
-                    render_res=r_res,
-                    sh_degree=sh_degree,
-                    device=device,
-                )
+                is_mesh_valid = pose_reason is None
+                mesh_reason = pose_reason or "valid"
+                mesh_metrics: Dict[str, Any] = {
+                    "target_mesh_visibility": target_visibility,
+                    "target_triangle_frustum_fraction": render_meta["target_triangle_frustum_fraction"],
+                    "camera_pose_clearance_valid": render_meta["camera_pose_clearance_valid"],
+                }
+                if is_mesh_valid and enable_quality_check:
+                    is_mesh_valid, mesh_reason, mesh_metrics = validate_rendered_frame(
+                        square_png,
+                        min_unique_colors=min_unique_colors,
+                        min_dynamic_range=min_dynamic_range,
+                        min_color_std=min_color_std,
+                        min_laplacian_var=min_laplacian_var,
+                        min_fg_pixels=min_fg_pixels,
+                        min_autocorr=min_autocorr,
+                        min_p95_grad=min_p95_grad,
+                        min_edge_density=min_edge_density,
+                        elongated_triangle_area_ratio=render_meta["visible_elongated_triangle_area_ratio"],
+                    )
 
-                if crop_coords is not None:
-                    cu0, cv0, cu1, cv1 = crop_coords
-                    gs_crop = raw_gs_rgb[cv0:cv1, cu0:cu1]
+                mesh_png_path = mesh_output_dir / inst_filename
+                mesh_record = {**render_meta, "output_image_file": inst_filename, "valid": is_mesh_valid}
+                if is_mesh_valid:
+                    mesh_valid_count += 1
+                    mesh_record["output_image_path"] = str(mesh_png_path)
+                    save_futures.append(save_pool.submit(square_png.save, mesh_png_path, "PNG", compress_level=1))
                 else:
-                    gs_crop = raw_gs_rgb
+                    mesh_png_path.unlink(missing_ok=True)
+                    mesh_record.update({"discard_reason": mesh_reason, "metrics": mesh_metrics})
+                    mesh_discarded_dir.mkdir(parents=True, exist_ok=True)
+                    discard_mesh_path = mesh_discarded_dir / inst_filename
+                    mesh_record["output_image_path"] = str(discard_mesh_path)
+                    save_futures.append(save_pool.submit(square_png.save, discard_mesh_path, "PNG", compress_level=1))
+                    mesh_manifest["discarded_instances"][f"{inst_key}:{view_name}"] = {
+                        "class_id": cid, "instance_id": inst_id, "role": role,
+                        "file": inst_filename, "reason": mesh_reason, "metrics": mesh_metrics,
+                        **render_meta,
+                    }
+                mesh_frame_records[view_name] = mesh_record
 
+                if not (enable_gs and splats is not None):
+                    continue
+                eye = np.asarray(render_meta["camera_eye"], dtype=np.float32)
+                target = np.asarray(render_meta["camera_target"], dtype=np.float32)
+                r_res = int(render_meta["raw_render_res"])
+                viewmat, K = compute_w2c_and_intrinsics(
+                    eye, target, np.array([0.0, 1.0, 0.0], dtype=np.float32),
+                    float(render_meta["camera_fov_deg"]), r_res,
+                )
+                raw_gs_rgb = render_gs_frame(
+                    splats=splats, viewmat=viewmat, K=K, render_res=r_res,
+                    sh_degree=sh_degree, device=device,
+                )
+                cu0, cv0, cu1, cv1 = render_meta["crop_coords"]
                 gs_square_png = pad_crop_to_square(
-                    gs_crop,
+                    raw_gs_rgb[cv0:cv1, cu0:cu1],
                     min_side=effective_min_res,
                     padding_color=padding_color,
                 )
-
-                if enable_quality_check:
+                is_gs_valid = pose_reason is None
+                gs_reason = pose_reason or "valid"
+                gs_metrics: Dict[str, Any] = {
+                    "target_mesh_visibility": target_visibility,
+                    "camera_pose_clearance_valid": render_meta["camera_pose_clearance_valid"],
+                }
+                if is_gs_valid and enable_quality_check:
                     is_gs_valid, gs_reason, gs_metrics = validate_rendered_frame(
                         gs_square_png,
                         min_unique_colors=min_unique_colors,
@@ -2006,95 +2320,63 @@ def run_extraction(
                         min_p95_grad=min_p95_grad,
                         min_edge_density=min_edge_density,
                     )
-                    # For verified mesh objects, accept authentic renders with strong contrast/dynamic range
-                    if not is_gs_valid and is_mesh_valid and gs_reason.startswith("no_recognizable_features: flat_or_blurry_surface"):
-                        if (
-                            gs_metrics.get("unique_colors", 0) >= 15
-                            and gs_metrics.get("gray_std", 0) >= 10.0
-                            and gs_metrics.get("gray_ptp", 0) >= 50.0
-                        ):
-                            is_gs_valid = True
-                            gs_reason = "valid (mesh_verified_contrast)"
-
-                # GS is saved if valid and:
-                # 1) Mesh is also valid, OR
-                # 2) GS is high-confidence feature-rich render of a real object (not noise floater cid 30)
                 is_high_conf_gs = (
-                    is_gs_valid
-                    and cid != 30
+                    is_gs_valid and cid != 30
                     and gs_metrics.get("p95_grad", 0) >= 1.5
                     and gs_metrics.get("unique_colors", 0) >= 18
                     and gs_metrics.get("gray_std", 0) >= 12.0
                 )
                 save_gs = is_gs_valid and (is_mesh_valid or is_high_conf_gs)
-
-                gs_target_path = gs_output_dir / inst_filename
+                gs_png_path = gs_output_dir / inst_filename
+                gs_record = {**render_meta, "output_image_file": inst_filename, "valid": save_gs}
                 if save_gs:
-                    gs_png_path = gs_target_path
+                    gs_valid_count += 1
+                    gs_record["output_image_path"] = str(gs_png_path)
                     save_futures.append(save_pool.submit(gs_square_png.save, gs_png_path, "PNG", compress_level=1))
                 else:
+                    gs_png_path.unlink(missing_ok=True)
+                    gs_reason = gs_reason if not is_gs_valid else f"mesh_discarded ({mesh_reason})"
+                    gs_record.update({"discard_reason": gs_reason, "metrics": gs_metrics})
                     gs_discarded_dir.mkdir(parents=True, exist_ok=True)
                     discard_gs_path = gs_discarded_dir / inst_filename
+                    gs_record["output_image_path"] = str(discard_gs_path)
                     save_futures.append(save_pool.submit(gs_square_png.save, discard_gs_path, "PNG", compress_level=1))
-                    if gs_target_path.exists():
-                        try:
-                            gs_target_path.unlink()
-                        except OSError:
-                            pass
                     if gs_manifest is not None:
-                        gs_manifest["discarded_instances"][inst_key] = {
-                            "class_id": cid,
-                            "instance_id": inst_id,
-                            "role": role,
-                            "file": inst_filename,
-                            "reason": gs_reason if not is_gs_valid else f"mesh_discarded ({mesh_reason})",
-                            "metrics": gs_metrics,
+                        gs_manifest["discarded_instances"][f"{inst_key}:{view_name}"] = {
+                            "class_id": cid, "instance_id": inst_id, "role": role,
+                            "file": inst_filename, "reason": gs_reason, "metrics": gs_metrics,
                             **render_meta,
                         }
-                    logger.info(f"  [DISCARDED GS] Class {cid:3d} Inst {inst_id:2d}: {gs_reason} -> saved to {discard_gs_path}")
+                gs_frame_records[view_name] = gs_record
 
-            if is_mesh_valid:
-                inst_record = {
-                    "class_id": cid,
-                    "instance_id": inst_id,
-                    "role": role,
-                    "triangle_count": inst["triangle_count"],
-                    "surface_area_m2": round(inst["area_m2"], 4),
-                    "output_image_file": inst_filename,
-                    "output_image_path": str(mesh_png_path),
-                    "details": info.get("details", ""),
-                    **render_meta,
-                }
-                if gs_png_path is not None:
-                    inst_record["gs_image_file"] = inst_filename
-                    inst_record["gs_image_path"] = str(gs_png_path)
-
-                mesh_manifest["extracted_instances"][inst_key] = inst_record
-                class_instances_mesh[str(inst_id)] = inst_record
+            instance_record = {
+                "class_id": cid,
+                "instance_id": inst_id,
+                "role": role,
+                "triangle_count": inst["triangle_count"],
+                "surface_area_m2": round(inst["area_m2"], 4),
+                "details": info.get("details", ""),
+                **base_meta,
+                "frames": mesh_frame_records,
+                "valid_mesh_frame_count": mesh_valid_count,
+                "valid_gaussian_frame_count": gs_valid_count,
+            }
+            mesh_manifest["extracted_instances"][inst_key] = instance_record
+            if mesh_valid_count:
+                class_instances_mesh[str(inst_id)] = instance_record
                 total_instances_extracted += 1
-
-            if save_gs and enable_gs and gs_manifest is not None and gs_png_path is not None:
-                gs_inst_record = {
-                    "class_id": cid,
-                    "instance_id": inst_id,
-                    "role": role,
-                    "triangle_count": inst["triangle_count"],
-                    "surface_area_m2": round(inst["area_m2"], 4),
-                    "output_image_file": inst_filename,
-                    "output_image_path": str(gs_png_path),
-                    "details": info.get("details", ""),
-                    **render_meta,
+            if gs_valid_count and gs_manifest is not None:
+                gs_manifest["extracted_instances"][inst_key] = {
+                    **instance_record,
+                    "frames": gs_frame_records,
                 }
-                gs_manifest["extracted_instances"][inst_key] = gs_inst_record
-                class_instances_gs[str(inst_id)] = gs_inst_record
+                class_instances_gs[str(inst_id)] = gs_manifest["extracted_instances"][inst_key]
 
-                gs_tag = " + GS" if (enable_gs and gs_png_path is not None) else ""
-                print(
-                    f"  Class {cid:3d} Inst {inst_id:2d} ({role:<20}): Level {render_meta['floor_level']} "
-                    f"side={render_meta['biggest_side']} -> {inst_filename} [Mesh{gs_tag}, "
-                    f"crop {render_meta['crop_size'][0]}x{render_meta['crop_size'][1]} -> square {square_png.size[0]}x{square_png.size[1]} PNG, "
-                    f"wall_dist={render_meta['camera_distance_to_nearest_wall_m']:.2f}m, purity={render_meta['purity_ratio']:.2f}]"
-                )
+            print(
+                f"  Class {cid:3d} Inst {inst_id:2d} ({role:<20}): "
+                f"{mesh_valid_count}/5 mesh and {gs_valid_count}/5 Gaussian views valid; "
+                f"area={inst['area_m2']:.3f}m²"
+            )
 
         # Build class-level record for backward compatibility
         if class_instances_mesh:
@@ -2176,7 +2458,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         skip_gs=args.skip_gs,
         device=args.device,
         levels_manifest_path=args.levels_manifest,
-        human_height_offset=args.human_height_offset,
         min_wall_distance=args.min_wall_distance,
         min_triangle_distance=args.min_triangle_distance,
         padding=args.padding,

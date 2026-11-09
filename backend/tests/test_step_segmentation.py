@@ -78,6 +78,8 @@ def test_final_category_classification_uses_stage05_delivery(tmp_path, monkeypat
         output_dir = Path(argv[argv.index("--output-dir") + 1])
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "valid_class_associations.json").write_text('{"associations": []}')
+        (output_dir / "categories.json").write_text("[]")
+        (stage_out / "class_metadata.json").write_text('{"classes": {}}')
         return []
 
     monkeypatch.setitem(sys.modules, "extract_non_structural_frames", SimpleNamespace(main=render))
@@ -85,8 +87,60 @@ def test_final_category_classification_uses_stage05_delivery(tmp_path, monkeypat
 
     assert step_segmentation.run_final_category_classification(scan, scan / "mesh.ply", stage_out) == []
     assert str(stage_out / "triangle_class_labels.npy") in calls["render"]
-    assert str(stage_out / "class_metadata.json") in calls["render"]
+    assert str(stage_out / "structural_classes.json") in calls["render"]
     assert str(stage_out / "non_structural_similarity") in calls["classify"]
+
+
+def test_fixed_wall_class_is_copied_to_object_exports_idempotently(tmp_path):
+    stage_out = tmp_path / "segmentation"
+    wall_dir = stage_out / "3d_masks/class_002_wall"
+    wall_dir.mkdir(parents=True)
+    source = wall_dir / "instance_001.ply"
+    source.write_bytes(b"wall-instance")
+    second_source = wall_dir / "instance_002.ply"
+    second_source.write_bytes(b"second-wall-instance")
+    (stage_out / "3d_masks/class_003_object").mkdir()
+    (stage_out / "3d_masks/class_003_object/instance_001.ply").write_bytes(b"object-instance")
+    (stage_out / "Instances PLYs/Non-Structural").mkdir(parents=True)
+    similarity = stage_out / "non_structural_similarity"
+    similarity.mkdir()
+    (similarity / "valid_class_associations.json").write_text(
+        json.dumps({"associations": [[2, 1], [3, 2]]})
+    )
+    (similarity / "categories.json").write_text(json.dumps([
+        {"id": 1, "name": "door"}, {"id": 2, "name": "chair"},
+    ]))
+    (stage_out / "class_metadata.json").write_text(json.dumps({"classes": {
+        "2": {"structural_role": "wall"}, "3": {"structural_role": "object"},
+    }}))
+
+    copies = step_segmentation.sync_fixed_class_wall_objects(stage_out)
+    copied = stage_out / "Instances PLYs/Non-Structural/2/instance_001.ply"
+    second_copied = stage_out / "Instances PLYs/Non-Structural/2/instance_002.ply"
+    object_link = stage_out / "3d_masks/class_002_object/instance_001.ply"
+    second_object_link = stage_out / "3d_masks/class_002_object/instance_002.ply"
+    assert [item["class_id"] for item in copies] == [2]
+    assert len(copies[0]["copied_instances"]) == 2
+    assert copied.read_bytes() == source.read_bytes()
+    assert second_copied.read_bytes() == second_source.read_bytes()
+    assert object_link.read_bytes() == source.read_bytes()
+    assert second_object_link.read_bytes() == second_source.read_bytes()
+    assert (stage_out / "3d_masks/class_002_wall/instance_001.ply").read_bytes() == b"wall-instance"
+    assert json.loads((stage_out / "class_metadata.json").read_text())["classes"]["2"]["structural_role"] == "wall"
+
+    step_segmentation.sync_fixed_class_wall_objects(stage_out)
+    assert copied.read_bytes() == b"wall-instance"
+    assert second_copied.read_bytes() == b"second-wall-instance"
+    assert object_link.read_bytes() == b"wall-instance"
+    assert second_object_link.read_bytes() == b"second-wall-instance"
+
+    (similarity / "valid_class_associations.json").write_text('{"associations": []}')
+    assert step_segmentation.sync_fixed_class_wall_objects(stage_out) == []
+    assert not copied.exists()
+    assert not second_copied.exists()
+    assert not object_link.exists()
+    assert not second_object_link.exists()
+    assert source.read_bytes() == b"wall-instance"
 
 
 def test_only_category_matching_requires_current_delivery_and_skips_segmentation(tmp_path, monkeypatch):

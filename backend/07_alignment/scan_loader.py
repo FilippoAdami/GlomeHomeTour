@@ -9,6 +9,8 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -20,6 +22,184 @@ from shapely.geometry import MultiPoint, Polygon
 from shapely.ops import unary_union
 
 logger = logging.getLogger("scan_loader")
+DOOR_TEXT_CLASS_ID = 1
+
+
+def _read_door_matches(path: Optional[Path]) -> Optional[Dict[Tuple[int, int], Dict[str, Any]]]:
+    if not path or not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    records = {
+        (int(item["source_class_id"]), int(item["instance_id"])): item
+        for item in data.get("instances", [])
+    }
+    matches = {}
+    for row in data.get("associations", []):
+        if isinstance(row, dict):
+            class_id = int(row.get("source_class_id", row.get("image_class_id")))
+            instance_id = int(row.get("instance_id", 0))
+            text_class_id = int(row.get("text_class_id", 0))
+        else:
+            class_id, instance_id, text_class_id = map(int, row)
+        if text_class_id == DOOR_TEXT_CLASS_ID:
+            matches[(class_id, instance_id)] = records.get((class_id, instance_id), {})
+    return matches
+
+
+def _split_oversized_door_mesh(mesh: trimesh.Trimesh) -> Optional[List[Dict[str, Any]]]:
+    bmin, bmax = mesh.bounds
+    span = bmax - bmin
+    if mesh.area <= 8.0 or span[0] <= 1.2 or span[2] <= 1.0:
+        return None
+
+    normals = mesh.face_normals
+    centers = mesh.triangles.mean(axis=1)
+    masks = (
+        ("west", (normals[:, 0] < -0.7) & (centers[:, 0] < bmin[0] + 0.35),
+         "Vertical", [-1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+        ("north", (normals[:, 2] > 0.7) & (centers[:, 2] > bmax[2] - 0.35),
+         "Horizontal", [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+        ("east", (normals[:, 0] > 0.7) & (centers[:, 0] > bmax[0] - 0.35),
+         "Vertical", [1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+    )
+    parts = []
+    for name, mask, orientation, normal, tangent in masks:
+        face_ids = np.flatnonzero(mask)
+        if not len(face_ids):
+            continue
+        part = mesh.submesh([face_ids], append=True)
+        parts.append({
+            "name": name,
+            "mesh": part,
+            "geometry": {
+                "orientation": orientation,
+                "normal": normal,
+                "tangent": tangent,
+            },
+        })
+    return parts if len(parts) > 1 else None
+
+
+def _publish_door_split(
+    paths: ScanAssetPaths,
+    class_id: int,
+    parent_instance_id: int,
+    source_path: Path,
+    parts: List[Dict[str, Any]],
+) -> List[Tuple[int, Dict[str, Any], Path]]:
+    segmentation_dir = paths.scan_dir / "segmentation"
+    canonical_dir = segmentation_dir / "Instances PLYs" / "Non-Structural" / str(class_id)
+    object_dir = segmentation_dir / "3d_masks" / f"class_{class_id:03d}_object"
+    canonical_dir.mkdir(parents=True, exist_ok=True)
+    object_dir.mkdir(parents=True, exist_ok=True)
+
+    parent_path = canonical_dir / f"instance_{parent_instance_id + 1:03d}.ply"
+    if source_path.resolve() != parent_path.resolve():
+        shutil.copy2(source_path, parent_path)
+    existing_indices = [
+        int(path.stem.removeprefix("instance_"))
+        for path in canonical_dir.glob("instance_*.ply")
+        if path.stem.removeprefix("instance_").isdigit()
+    ]
+    next_index = max(existing_indices, default=parent_instance_id + 1)
+    staged_rows = []
+    for part_idx, part in enumerate(parts):
+        instance_id = parent_instance_id if part_idx == 0 else next_index
+        if part_idx:
+            next_index += 1
+        canonical_path = canonical_dir / f"instance_{instance_id + 1:03d}.ply"
+        temp_path = canonical_path.with_name(f".{canonical_path.stem}.phase07.tmp.ply")
+        part["mesh"].export(str(temp_path))
+        staged_rows.append((instance_id, part, canonical_path, temp_path))
+
+    child_rows = []
+    for instance_id, part, canonical_path, temp_path in staged_rows:
+        temp_path.replace(canonical_path)
+
+        mask_path = object_dir / canonical_path.name
+        if mask_path.is_symlink() or mask_path.exists():
+            mask_path.unlink()
+        try:
+            mask_path.symlink_to(os.path.relpath(canonical_path, object_dir))
+        except OSError:
+            shutil.copy2(canonical_path, mask_path)
+        child_rows.append((instance_id, part, canonical_path))
+
+    copies_path = segmentation_dir / "fixed_class_object_copies.json"
+    if copies_path.is_file():
+        copies = json.loads(copies_path.read_text(encoding="utf-8"))
+        copy_row = next((row for row in copies.get("copies", []) if int(row["class_id"]) == class_id), None)
+        if copy_row is not None:
+            copy_row["copied_instances"] = [
+                str(path.relative_to(segmentation_dir))
+                for path in sorted(canonical_dir.glob("instance_*.ply"))
+            ]
+            copies_path.write_text(json.dumps(copies, indent=2) + "\n", encoding="utf-8")
+
+    matches_path = paths.door_instance_metadata_path
+    if matches_path and matches_path.is_file():
+        metadata = json.loads(matches_path.read_text(encoding="utf-8"))
+        metadata["associations"] = sorted({
+            tuple(map(int, row)) for row in metadata.get("associations", [])
+            if not (int(row[0]) == class_id and int(row[1]) == parent_instance_id)
+        } | {(class_id, instance_id, DOOR_TEXT_CLASS_ID) for instance_id, _, _ in child_rows})
+        metadata["instances"] = [
+            row for row in metadata.get("instances", [])
+            if not (int(row["source_class_id"]) == class_id and int(row["instance_id"]) == parent_instance_id)
+        ]
+        for instance_id, part, _ in child_rows:
+            geometry = part["geometry"]
+            metadata["instances"].append({
+                "source_class_id": class_id,
+                "instance_id": instance_id,
+                "status": "accepted",
+                "text_class_id": DOOR_TEXT_CLASS_ID,
+                "valid_frame_count": 0,
+                "positive_categories_within_margin": 0,
+                "classification_source": "phase07_door_split",
+                "door_geometry": geometry,
+            })
+        metadata["instances"].sort(key=lambda row: (int(row["source_class_id"]), int(row["instance_id"])))
+        matches_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    return child_rows
+
+
+def _write_door_scene_metadata(paths: ScanAssetPaths, matches: Dict[Tuple[int, int], Dict[str, Any]]) -> None:
+    manifest_path = paths.scan_dir / "segmentation" / "segmentation.json"
+    if not manifest_path.is_file():
+        return
+    masks_dir = paths.scan_dir / "segmentation" / "3d_masks"
+    door_instances = []
+    for class_id, instance_id in sorted(matches):
+        name = f"instance_{instance_id + 1:03d}.ply"
+        candidates = [
+            masks_dir / f"class_{class_id:03d}_object" / name,
+            masks_dir / f"class_{class_id:03d}_wall" / name,
+        ]
+        source = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if source is None:
+            continue
+        part = trimesh.load(source, process=False)
+        bmin, bmax = part.bounds
+        door_instances.append({
+            "instance_key": f"door_{class_id}_{instance_id}",
+            "source_class_id": class_id,
+            "instance_id": instance_id,
+            "instance_index": instance_id + 1,
+            "class_id": class_id,
+            "structural_role": "object",
+            "text_class_id": DOOR_TEXT_CLASS_ID,
+            "category": "door",
+            "triangle_count": int(len(part.faces)),
+            "area_m2": round(float(part.area), 4),
+            "bounds_min": [round(float(value), 3) for value in bmin],
+            "bounds_max": [round(float(value), 3) for value in bmax],
+            "relative_path": str(source.relative_to(paths.scan_dir / "segmentation")),
+        })
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    data["door_instances"] = door_instances
+    manifest_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -32,6 +212,7 @@ class ScanAssetPaths:
     gaussian_splat_path: Optional[Path] = None
     # Phase 05: Semantic Segmentation
     door_class_metadata_path: Optional[Path] = None
+    door_instance_metadata_path: Optional[Path] = None
     triangle_labels_path: Optional[Path] = None
     instances_summary_path: Optional[Path] = None
     segmentation_dir: Optional[Path] = None
@@ -180,9 +361,15 @@ class ScanDataset:
         seg_dir = scan_dir / "segmentation"
         if seg_dir.is_dir():
             paths.segmentation_dir = seg_dir
-            vc_p = seg_dir / "valid_class_associations.json"
+            similarity_dir = seg_dir / "non_structural_similarity"
+            vc_p = similarity_dir / "valid_class_associations.json"
+            if not vc_p.is_file():
+                vc_p = seg_dir / "valid_class_associations.json"
             if vc_p.is_file():
                 paths.door_class_metadata_path = vc_p
+            vi_p = similarity_dir / "valid_instance_associations.json"
+            if vi_p.is_file():
+                paths.door_instance_metadata_path = vi_p
             lbl_p = seg_dir / "triangle_class_labels.npy"
             if lbl_p.is_file():
                 paths.triangle_labels_path = lbl_p
@@ -255,28 +442,41 @@ class ScanDataset:
     @staticmethod
     def _extract_door_classes(paths: ScanAssetPaths) -> List[int]:
         """Extracts class IDs belonging to doors from Phase 05 metadata."""
+        instance_matches = _read_door_matches(paths.door_instance_metadata_path)
         door_classes = []
+        metadata_available = bool(paths.door_class_metadata_path and paths.door_class_metadata_path.is_file())
         if paths.door_class_metadata_path and paths.door_class_metadata_path.is_file():
             try:
-                with open(paths.door_class_metadata_path, "r") as f:
-                    data = json.load(f)
+                data = json.loads(paths.door_class_metadata_path.read_text(encoding="utf-8"))
                 associations = data.get("valid_associations", data.get("associations", []))
                 for assoc in associations:
-                    txt = str(assoc.get("target_text", "")).lower()
-                    cat = str(assoc.get("category", "")).lower()
-                    if any(k in txt or k in cat for k in ["door", "door-frame", "doorway", "entrance"]):
-                        door_classes.append(int(assoc["image_class_id"]))
+                    if isinstance(assoc, dict):
+                        text_class_id = int(assoc.get("text_class_id", 0))
+                        class_id = int(assoc.get("image_class_id", assoc.get("source_class_id", 0)))
+                        names = " ".join((str(assoc.get("target_text", "")), str(assoc.get("category", "")))).lower()
+                        is_door = text_class_id == DOOR_TEXT_CLASS_ID or any(
+                            word in names for word in ("door", "door-frame", "doorway", "entrance")
+                        )
+                    else:
+                        class_id, text_class_id = map(int, assoc[:2])
+                        is_door = text_class_id == DOOR_TEXT_CLASS_ID
+                    if is_door:
+                        door_classes.append(class_id)
             except Exception as e:
                 logger.warning(f"Error parsing door class associations for {paths.scan_id}: {e}")
 
+        if door_classes:
+            return sorted(set(door_classes))
+        if not metadata_available and instance_matches:
+            return sorted({class_id for class_id, _ in instance_matches})
+
         # Fallback heuristic if not resolved
-        if not door_classes:
-            if paths.scan_id.endswith("_0"):
-                door_classes = [22]
-            elif paths.scan_id.endswith("_1"):
-                door_classes = [5]
-            elif paths.scan_id.endswith("_2"):
-                door_classes = [11]
+        if paths.scan_id.endswith("_0"):
+            door_classes = [22]
+        elif paths.scan_id.endswith("_1"):
+            door_classes = [5]
+        elif paths.scan_id.endswith("_2"):
+            door_classes = [11]
 
         return sorted(list(set(door_classes)))
 
@@ -376,118 +576,80 @@ class ScanDataset:
         masks_dir = paths.scan_dir / "segmentation" / "3d_masks"
         if masks_dir.is_dir():
             try:
-                inst_counter = 0
-                for cid in sorted(set(door_classes)):
-                    for sub in [f"class_{cid:03d}_wall", f"class_{cid:03d}_object"]:
-                        cdir = masks_dir / sub
-                        if not cdir.is_dir():
+                raw_door_matches = _read_door_matches(paths.door_instance_metadata_path)
+                door_matches = (
+                    {key: value for key, value in raw_door_matches.items() if key[0] in door_classes}
+                    if raw_door_matches is not None else None
+                )
+                accepted_door_matches = {}
+                instance_ids = sorted(door_matches) if door_matches else None
+                if instance_ids is None:
+                    instance_ids = [
+                        (class_id, int(path.stem.removeprefix("instance_")) - 1)
+                        for class_id in sorted(set(door_classes))
+                        for role in ("object", "wall")
+                        for path in sorted((masks_dir / f"class_{class_id:03d}_{role}").glob("instance_*.ply"))
+                        if role == "object" or not (masks_dir / f"class_{class_id:03d}_object").is_dir()
+                    ]
+                    instance_ids = sorted(set(instance_ids))
+
+                for class_id, source_instance_id in instance_ids:
+                    object_dir = masks_dir / f"class_{class_id:03d}_object"
+                    wall_dir = masks_dir / f"class_{class_id:03d}_wall"
+                    instance_name = f"instance_{source_instance_id + 1:03d}.ply"
+                    candidates = [object_dir / instance_name, wall_dir / instance_name]
+                    source_path = next((path for path in candidates if path.is_file()), None)
+                    if source_path is None:
+                        continue
+                    current_match = (door_matches or {}).get((class_id, source_instance_id), {})
+                    source_mesh = trimesh.load(source_path, process=False)
+                    split_parts = _split_oversized_door_mesh(source_mesh)
+                    if split_parts:
+                        split_parts = [
+                            part for part in split_parts
+                            if float((part["mesh"].bounds[1] - part["mesh"].bounds[0])[
+                                0 if part["geometry"]["orientation"] == "Horizontal" else 2
+                            ]) >= 0.60
+                        ]
+                        if not split_parts:
                             continue
-                        for iply in sorted(cdir.glob("instance_*.ply")):
-                            m = trimesh.load(iply, process=False)
-                            bmin, bmax = m.bounds
-                            span = bmax - bmin
-                            area = float(m.area)
-                            h_span = float(span[1])
-                            w_span = float(max(span[0], span[2]))
+                        children = _publish_door_split(
+                            paths, class_id, source_instance_id, source_path, split_parts
+                        )
+                        for child_id, child_part, _ in children:
+                            descriptor = ScanDataset._door_instance_from_mesh(
+                                paths, class_id, child_id, child_part["mesh"],
+                                child_part["geometry"], child_part["name"], len(instances) + 1,
+                            )
+                            if descriptor is not None:
+                                instances.append(descriptor)
+                                accepted_door_matches[(class_id, child_id)] = {
+                                    "door_geometry": child_part["geometry"],
+                                    "status": "accepted",
+                                    "text_class_id": DOOR_TEXT_CLASS_ID,
+                                }
+                        continue
 
-                            # Outlier filtering: minimum 50 cm width x 1.20 m height
-                            if w_span < 0.50 or h_span < 1.20:
-                                continue
+                    door_geometry = current_match.get("door_geometry")
+                    descriptor = ScanDataset._door_instance_from_mesh(
+                        paths, class_id, source_instance_id, source_mesh,
+                        door_geometry, source_path.stem, len(instances) + 1,
+                    )
+                    if descriptor is not None:
+                        instances.append(descriptor)
+                        accepted_door_matches[(class_id, source_instance_id)] = current_match
 
-                            # Multi-plane instance decomposition for oversized vestibule nook
-                            if area > 8.0 and span[0] > 1.2 and span[2] > 1.0:
-                                fn = m.face_normals
-                                fc = m.triangles.mean(axis=1)
-
-                                # West door: normal -X, faces west towards scan 0
-                                mask_w = (fn[:, 0] < -0.7) & (fc[:, 0] < bmin[0] + 0.35)
-                                if np.any(mask_w):
-                                    pts = m.vertices[m.faces[mask_w]].reshape(-1, 3)
-                                    bmin_w, bmax_w = pts.min(axis=0), pts.max(axis=0)
-                                    inst_counter += 1
-                                    instances.append({
-                                        "scan_id": paths.scan_id,
-                                        "instance_idx": inst_counter,
-                                        "center": (bmin_w + bmax_w) / 2.0,
-                                        "center_loc_2d": np.array([(bmin_w[0] + bmax_w[0]) / 2.0, -(bmin_w[2] + bmax_w[2]) / 2.0]),
-                                        "orientation": "Vertical",
-                                        "normal": np.array([-1.0, 0.0, 0.0]),
-                                        "tangent": np.array([0.0, 0.0, -1.0]),
-                                        "width": float(bmax_w[2] - bmin_w[2]),
-                                        "height": float(bmax_w[1] - bmin_w[1]),
-                                        "area": area / 3.0,
-                                        "description": "Vestibule West Door",
-                                    })
-
-                                # North door: normal +Z, faces north towards scan 2
-                                mask_n = (fn[:, 2] > 0.7) & (fc[:, 2] > bmax[2] - 0.35)
-                                if np.any(mask_n):
-                                    pts = m.vertices[m.faces[mask_n]].reshape(-1, 3)
-                                    bmin_n, bmax_n = pts.min(axis=0), pts.max(axis=0)
-                                    inst_counter += 1
-                                    instances.append({
-                                        "scan_id": paths.scan_id,
-                                        "instance_idx": inst_counter,
-                                        "center": (bmin_n + bmax_n) / 2.0,
-                                        "center_loc_2d": np.array([(bmin_n[0] + bmax_n[0]) / 2.0, -(bmin_n[2] + bmax_n[2]) / 2.0]),
-                                        "orientation": "Horizontal",
-                                        "normal": np.array([0.0, 0.0, 1.0]),
-                                        "tangent": np.array([1.0, 0.0, 0.0]),
-                                        "width": float(bmax_n[0] - bmin_n[0]),
-                                        "height": float(bmax_n[1] - bmin_n[1]),
-                                        "area": area / 3.0,
-                                        "description": "Vestibule North Door",
-                                    })
-
-                                # East door: normal +X
-                                mask_e = (fn[:, 0] > 0.7) & (fc[:, 0] > bmax[0] - 0.35)
-                                if np.any(mask_e):
-                                    pts = m.vertices[m.faces[mask_e]].reshape(-1, 3)
-                                    bmin_e, bmax_e = pts.min(axis=0), pts.max(axis=0)
-                                    inst_counter += 1
-                                    instances.append({
-                                        "scan_id": paths.scan_id,
-                                        "instance_idx": inst_counter,
-                                        "center": (bmin_e + bmax_e) / 2.0,
-                                        "center_loc_2d": np.array([(bmin_e[0] + bmax_e[0]) / 2.0, -(bmin_e[2] + bmax_e[2]) / 2.0]),
-                                        "orientation": "Vertical",
-                                        "normal": np.array([1.0, 0.0, 0.0]),
-                                        "tangent": np.array([0.0, 0.0, -1.0]),
-                                        "width": float(bmax_e[2] - bmin_e[2]),
-                                        "height": float(bmax_e[1] - bmin_e[1]),
-                                        "area": area / 3.0,
-                                        "description": "Vestibule East Door",
-                                    })
-                            else:
-                                inst_counter += 1
-                                if span[0] > span[2]:
-                                    normal = np.array([0.0, 0.0, -1.0])
-                                    tangent = np.array([1.0, 0.0, 0.0])
-                                    orient = "Horizontal"
-                                    width = float(span[0])
-                                else:
-                                    normal = np.array([1.0, 0.0, 0.0])
-                                    tangent = np.array([0.0, 0.0, -1.0])
-                                    orient = "Vertical"
-                                    width = float(span[2])
-
-                                instances.append({
-                                    "scan_id": paths.scan_id,
-                                    "instance_idx": inst_counter,
-                                    "center": (bmin + bmax) / 2.0,
-                                    "center_loc_2d": np.array([(bmin[0] + bmax[0]) / 2.0, -(bmin[2] + bmax[2]) / 2.0]),
-                                    "orientation": orient,
-                                    "normal": normal,
-                                    "tangent": tangent,
-                                    "width": width,
-                                    "height": float(span[1]),
-                                    "area": area,
-                                    "description": f"{paths.scan_id}_{cdir.name}_{iply.stem}",
-                                })
+                _write_door_scene_metadata(paths, accepted_door_matches)
                 if instances:
                     return instances
             except Exception as e:
                 logger.warning(f"Error loading 3D masks for {paths.scan_id}: {e}")
+                if paths.door_instance_metadata_path and paths.door_instance_metadata_path.is_file():
+                    raise
+
+            # A current per-instance association file is authoritative, including when it has no door matches.
+            if paths.door_instance_metadata_path and paths.door_instance_metadata_path.is_file():
+                return instances
 
         # 2. Fallback to raw triangle labels
         if paths.triangle_labels_path and paths.triangle_labels_path.is_file():
@@ -514,6 +676,8 @@ class ScanDataset:
                             tangent = np.array([0.0, 0.0, -1.0])
                             orient = "Vertical"
                             width = float(span[2])
+                        if width < 0.60:
+                            continue
 
                         instances.append({
                             "scan_id": paths.scan_id,
@@ -532,3 +696,51 @@ class ScanDataset:
                 logger.warning(f"Error extracting door instances from labels for {paths.scan_id}: {e}")
 
         return instances
+
+    @staticmethod
+    def _door_instance_from_mesh(
+        paths: ScanAssetPaths,
+        class_id: int,
+        source_instance_id: int,
+        mesh: trimesh.Trimesh,
+        door_geometry: Optional[Dict[str, Any]],
+        description: str,
+        instance_idx: int,
+    ) -> Optional[Dict[str, Any]]:
+        bmin, bmax = mesh.bounds
+        span = bmax - bmin
+        if not door_geometry and span[1] < 1.20:
+            return None
+        if door_geometry:
+            orientation = str(door_geometry["orientation"])
+            normal = np.asarray(door_geometry["normal"], dtype=np.float64)
+            tangent = np.asarray(door_geometry["tangent"], dtype=np.float64)
+            width = float(span[0] if orientation == "Horizontal" else span[2])
+        elif span[0] > span[2]:
+            orientation = "Horizontal"
+            normal = np.array([0.0, 0.0, -1.0])
+            tangent = np.array([1.0, 0.0, 0.0])
+            width = float(span[0])
+        else:
+            orientation = "Vertical"
+            normal = np.array([1.0, 0.0, 0.0])
+            tangent = np.array([0.0, 0.0, -1.0])
+            width = float(span[2])
+        if width < 0.60:
+            return None
+        center = (bmin + bmax) / 2.0
+        return {
+            "scan_id": paths.scan_id,
+            "instance_idx": instance_idx,
+            "center": center,
+            "center_loc_2d": np.array([center[0], -center[2]]),
+            "orientation": orientation,
+            "normal": normal,
+            "tangent": tangent,
+            "width": width,
+            "height": float(span[1]),
+            "area": float(mesh.area),
+            "source_class_id": class_id,
+            "source_instance_id": source_instance_id,
+            "description": f"{paths.scan_id}_{description}",
+        }

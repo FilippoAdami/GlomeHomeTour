@@ -66,23 +66,46 @@ def load_sealed_mesh_ownership(scan_dir: Path) -> tuple[o3d.geometry.TriangleMes
     return sealed, class_ids, instance_ids, boundary
 
 
+def _triangle_geometry_keys(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    triangles = np.asarray(vertices, dtype=np.float32)[faces]
+    order = np.lexsort((triangles[:, :, 2], triangles[:, :, 1], triangles[:, :, 0]), axis=1)
+    canonical = np.ascontiguousarray(np.take_along_axis(triangles, order[:, :, None], axis=1))
+    flattened = canonical.reshape(len(faces), 9)
+    return flattened.view(np.dtype((np.void, flattened.dtype.itemsize * 9))).reshape(-1)
+
+
 def instance_face_indices(source_path: Path, sealed: o3d.geometry.TriangleMesh,
                           class_ids: np.ndarray, instance_ids: np.ndarray,
                           class_id: int, instance_id: int) -> tuple[np.ndarray, np.ndarray]:
     indices = np.flatnonzero((class_ids == class_id) & (instance_ids == instance_id))
     source = o3d.io.read_triangle_mesh(str(source_path))
     source_faces = np.asarray(source.triangles)
-    if len(indices) != len(source_faces):
-        raise ValueError(f"Sealed ownership has {len(indices)} faces for {source_path}; "
-                         f"instance mesh has {len(source_faces)}")
-
     sealed_vertices = np.asarray(sealed.vertices, dtype=np.float32)
     sealed_faces = np.asarray(sealed.triangles)
     source_vertices = np.asarray(source.vertices, dtype=np.float32)
-    if not np.array_equal(sealed_vertices[sealed_faces[indices]],
-                          source_vertices[source_faces]):
-        raise ValueError(f"Source instance faces do not match sealed mesh ownership order: {source_path}")
-    return indices, source_faces.copy()
+    if len(indices) == len(source_faces) and np.array_equal(
+        sealed_vertices[sealed_faces[indices]], source_vertices[source_faces]
+    ):
+        return indices, source_faces.copy()
+
+    candidates = np.flatnonzero(class_ids == class_id)
+    candidate_keys = _triangle_geometry_keys(sealed_vertices, sealed_faces[candidates])
+    source_keys = _triangle_geometry_keys(source_vertices, source_faces)
+    order = np.argsort(candidate_keys)
+    sorted_keys = candidate_keys[order]
+    positions = np.searchsorted(sorted_keys, source_keys)
+    found = positions < len(sorted_keys)
+    found[found] &= sorted_keys[positions[found]] == source_keys[found]
+    if not np.all(found):
+        raise ValueError(f"Could not map all source faces to sealed class {class_id}: {source_path}")
+    ambiguous = np.zeros(len(positions), dtype=bool)
+    has_previous = positions > 0
+    ambiguous[has_previous] |= sorted_keys[positions[has_previous]] == sorted_keys[positions[has_previous] - 1]
+    has_next = positions + 1 < len(sorted_keys)
+    ambiguous[has_next] |= sorted_keys[positions[has_next]] == sorted_keys[positions[has_next] + 1]
+    if np.any(ambiguous):
+        raise ValueError(f"Source faces have ambiguous duplicate geometry in sealed class {class_id}: {source_path}")
+    return candidates[order[positions]], source_faces.copy()
 
 
 def write_instance(path: Path, mesh: o3d.geometry.TriangleMesh,

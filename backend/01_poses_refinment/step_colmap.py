@@ -500,6 +500,9 @@ def transform_colmap_model(sparse_dir: Path, rotation: np.ndarray,
              clean_xyz @ rotation.T + translation, clean_rgb)
     for binary in sparse_dir.glob("*.bin"):
         binary.unlink()
+    # COLMAP frame poses override images.txt; infer fresh per-image frames after text edits.
+    for name in ("frames.txt", "rigs.txt"):
+        (sparse_dir / name).unlink(missing_ok=True)
     _run_colmap(["colmap", "model_converter", "--input_path", str(sparse_dir),
                  "--output_path", str(sparse_dir), "--output_type", "BIN"])
 

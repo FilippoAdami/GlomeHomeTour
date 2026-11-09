@@ -99,7 +99,8 @@ def test_numbered_class_names_match_current_ontology():
                   if isinstance(node, ast.Assign)
                   and any(isinstance(target, ast.Name) and target.id == 'CATEGORY_GROUPS'
                           for target in node.targets))
-    assert tuple(symbols.CLASS_NAMES.values()) == tuple(group[0] for group in groups)
+    assert all(symbols.CLASS_NAMES[category_id] == words[0]
+               for category_id, words in groups.items())
     assert symbols.CLASS_NAMES[18] == 'bed'
     assert symbols.CLASS_NAMES[22] == 'dishwasher'
     assert symbols.CLASS_NAMES[28] == 'car'
@@ -127,6 +128,15 @@ def test_impossible_dishwasher_sizes_rejected(size):
 def test_compact_and_slimline_dishwashers_accepted():
     for width, length in ((.5, .551), (.6, .45), (.6, .6)):
         assert ET.fromstring(symbols.sized_svg(22, width, length)).attrib['data-class-id'] == '22'
+
+
+def test_final_association_render_can_skip_symbol_footprint_limits():
+    with pytest.raises(ValueError, match='dishwasher'):
+        symbols.sized_svg(22, .3, .3)
+    root = ET.fromstring(symbols.sized_svg(22, .3, .3, validate_dimensions=False))
+    assert root.attrib['viewBox'] == '0 0 300 300'
+    with pytest.raises(ValueError, match='finite positive'):
+        symbols.sized_svg(22, 0, .3, validate_dimensions=False)
 
 
 def test_class_synonyms_have_room_without_allowing_deep_benches():

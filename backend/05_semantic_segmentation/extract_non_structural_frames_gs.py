@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from scipy.spatial.transform import Rotation
 
 _backend_dir = Path(__file__).resolve().parents[1]
 if str(_backend_dir) not in sys.path:
@@ -90,9 +91,33 @@ def resolve_gs_checkpoint_path(workspace: Path, explicit_path: Optional[Path] = 
     raise FileNotFoundError(f"Could not find a Gaussian Splat checkpoint.pt in {workspace}")
 
 
+def _phase07_scan_transform(workspace: Path, checkpoint_path: Path) -> Optional[np.ndarray]:
+    """Read the scan's Phase 07 transform when rendering against globally aligned assets."""
+    scan_dir = Path(workspace)
+    if not (scan_dir / "mesh.json").is_file():
+        candidate = checkpoint_path.parent.parent
+        if (candidate / "mesh.json").is_file():
+            scan_dir = candidate
+    manifest = scan_dir.parent / "multi_room_alignment" / "stats" / "aligned_scans_transforms.json"
+    if not manifest.is_file():
+        return None
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    item = data.get("scans", {}).get(scan_dir.name)
+    if item is None:
+        raise ValueError(f"{manifest} has no transform for {scan_dir.name}")
+    transform = np.asarray(item.get("transform_matrix"), dtype=np.float64)
+    if (transform.shape != (4, 4) or not np.isfinite(transform).all()
+            or not np.allclose(transform[3], [0., 0., 0., 1.], atol=1e-8)
+            or not np.allclose(transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-5)
+            or not np.isclose(np.linalg.det(transform[:3, :3]), 1., atol=1e-5)):
+        raise ValueError(f"Invalid Phase 07 transform for {scan_dir.name} in {manifest}")
+    return transform
+
+
 def load_gaussian_splats(
     checkpoint_path: Path,
     device: str = "cuda",
+    workspace: Optional[Path] = None,
 ) -> Tuple[Dict[str, torch.Tensor], int]:
     """
     Load splat parameters from a checkpoint file.
@@ -105,6 +130,33 @@ def load_gaussian_splats(
     raw_splats = checkpoint["splats"]
 
     sh_degree = int(checkpoint.get("sh_degree", 3))
+    transform = _phase07_scan_transform(workspace, checkpoint_path) if workspace is not None else None
+    if transform is not None and not np.allclose(transform, np.eye(4), atol=1e-10):
+        rotation = transform[:3, :3]
+        means = raw_splats["means"]
+        rot = torch.as_tensor(rotation, dtype=means.dtype, device=means.device)
+        translation = torch.as_tensor(transform[:3, 3], dtype=means.dtype, device=means.device)
+        raw_splats["means"] = means @ rot.T + translation
+
+        r = Rotation.from_matrix(rotation).as_quat()
+        delta = torch.as_tensor([r[3], r[0], r[1], r[2]],
+                                dtype=raw_splats["quats"].dtype, device=raw_splats["quats"].device)
+        w1, v1 = delta[:1], delta[1:]
+        old = raw_splats["quats"]
+        w2, v2 = old[:, :1], old[:, 1:]
+        raw_splats["quats"] = F.normalize(torch.cat((
+            w1 * w2 - (v1 * v2).sum(-1, keepdim=True),
+            w1 * v2 + w2 * v1 + torch.cross(v1.expand_as(v2), v2, dim=-1),
+        ), dim=-1), dim=-1)
+
+        phase04_dir = str(_backend_dir / "04_3DGS_to_mesh")
+        if phase04_dir not in sys.path:
+            sys.path.insert(0, phase04_dir)
+        from scene_alignment import _rotate_sh
+        raw_splats["sh0"], raw_splats["shN"] = _rotate_sh(
+            raw_splats["sh0"], raw_splats["shN"], rotation
+        )
+        logger.info("Applied Phase 07 global alignment to Gaussian checkpoint for %s", Path(workspace).name)
 
     splats = {
         "means": raw_splats["means"].to(device),
@@ -219,10 +271,6 @@ def render_gs_frame(
     return img_np
 
 
-# Helper functions imported from mesh frame extractor
-from extract_non_structural_frames import pad_crop_to_square, validate_rendered_frame
-
-
 def run_gs_extraction(
     workspace: Path,
     manifest_path: Optional[Path] = None,
@@ -244,6 +292,13 @@ def run_gs_extraction(
     """
     Extract Gaussian Splat frames for all classes documented in the mesh frames manifest.
     """
+    from extract_non_structural_frames import (
+        MIN_TARGET_MESH_VISIBILITY,
+        MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION,
+        pad_crop_to_square,
+        validate_rendered_frame,
+    )
+
     if manifest_path is None:
         manifest_path = (
             workspace
@@ -277,7 +332,7 @@ def run_gs_extraction(
         discarded_dir = output_dir.parent / (output_dir.name + "_discarded")
 
     logger.info(f"Loading Gaussian Splats to {device}...")
-    splats, sh_degree = load_gaussian_splats(ckpt_file, device=device)
+    splats, sh_degree = load_gaussian_splats(ckpt_file, device=device, workspace=workspace)
     num_splats = len(splats["means"])
     logger.info(f"Loaded {num_splats:,} Gaussians (SH degree {sh_degree})")
 
@@ -302,103 +357,113 @@ def run_gs_extraction(
     }
 
     t0 = time.time()
-    logger.info(f"Rendering {len(items_to_render)} Gaussian Splat frames...")
+    logger.info(f"Rendering Gaussian Splat views for {len(items_to_render)} instances...")
+    valid_frame_count = 0
 
     for key_str, meta in items_to_render:
         cid = int(meta["class_id"]) if "class_id" in meta else int(key_str)
         inst_id = int(meta.get("instance_id", 0))
-        eye = np.array(meta["camera_eye"], dtype=np.float32)
-        target = np.array(meta["camera_target"], dtype=np.float32)
-        up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        fov_deg = float(meta["camera_fov_deg"])
-        render_res = int(meta.get("raw_render_res", 1536))
-        crop_coords = meta.get("crop_coords")  # [cu0, cv0, cu1, cv1]
-
-        viewmat, K = compute_w2c_and_intrinsics(eye, target, up, fov_deg, render_res)
-
-        raw_rgb = render_gs_frame(
-            splats=splats,
-            viewmat=viewmat,
-            K=K,
-            render_res=render_res,
-            sh_degree=sh_degree,
-            tile_size=tile_size,
-            device=device,
-        )
-
-        if crop_coords is not None:
-            cu0, cv0, cu1, cv1 = crop_coords
-            crop_arr = raw_rgb[cv0:cv1, cu0:cu1]
-        else:
-            crop_arr = raw_rgb
-
-        square_png = pad_crop_to_square(
-            crop_arr,
-            min_side=min_resolution,
-            padding_color=padding_color,
-        )
-
-        png_filename = meta.get("output_image_file", f"class_{cid:03d}_inst_{inst_id:03d}.png" if is_instance_mode else f"class_{cid:03d}.png")
-        out_png_path = output_dir / png_filename
         role = meta.get("role", "unknown")
-        crop_h, crop_w = crop_arr.shape[:2]
-
-        is_valid = True
-        reason = "valid"
-        metrics: Dict[str, Any] = {}
-        if enable_quality_check:
-            is_valid, reason, metrics = validate_rendered_frame(
-                square_png,
-                min_unique_colors=min_unique_colors,
-                min_dynamic_range=min_dynamic_range,
-                min_color_std=min_color_std,
-                min_laplacian_var=min_laplacian_var,
-                min_fg_pixels=min_fg_pixels,
-                min_autocorr=min_autocorr,
-                min_p95_grad=min_p95_grad,
-                min_edge_density=min_edge_density,
+        frame_metas = meta.get("frames") or {meta.get("view_name", "base"): meta}
+        gs_frames: Dict[str, Any] = {}
+        valid_instance_frames = 0
+        for view_name, frame_meta in frame_metas.items():
+            eye = np.array(frame_meta["camera_eye"], dtype=np.float32)
+            target = np.array(frame_meta["camera_target"], dtype=np.float32)
+            up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            fov_deg = float(frame_meta["camera_fov_deg"])
+            render_res = int(frame_meta.get("raw_render_res", 1536))
+            crop_coords = frame_meta.get("crop_coords")
+            viewmat, K = compute_w2c_and_intrinsics(eye, target, up, fov_deg, render_res)
+            raw_rgb = render_gs_frame(
+                splats=splats, viewmat=viewmat, K=K, render_res=render_res,
+                sh_degree=sh_degree, tile_size=tile_size, device=device,
             )
-            # For verified objects from mesh manifest, accept authentic renders with strong contrast/dynamic range
-            if not is_valid and reason.startswith("no_recognizable_features: flat_or_blurry_surface"):
-                if (
-                    metrics.get("unique_colors", 0) >= 15
-                    and metrics.get("gray_std", 0) >= 10.0
-                    and metrics.get("gray_ptp", 0) >= 50.0
-                ):
-                    is_valid = True
-                    reason = "valid (contrast_preserved)"
-
-        if not is_valid:
-            discarded_dir.mkdir(parents=True, exist_ok=True)
-            discard_path = discarded_dir / png_filename
-            square_png.save(discard_path)
-            if out_png_path.exists():
-                try:
-                    out_png_path.unlink()
-                except OSError:
-                    pass
-            discard_record = dict(meta)
-            discard_record["output_image_file"] = png_filename
-            discard_record["output_image_path"] = str(discard_path)
-            discard_record["discard_reason"] = reason
-            discard_record["discard_metrics"] = metrics
-            gs_manifest["discarded_instances"][key_str] = discard_record
-            logger.info(
-                f"  Class {cid:3d} (Inst {inst_id:2d}, {role:<20}): [DISCARDED GS] {png_filename}: {reason} -> saved to {discard_path}"
+            if crop_coords is not None:
+                cu0, cv0, cu1, cv1 = crop_coords
+                crop_arr = raw_rgb[cv0:cv1, cu0:cu1]
+            else:
+                crop_arr = raw_rgb
+            square_png = pad_crop_to_square(crop_arr, min_side=min_resolution, padding_color=padding_color)
+            fallback_name = (
+                f"class_{cid:03d}_inst_{inst_id:03d}_{view_name}.png"
+                if is_instance_mode and view_name != "base"
+                else f"class_{cid:03d}_inst_{inst_id:03d}.png" if is_instance_mode
+                else f"class_{cid:03d}.png"
             )
-            continue
+            png_filename = frame_meta.get("output_image_file", fallback_name)
+            out_png_path = output_dir / png_filename
+            crop_h, crop_w = crop_arr.shape[:2]
 
-        square_png.save(out_png_path)
-        logger.info(
-            f"  Class {cid:3d} (Inst {inst_id:2d}, {role:<20}): GS render -> {png_filename} "
-            f"[crop {crop_w}x{crop_h} -> square {square_png.size[0]}x{square_png.size[1]} PNG]"
-        )
+            is_valid = True
+            reason = "valid"
+            metrics: Dict[str, Any] = {}
+            if frame_meta.get("camera_pose_clearance_valid") is False:
+                is_valid = False
+                reason = "camera_too_close_to_mesh"
+            elif (
+                frame_meta.get("target_triangle_frustum_fraction") is not None
+                and float(frame_meta["target_triangle_frustum_fraction"])
+                < MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION
+            ):
+                is_valid = False
+                coverage = float(frame_meta["target_triangle_frustum_fraction"])
+                reason = (
+                    "insufficient_target_triangle_frustum_coverage: "
+                    f"{coverage:.3f} < {MIN_TARGET_TRIANGLE_FRUSTUM_FRACTION:.2f}"
+                )
+                metrics["target_triangle_frustum_fraction"] = coverage
+            elif (
+                frame_meta.get("target_mesh_visibility_available", False)
+                and float(frame_meta.get("target_mesh_visibility", 0.0)) <= MIN_TARGET_MESH_VISIBILITY
+            ):
+                is_valid = False
+                visibility = float(frame_meta.get("target_mesh_visibility", 0.0))
+                reason = (
+                    "fully_occluded: target_mesh_visibility "
+                    f"({visibility:.3f} <= {MIN_TARGET_MESH_VISIBILITY:.2f})"
+                )
+                metrics["target_mesh_visibility"] = visibility
+            elif enable_quality_check:
+                is_valid, reason, metrics = validate_rendered_frame(
+                    square_png, min_unique_colors=min_unique_colors,
+                    min_dynamic_range=min_dynamic_range, min_color_std=min_color_std,
+                    min_laplacian_var=min_laplacian_var, min_fg_pixels=min_fg_pixels,
+                    min_autocorr=min_autocorr, min_p95_grad=min_p95_grad,
+                    min_edge_density=min_edge_density,
+                )
+            gs_record = dict(frame_meta)
+            gs_record.update({"output_image_file": png_filename, "valid": is_valid})
+            if not is_valid:
+                discarded_dir.mkdir(parents=True, exist_ok=True)
+                discard_path = discarded_dir / png_filename
+                square_png.save(discard_path)
+                out_png_path.unlink(missing_ok=True)
+                gs_record.update({
+                    "output_image_path": str(discard_path),
+                    "discard_reason": reason,
+                    "discard_metrics": metrics,
+                })
+                discard_key = f"{key_str}:{view_name}" if len(frame_metas) > 1 else key_str
+                gs_manifest["discarded_instances"][discard_key] = gs_record
+                logger.info(f"  Class {cid:3d} (Inst {inst_id:2d}): [DISCARDED GS] {png_filename}: {reason}")
+            else:
+                square_png.save(out_png_path)
+                gs_record["output_image_path"] = str(out_png_path)
+                valid_instance_frames += 1
+                valid_frame_count += 1
+                logger.info(
+                    f"  Class {cid:3d} (Inst {inst_id:2d}, {role:<20}): GS render -> {png_filename} "
+                    f"[crop {crop_w}x{crop_h} -> square {square_png.size[0]}x{square_png.size[1]} PNG]"
+                )
+            gs_frames[view_name] = gs_record
 
         gs_meta = dict(meta)
-        gs_meta["output_image_file"] = png_filename
-        gs_meta["output_image_path"] = str(out_png_path)
+        gs_meta["frames"] = gs_frames
+        gs_meta["valid_gaussian_frame_count"] = valid_instance_frames
         if is_instance_mode:
-            gs_manifest["extracted_instances"][key_str] = gs_meta
+            if valid_instance_frames:
+                gs_manifest["extracted_instances"][key_str] = gs_meta
         else:
             gs_manifest["extracted_classes"][key_str] = gs_meta
 
@@ -415,10 +480,11 @@ def run_gs_extraction(
             class_entry["num_instances"] = len(class_entry.get("instances", {}))
 
     gs_manifest["total_instances_extracted"] = len(gs_manifest.get("extracted_instances", {}))
+    gs_manifest["total_valid_frames"] = valid_frame_count
     elapsed = time.time() - t0
     logger.info(
         f"Gaussian Splat frame extraction complete in {elapsed:.2f}s: "
-        f"{gs_manifest['total_instances_extracted']} valid frames rendered, "
+        f"{gs_manifest['total_instances_extracted']} instances with {valid_frame_count} valid views rendered, "
         f"{len(gs_manifest['discarded_instances'])} frames discarded."
     )
 
