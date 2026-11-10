@@ -64,7 +64,8 @@ Within `current_scene/artifacts/Generate Floor Plans/`, the macro produces these
 
 Each `floor_<level>_measurements.png` has a transparent RGBA background, orange dimension spans,
 and rasterized numeric labels. Its manifest records the reference projection grid and the
-approximation notice; the viewer displays the notice when measurements are enabled.
+approximation notice; the viewer shows that notice in a hover- and keyboard-accessible tooltip
+beside the measurements toggle.
 
 It also saves the floor/scan plane metadata, both types of per-floor cut meshes, projection and
 categorization reports, final instance associations, unmeasured furnished SVGs, and per-step manifests
@@ -243,19 +244,23 @@ height is half the width. +Y is up, longitude zero faces +X, and longitude incre
 +Z. The renderer loads Phase 07's filtered per-scan sealed Gaussian PLY, restores its
 geometry and cameras to the source frame for SH evaluation, and preserves all filtering.
 Six overlapping pinhole faces provide Gaussian RGB/alpha; chunked exact raycasts render
-the mesh. The macro inspects `aligned_sealed_meshes.glb` and the Phase 07 panel manifest,
-recording GLB provenance and per-scan panel counts. Current exports have only RGBA vertex
-colors, including the silver panels; there are no PBR, reflection, or transmission properties
-to apply. Mesh panoramas therefore retain the existing vertex colors. No new renderer
-dependency is required.
+the mesh. The macro validates appended mirror and window triangles against the Phase 07
+panel manifest and traces secondary rays from each visible panel pixel. Rays use all aligned
+sealed scan meshes with every classified panel face removed, so windows can show geometry
+captured in an adjacent scan. Mirrors reflect the room; windows blend 90% transmission, 5%
+reflection, and 5% gray tint. If a transmission ray misses captured geometry, it uses the
+configured missing-geometry environment color (white by default), rather than turning the
+window into a second mirror. Panel classifications come from each scan's Phase 07 manifest;
+the renderer has no scene-name or fixed-layout rules. This is an idealized single-bounce
+effect: the GLB has vertex colors but no authored optical materials or lighting model.
+No new renderer dependency is required.
 
 Outputs under `Generate 360 Pictures/<scan>/<floor>/` include paired panoramas,
 `selected_points.json`, `coverage.png`, and a contact sheet. Each point records height,
 nearest supporting acquired pose, actual 3D distance, obstruction/source scores, and render
 support. The aggregate `generate_360_pictures_manifest.json` records input hashes,
-per-floor triangle coverage, counts and runtimes. Schema version 4 records the stricter
-above-floor triangle denominator, sampled candidate screening, exact selected coverage,
-and progressive height-search history. Each point records
+per-floor triangle coverage, counts and runtimes. Schema version 5 also records the panel
+manifest hash and per-panorama optical pixel and secondary-hit counts. Each point records
 its actual selected height. A completed floor below 70% is published as
 `coverage_limited`; the aggregate status is `partial` and the CLI exits nonzero.
 Execution failures are reported per scan and preserve already published floor outputs.
@@ -294,25 +299,36 @@ for panoramas. The generator validates completed upstream manifests, the photo t
 projection geometry, and floor support; a missing floor under a photo is an error.
 
 Camera order is scan ID, floor name, photograph image ID, then panorama point ID. Numbering
-restarts per scan and is shared by the tour and static images. Plans use each projection's own
+restarts per scan and is shared by the tour and static images. Interactive and exported plan and
+minimap markers display only camera numbers; scan and floor identifiers come from the input
+manifests and are not hardcoded in the rendering logic. Plans use each projection's own
 saved grid; photo directions use aligned COLMAP poses and horizontal calibration. Panorama
 longitude zero is +X and positive longitude is +Z. The minimap is cropped to the current
 scan's attributed floor geometry. The floor plan's **Show measurements** control starts off and
 toggles the selected floor's transparent PNG over all three styles; the viewer maps it into each
 style's projection grid. Measurements never appear on interactive or static minimaps.
+For display, the viewer vertically flips copied plan images (top to bottom) and applies the same
+pixel transform to camera positions and measurement geometry; measurement labels stay upright. This
+puts world +Z downward on screen, so static photo cones and the live 360° minimap cone negate yaw
+when drawing their screen-space direction. The source floor-plan artifacts are unchanged.
 `static/plans/<level>/` contains the three camera-marked plans;
 `static/<scan>/<number>_<kind>/` contains the three minimap variants and, for panoramas, the
 original equirectangular image. Minimap overlays in the static panorama variants are embedded in
 the equirectangular image and therefore move and distort in a spherical viewer.
 
 The manifest links each copied camera image to its source, the three upstream macro manifests,
-and the measurement manifest;
-the browser's `tour.json` uses relative asset paths. Execution logs are written to
+and the measurement manifest. `tour.json` is fetched without cache, and camera-image and viewer
+script URLs include content hashes so regenerated assets cannot reuse stale browser-cache entries. Execution
+logs are written to
 `generate_interactive_viewer.log`. Click the minimap to return to the full floor plan; choose the
 plan style there or right-click a plan or minimap. Side arrows navigate between cameras. The
 controls support keyboard, mouse, and touch; panoramas open at the widest supported view and use
-drag, arrow keys, or zoom buttons. A brief movement and label identify a newly opened panorama;
-the movement is skipped when the browser requests reduced motion and stops on interaction.
+drag, arrow keys, or zoom buttons. **Show mesh** switches between the paired Gaussian and mesh
+panoramas without changing the viewing direction or zoom; the selection carries across panoramas.
+Mesh panoramas simulate reflections and transmission for classified Phase 07 panels. Static camera
+images use the Gaussian panorama. A brief movement and label
+identify a newly opened panorama; the movement is skipped when the browser requests reduced motion
+and stops on interaction.
 
 ## Top-down and elevation views
 
@@ -536,7 +552,8 @@ Chrome or Chromium to choose label positions that avoid existing marks.
 Orange dimension spans and numeric labels measure the straight segments of that floor's regularized
 PLI wall contours; furniture and door/window symbols are not measured. Labels use metres to two
 decimal places, and segments shorter than 10 cm are omitted as contour noise. The viewer displays
-the approximation notice when measurements are shown. Annotation
+the approximation notice as manifest metadata and shows it in a question-mark tooltip beside the
+measurement toggle. The notice is not rendered in the measurement PNG. Annotation
 placement checks nearby plan marks and other dimensions, choosing the clearer inside or outside side
 of each wall segment. A segment facing another scan within 70 cm is always placed inward, so its
 annotations cannot spill into the gap or neighboring scan. The measurement manifest records each

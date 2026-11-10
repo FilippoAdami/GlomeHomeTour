@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const NS = 'http://www.w3.org/2000/svg';
 let data, active = -1, yaw = 0, pitch = 0, fov = 2 * Math.PI / 3, gl, program, texture, uniforms, dragging;
-let viewVersion = 0, wobbleFrame = 0, hintTimer = 0, cueAllowed = false;
+let viewVersion = 0, wobbleFrame = 0, hintTimer = 0, cueAllowed = false, panoramaMode = 'gaussian';
 const radians = x => x * Math.PI / 180;
 function element(name, attrs = {}) { const node = document.createElementNS(NS, name); for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value); return node; }
 function currentLevel() { return data.levels.find(level => level.name === $('level').value); }
@@ -21,22 +21,26 @@ function map(container, level, style, cameras, crop, current, showMeasurements =
   const image = element('image', {href:info.image, x:0, y:0, width:grid.width, height:grid.height}); layer.append(image);
   if (showMeasurements && !current) {
     const overlay=level.measurements, source=overlay.grid, scale=source.size/grid.size;
+    const x=(source.x_min-grid.x_min)/grid.size, y=(grid.z_max-source.z_max)/grid.size;
+    const width=source.width*scale, height=source.height*scale;
     layer.append(element('image', {href:overlay.image,
-      x:(source.x_min-grid.x_min)/grid.size, y:(grid.z_max-source.z_max)/grid.size,
-      width:source.width*scale, height:source.height*scale, 'pointer-events':'none'}));
+      x, y:grid.height-y-height,
+      width, height, 'pointer-events':'none'}));
   }
   for (const camera of cameras) {
     const [x,y] = camera.pixels[style], group = element('g', {class:`camera ${camera.kind === 'photo' ? 'photo' : 'pano'} ${camera === current ? 'current' : ''}`, ...(current ? {} : {tabindex:'0', role:'button', 'aria-label':`${camera.scan}, ${camera.kind}, camera ${camera.number}`})});
-    const center = camera === current && camera.kind === 'panorama' ? yaw : camera.yaw;
+    const direction = camera === current && camera.kind === 'panorama' ? yaw : camera.yaw;
     const edges = camera === current && camera.kind === 'panorama' ? [-fov/2,fov/2] : camera.edges;
     if (camera.kind === 'photo' || current) {
-      const pts = edges.map(a => `${x+90*Math.cos(center+a)},${y-90*Math.sin(center+a)}`);
+      const pts = edges.map(a => {
+        const angle = -(direction + a);
+        return `${x+90*Math.cos(angle)},${y-90*Math.sin(angle)}`;
+      });
       group.append(element('polygon', {points:`${x},${y} ${pts.join(' ')}`, class:'cone'}));
     } else group.append(element('circle', {cx:x, cy:y, r:31, class:'ring'}));
     group.append(element('circle',{cx:x,cy:y,r:38,fill:'transparent'}));
     group.append(element('circle',{cx:x,cy:y,r:21,class:'disc'}));
     const label = element('text',{x,y}); label.textContent=camera.number; group.append(label);
-    if (!current) { const scan = element('text',{x:x+25,y:y+30,class:'scan-label'}); scan.textContent=camera.scan; group.append(scan); }
     if (!current) { const open = () => showCamera(data.cameras.indexOf(camera)); group.addEventListener('click',open); group.addEventListener('keydown',e => {if(e.key==='Enter'||e.key===' '){e.preventDefault();open();}}); }
     layer.append(group);
   }
@@ -45,6 +49,12 @@ function map(container, level, style, cameras, crop, current, showMeasurements =
 function renderPlan() { const level=currentLevel(); map($('plan'),level,$('style').value,data.cameras.filter(c=>c.floor===level.name),null,null,$('measurements').checked); }
 function renderMini() { const camera=data.cameras[active], level=currentLevel(), style=$('style').value; map($('minimap'),level,style,[camera],level.styles[style].crops[camera.scan],camera); }
 function stopCue() { cueAllowed=false; cancelAnimationFrame(wobbleFrame); wobbleFrame=0; clearTimeout(hintTimer); $('panorama-hint').hidden=true; }
+function panoramaSource(camera) { return panoramaMode === 'mesh' ? camera.mesh_image : camera.image; }
+function updatePanoramaButton() {
+  const target=panoramaMode === 'gaussian' ? 'mesh' : 'Gaussian splat';
+  $('panorama-source').textContent=`Show ${target}`;
+  $('panorama-source').setAttribute('aria-label', `Switch to ${target} panorama`);
+}
 function showPlan() { stopCue(); viewVersion++; active=-1; $('plan-menu').hidden=true; $('plan-view').hidden=false; $('image-view').hidden=true; renderPlan(); }
 function showCamera(index) {
   stopCue(); const version=++viewVersion;
@@ -53,7 +63,7 @@ function showCamera(index) {
   $('minimap-open').setAttribute('aria-label', `Return to floor plan, ${c.scan}, camera ${c.number}`);
   $('photo').alt=`${c.scan}, ${c.floor}, camera ${c.number}`;
   $('photo').hidden=c.kind!=='photo'; $('panorama').hidden=c.kind!=='panorama'; $('pano-controls').hidden=c.kind!=='panorama';
-  if(c.kind==='photo') $('photo').src=c.image; else {yaw=c.yaw; pitch=0; fov=radians(120); cueAllowed=true; loadPanorama(c.image,version);}
+  if(c.kind==='photo') $('photo').src=c.image; else {yaw=c.yaw; pitch=0; fov=radians(120); cueAllowed=true; updatePanoramaButton(); loadPanorama(panoramaSource(c),version);}
   renderMini();
 }
 function initGL() {
@@ -81,20 +91,21 @@ function startCue() {
   }
   wobbleFrame=requestAnimationFrame(frame);
 }
-function renderPano() { if(active<0 || data.cameras[active].kind!=='panorama'||!gl)return; const canvas=$('panorama'), scale=Math.min(devicePixelRatio,2), width=Math.max(1,Math.round(canvas.clientWidth*scale)), height=Math.max(1,Math.round(canvas.clientHeight*scale));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}gl.viewport(0,0,width,height);gl.uniform2f(uniforms.resolution,width,height);gl.uniform1f(uniforms.yaw,yaw);gl.uniform1f(uniforms.pitch,pitch);gl.uniform1f(uniforms.fov,fov);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);const [x,y]=data.cameras[active].pixels[$('style').value], cone=$('minimap').querySelector('.current .cone');if(cone){const points=[-fov/2,fov/2].map(a=>`${x+90*Math.cos(yaw+a)},${y-90*Math.sin(yaw+a)}`);cone.setAttribute('points',`${x},${y} ${points.join(' ')}`);} }
+function renderPano() { if(active<0 || data.cameras[active].kind!=='panorama'||!gl)return; const canvas=$('panorama'), scale=Math.min(devicePixelRatio,2), width=Math.max(1,Math.round(canvas.clientWidth*scale)), height=Math.max(1,Math.round(canvas.clientHeight*scale));if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}gl.viewport(0,0,width,height);gl.uniform2f(uniforms.resolution,width,height);gl.uniform1f(uniforms.yaw,yaw);gl.uniform1f(uniforms.pitch,pitch);gl.uniform1f(uniforms.fov,fov);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);const [x,y]=data.cameras[active].pixels[$('style').value], cone=$('minimap').querySelector('.current .cone');if(cone){const points=[-fov/2,fov/2].map(a=>`${x+90*Math.cos(-(yaw+a))},${y-90*Math.sin(-(yaw+a))}`);cone.setAttribute('points',`${x},${y} ${points.join(' ')}`);} }
 function zoom(delta){stopCue();fov=Math.max(radians(35),Math.min(radians(120),fov+delta));renderPano();}
 $('minimap-open').onclick=showPlan;$('previous').onclick=()=>showCamera(active-1);$('next').onclick=()=>showCamera(active+1);
 $('level').onchange=()=>{if(active>=0)showPlan();else renderPlan();};$('style').onchange=()=>active<0?renderPlan():renderMini();
-$('measurements').onchange=()=>{$('measurement-warning').hidden=!$('measurements').checked;renderPlan();};
+$('measurements').onchange=renderPlan;
 for(const id of ['plan','minimap-open']) $(id).addEventListener('contextmenu',e=>{e.preventDefault();const menu=$('plan-menu');menu.hidden=false;menu.style.left=`${Math.min(e.clientX,innerWidth-menu.offsetWidth-4)}px`;menu.style.top=`${Math.min(e.clientY,innerHeight-menu.offsetHeight-4)}px`;menu.querySelector(`[data-style="${$('style').value}"]`).focus();});
 $('plan-menu').addEventListener('click',e=>{const choice=e.target.closest('[data-style]');if(!choice)return;$('style').value=choice.dataset.style;$('style').dispatchEvent(new Event('change'));$('plan-menu').hidden=true;});
 document.addEventListener('click',e=>{if(!$('plan-menu').contains(e.target))$('plan-menu').hidden=true;});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('plan-menu').hidden){$('plan-menu').hidden=true;(active<0?$('style'):$('minimap-open')).focus();}});
 $('zoom-in').onclick=()=>zoom(-radians(10));$('zoom-out').onclick=()=>zoom(radians(10));
+$('panorama-source').onclick=()=>{if(active<0 || data.cameras[active].kind!=='panorama')return;stopCue();panoramaMode=panoramaMode==='gaussian'?'mesh':'gaussian';updatePanoramaButton();loadPanorama(panoramaSource(data.cameras[active]),++viewVersion);};
 $('panorama').addEventListener('pointerdown',e=>{stopCue();dragging={x:e.clientX,y:e.clientY};e.target.setPointerCapture(e.pointerId);});
 $('panorama').addEventListener('pointermove',e=>{if(!dragging)return;const k=2*Math.tan(fov/2)/e.target.clientWidth;yaw-=(e.clientX-dragging.x)*k;pitch=Math.max(-1.5,Math.min(1.5,pitch+(e.clientY-dragging.y)*k));dragging={x:e.clientX,y:e.clientY};renderPano();});
 $('panorama').addEventListener('pointerup',()=>dragging=null);$('panorama').addEventListener('pointercancel',()=>dragging=null);
 $('panorama').addEventListener('wheel',e=>{e.preventDefault();zoom(Math.sign(e.deltaY)*radians(5));},{passive:false});
 $('panorama').addEventListener('keydown',e=>{const step=radians(5);if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','+','=','-'].includes(e.key))return;stopCue();if(e.key==='ArrowLeft')yaw-=step;else if(e.key==='ArrowRight')yaw+=step;else if(e.key==='ArrowUp')pitch=Math.min(1.5,pitch+step);else if(e.key==='ArrowDown')pitch=Math.max(-1.5,pitch-step);else if(e.key==='+'||e.key==='=')zoom(-step);else zoom(step);e.preventDefault();renderPano();});
 window.addEventListener('resize',renderPano);
-fetch('tour.json').then(r=>{if(!r.ok)throw Error(`Cannot load tour: ${r.status}`);return r.json();}).then(result=>{data=result; $('measurement-warning').textContent=data.measurement_warning; for(const level of data.levels){const option=document.createElement('option');option.value=level.name;option.textContent=level.name;$('level').append(option);}renderPlan();}).catch(error=>{document.querySelector('main').textContent=`Unable to load the tour: ${error.message}`;});
+fetch('tour.json', {cache:'no-store'}).then(r=>{if(!r.ok)throw Error(`Cannot load tour: ${r.status}`);return r.json();}).then(result=>{data=result; $('measurement-tooltip').textContent=data.measurement_warning; for(const level of data.levels){const option=document.createElement('option');option.value=level.name;option.textContent=level.name;$('level').append(option);}renderPlan();}).catch(error=>{document.querySelector('main').textContent=`Unable to load the tour: ${error.message}`;});

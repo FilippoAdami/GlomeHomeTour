@@ -1,6 +1,7 @@
 """Detect and mark final object regions extending beyond their regularized room shell."""
 from __future__ import annotations
 
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -27,6 +28,8 @@ OUTSIDE_EPSILON_M = 0.001
 PATCH_GAP_M = 0.001
 SEAM_LIMIT = 3.0
 RECTANGLE_LIMIT = 0.7
+ELONGATED_TRIANGLE_ASPECT_RATIO = 20.0
+ELONGATED_BOUNDARY_WEIGHT = 0.5
 FACE_MARKER = "is_phase07_outlier"
 CHUNK_SIZE = 100_000
 
@@ -173,11 +176,38 @@ def _connected_regions(faces: np.ndarray, selected: np.ndarray, adjacency: np.nd
     return [ids[labels == label] for label in range(labels.max() + 1)]
 
 
-def _attachment_length(vertices: np.ndarray, selected: np.ndarray, adjacency: np.ndarray, edges: np.ndarray) -> float:
+def _attachment_lengths(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    selected: np.ndarray,
+    adjacency: np.ndarray,
+    edges: np.ndarray,
+) -> tuple[float, float]:
     if not len(adjacency):
-        return 0.0
+        return 0.0, 0.0
     boundary = selected[adjacency[:, 0]] != selected[adjacency[:, 1]]
-    return float(np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)[boundary].sum())
+    lengths = np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)[boundary]
+    raw_length = float(lengths.sum())
+    if not np.any(boundary):
+        return raw_length, raw_length
+
+    selected_faces = np.where(selected[adjacency[:, 0]], adjacency[:, 0], adjacency[:, 1])[boundary]
+    triangles = vertices[faces[selected_faces]]
+    edge_squared = np.stack((
+        np.sum((triangles[:, 1] - triangles[:, 0]) ** 2, axis=1),
+        np.sum((triangles[:, 2] - triangles[:, 1]) ** 2, axis=1),
+        np.sum((triangles[:, 0] - triangles[:, 2]) ** 2, axis=1),
+    ), axis=1)
+    twice_area = np.linalg.norm(
+        np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+    )
+    aspect_ratio = np.divide(
+        edge_squared.max(axis=1), twice_area,
+        out=np.full(len(twice_area), np.inf, dtype=np.float64), where=twice_area > 1e-12,
+    )
+    weights = np.where(aspect_ratio > ELONGATED_TRIANGLE_ASPECT_RATIO,
+                       ELONGATED_BOUNDARY_WEIGHT, 1.0)
+    return raw_length, float(np.dot(lengths, weights))
 
 
 def _region_surface(triangles: np.ndarray) -> dict[str, Any]:
@@ -403,14 +433,14 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
             if not np.array_equal(source_faces[offset:stop], expected_faces):
                 raise ValueError(f"Object PLY face order differs from {source_path}: {path}")
 
-            prepared_objects.append((xyz, faces, offset))
+            prepared_objects.append((path, xyz, faces, offset))
             offset = stop
             vertex_offset += len(vertices)
 
         distances_by_object = _signed_outside_distances_by_object(
-            [item[0] for item in prepared_objects], surface
+            [item[1] for item in prepared_objects], surface
         )
-        for (xyz, faces, face_offset), distances in zip(prepared_objects, distances_by_object):
+        for (path, xyz, faces, face_offset), distances in zip(prepared_objects, distances_by_object):
             outside_vertices = distances > OUTSIDE_EPSILON_M
             triangles = xyz[faces]
             triangle_outside = outside_vertices[faces].any(axis=1)
@@ -427,13 +457,17 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
                     continue
                 component_mask = np.zeros(len(faces), dtype=bool)
                 component_mask[component] = True
-                cut = _attachment_length(xyz, component_mask, adjacency, adjacency_edges)
+                cut, effective_cut = _attachment_lengths(
+                    xyz, faces, component_mask, adjacency, adjacency_edges
+                )
                 region_triangles = triangles[component]
                 selected_regions.append({
                     "scan_id": scan_id,
+                    "source": path.relative_to(output_dir / "objects" / scan_id).as_posix(),
                     "face_ids": face_offset + component,
                     "area": area,
                     "cut_length": cut,
+                    "effective_cut_length": effective_cut,
                     "triangles": region_triangles,
                     "triangle_areas": triangle_areas[component],
                     "surface": _region_surface(region_triangles),
@@ -446,15 +480,68 @@ def create_final_red_objects(scans: dict[str, Any], transforms: dict[str, np.nda
     stage_started = time.perf_counter()
     groups = _visible_groups(selected_regions)
     visible_group_count = len(groups)
-    for group in groups:
-        area = sum(region["area"] for region in group)
-        seam = sum(region["cut_length"] for region in group) / np.sqrt(area) if area > 0 else float("inf")
-        keep = seam < SEAM_LIMIT
-        if not keep:
-            keep = _rectangle_similarity(group, surfaces[group[0]["scan_id"]]) > RECTANGLE_LIMIT
+    group_scores = []
+    for group_index, group in enumerate(groups, 1):
+        area = float(sum(region["area"] for region in group))
+        raw_cut = float(sum(region["cut_length"] for region in group))
+        effective_cut = float(sum(region["effective_cut_length"] for region in group))
+        raw_seam = float(raw_cut / np.sqrt(area)) if area > 0 else float("inf")
+        seam = float(effective_cut / np.sqrt(area)) if area > 0 else float("inf")
+        similarity = float(_rectangle_similarity(group, surfaces[group[0]["scan_id"]]))
+        seam_pass = bool(seam < SEAM_LIMIT)
+        similarity_pass = bool(similarity > RECTANGLE_LIMIT)
+        keep = seam_pass or similarity_pass
+        group_scores.append({
+            "group_id": f"G{group_index:02d}",
+            "scan_id": group[0]["scan_id"],
+            "members": [region["source"] for region in group],
+            "member_count": len(group),
+            "area_m2": area,
+            "raw_attachment_boundary_m": raw_cut,
+            "effective_attachment_boundary_m": effective_cut,
+            "raw_seam_score": raw_seam,
+            "effective_seam_score": seam,
+            "seam_pass": seam_pass,
+            "rectangle_similarity": similarity,
+            "similarity_pass": similarity_pass,
+            "outcome": (
+                "PASS (both)" if seam_pass and similarity_pass else
+                "PASS (seam)" if seam_pass else
+                "PASS (similarity)" if similarity_pass else "DISCARDED"
+            ),
+            "member_details": [
+                {
+                    "source": region["source"],
+                    "area_m2": region["area"],
+                    "raw_attachment_boundary_m": region["cut_length"],
+                    "effective_attachment_boundary_m": region["effective_cut_length"],
+                }
+                for region in group
+            ],
+        })
         if keep:
             for region in group:
                 selected_faces[region["face_ids"]] = True
+    score_path = output_dir / "stats" / "phase07_outlier_group_scores.json"
+    score_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_score_path = score_path.with_suffix(".json.tmp")
+    staged_score_path.write_text(json.dumps({
+        "schema_version": 1,
+        "criteria": {
+            "area_minimum_m2_exclusive": AREA_LIMIT_M2,
+            "depth_minimum_m_exclusive": DEPTH_LIMIT_M,
+            "patch_join_gap_m_maximum": PATCH_GAP_M,
+            "seam_score_passes_below": SEAM_LIMIT,
+            "elongated_triangle_aspect_ratio_above": ELONGATED_TRIANGLE_ASPECT_RATIO,
+            "elongated_boundary_weight": ELONGATED_BOUNDARY_WEIGHT,
+            "rectangle_similarity_passes_above": RECTANGLE_LIMIT,
+        },
+        "group_count": len(group_scores),
+        "passed_count": sum(item["outcome"].startswith("PASS") for item in group_scores),
+        "discarded_count": sum(item["outcome"] == "DISCARDED" for item in group_scores),
+        "groups": group_scores,
+    }, indent=2) + "\n")
+    staged_score_path.replace(score_path)
     timings["group_and_filter_regions"] = time.perf_counter() - stage_started
 
     stage_started = time.perf_counter()

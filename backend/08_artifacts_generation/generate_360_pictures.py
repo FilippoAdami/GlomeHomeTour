@@ -43,6 +43,26 @@ def mesh_scene(vertices, faces):
     return scene
 
 
+def optical_environment(alignment_dir, scan_ids, regions):
+    from panorama_rendering import panel_faces
+
+    vertices_all, faces_all, colors_all = [], [], []
+    hashes, vertex_offset = {}, 0
+    for scan_id in scan_ids:
+        path = alignment_dir / "scans" / scan_id / "mesh.ply"
+        vertices, faces, colors = _read_mesh(path)
+        types, _ = panel_faces(scan_id, vertices, faces, regions)
+        vertices_all.append(vertices)
+        faces_all.append(faces[types == 0] + vertex_offset)
+        colors_all.append(colors)
+        vertex_offset += len(vertices)
+        hashes[str(path)] = _hash(path)
+    vertices = np.concatenate(vertices_all)
+    faces = np.concatenate(faces_all)
+    colors = np.concatenate(colors_all)
+    return (mesh_scene(vertices, faces) if len(faces) else None, faces, colors), hashes
+
+
 def cast(scene, origins, directions):
     origins, directions = np.broadcast_arrays(np.asarray(origins, np.float32),
                                               np.asarray(directions, np.float32))
@@ -709,8 +729,9 @@ def publish(staged, target):
         shutil.rmtree(previous)
 
 
-def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, output_dir, width):
-    from panorama_rendering import load_gaussians, render_gaussian_panorama, render_mesh_panorama, inspect_panel_materials
+def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, output_dir, width,
+                optical_geometry, optical_environment_hashes):
+    from panorama_rendering import load_gaussians, render_gaussian_panorama, render_mesh_panorama, inspect_panel_materials, panel_faces
 
     started = time.perf_counter()
     timings = {}
@@ -763,10 +784,19 @@ def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, ou
     stage = "load_render_models_and_provenance"
     tick = _start_timing(scan_id, stage)
     panel_materials = inspect_panel_materials(alignment_dir, scan_id)
+    panel_manifest = alignment_dir / "stats" / "phase07_region_replacements.json"
+    regions = json.loads(panel_manifest.read_text(encoding="utf-8")).get("regions", []) if panel_manifest.is_file() else []
+    panel_types, _ = panel_faces(scan_id, vertices, faces, regions)
+    panel_optics = None
+    panel_optical_colors = None
+    if np.any(panel_types):
+        secondary_scene, secondary_faces, panel_optical_colors = optical_geometry
+        panel_optics = (panel_types, secondary_scene, secondary_faces, max(0.001 * policy["distance_scale"], 1e-6))
     model = load_gaussians(splat_path, transform)
     provenance = {"mesh": str(mesh_path), "mesh_sha256": _hash(mesh_path),
                   "sealed_gaussians": str(splat_path), "sealed_gaussians_sha256": _hash(splat_path),
                   "pose_lineage": lineage, "panel_materials": panel_materials,
+                  "optical_environment_meshes": optical_environment_hashes,
                   "metric_scale_sha256": _hash(metric_path) if metric_path.is_file() else None,
                   "element_hashes": {r["source_mesh"]: _hash(alignment_dir / r["source_mesh"])
                                      for r in metadata["floor_planes"] + metadata["ceiling_planes"]
@@ -846,7 +876,10 @@ def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, ou
             for rank, i in enumerate(selected, 1):
                 render_started = time.perf_counter()
                 rgb, alpha = render_gaussian_panorama(model, candidates[i], width)
-                mesh_rgb, hit = render_mesh_panorama(scene, vertices, faces, colors, candidates[i], width)
+                optical_stats = {}
+                mesh_rgb, hit = render_mesh_panorama(scene, vertices, faces, colors, candidates[i], width,
+                                                      panel_optics=panel_optics, optical_stats=optical_stats,
+                                                      panel_optical_colors=panel_optical_colors)
                 prefix = f"panorama_{rank:03d}"
                 Image.fromarray(rgb).save(staged / f"{prefix}_gaussian.jpg", quality=95, subsampling=0)
                 Image.fromarray(mesh_rgb).save(staged / f"{prefix}_mesh.jpg", quality=95, subsampling=0)
@@ -863,7 +896,7 @@ def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, ou
                          "gaussian_image": f"{prefix}_gaussian.jpg", "mesh_image": f"{prefix}_mesh.jpg",
                          "gaussian_alpha_mean": float(alpha.mean()),
                          "gaussian_low_alpha_fraction": float((alpha < 0.5).mean()),
-                         "mesh_hit_fraction": float(hit.mean())}
+                         "mesh_hit_fraction": float(hit.mean()), "mesh_optical_pixels": optical_stats}
                 records_out.append(entry)
                 LOGGER.info("%s/%s: rendered panorama %d/%d in %.2f s", scan_id, name, rank,
                             len(selected), time.perf_counter() - render_started)
@@ -878,7 +911,7 @@ def process_scan(scan_id, transform, alignment_dir, metadata, slice_manifest, ou
 
             active_stage = "write_and_publish_floor_report"
             tick = _start_timing(f"{scan_id}/{name}", active_stage)
-            report = {"schema_version": 4, "macro_step": MACRO, "scan_id": scan_id,
+            report = {"schema_version": 5, "macro_step": MACRO, "scan_id": scan_id,
                       "floor_level_name": name,
                       "status": "complete" if selection["minimum_reached"] else "coverage_limited",
                       "coordinate_frame": "phase07_aligned_world", "height_policy": policy,
@@ -951,6 +984,7 @@ def generate_360_pictures(alignment_dir=DEFAULT_ALIGNMENT_DIR, output_dir=None, 
     metadata_path = plan_dir / "floor_level_metadata.json"
     slices_path = plan_dir / "floor_level_meshes" / "floor_level_meshes_manifest.json"
     transforms_path = alignment_dir / "stats" / "aligned_scans_transforms.json"
+    panel_manifest_path = alignment_dir / "stats" / "phase07_region_replacements.json"
     metadata = json.loads(metadata_path.read_text())
     if metadata.get("source_alignment_dir") and Path(metadata["source_alignment_dir"]).resolve() != alignment_dir:
         raise ValueError("Floor metadata belongs to another Phase 07 alignment; regenerate floor plans")
@@ -961,24 +995,40 @@ def generate_360_pictures(alignment_dir=DEFAULT_ALIGNMENT_DIR, output_dir=None, 
     output_dir.mkdir(parents=True, exist_ok=True)
     setup_elapsed = round(time.perf_counter() - started, 3)
     LOGGER.info("Starting %s for %d scans at %d px", MACRO, len(transforms), width)
+    scan_ids = sorted(transforms)
+    for scan_id in scan_ids:
+        if Path(scan_id).name != scan_id or not scan_id.startswith("scan_"):
+            raise ValueError(f"Invalid scan identity: {scan_id}")
+    panel_regions = json.loads(panel_manifest_path.read_text(encoding="utf-8")).get("regions", []) \
+        if panel_manifest_path.is_file() else []
+    has_panels = any(region.get("class") in {"mirror", "window"} and region.get("sealed_panels")
+                     for region in panel_regions)
+    if has_panels:
+        optical_geometry, optical_hashes = optical_environment(alignment_dir, scan_ids, panel_regions)
+    else:
+        optical_geometry, optical_hashes = (None, np.empty((0, 3), np.uint32),
+                                             np.empty((0, 3), np.uint8)), {}
     scans, failures = [], []
-    manifest = {"schema_version": 4, "macro_step": MACRO, "phase_status": "in_progress",
+    source_paths = [metadata_path, slices_path, transforms_path]
+    if panel_manifest_path.is_file():
+        source_paths.append(panel_manifest_path)
+    manifest = {"schema_version": 5, "macro_step": MACRO, "phase_status": "in_progress",
                 "macro_step_status": "running", "alignment_dir": str(alignment_dir),
-                "source_hashes": {str(p): _hash(p) for p in [metadata_path, slices_path, transforms_path]},
+                "source_hashes": {str(p): _hash(p) for p in source_paths},
                 "coverage_metric": "visible_slice_triangle_count",
                 "coverage_target": COVERAGE_TARGET, "minimum_coverage": MINIMUM_COVERAGE,
                 "panorama_width": width, "timings_seconds": {"input_validation_and_setup": setup_elapsed},
                 "scans": scans, "failures": failures}
+    manifest["source_hashes"].update(optical_hashes)
     _json(output_dir / "generate_360_pictures_manifest.json", manifest)
     scan_processing_started = time.perf_counter()
-    for scan_id, record in sorted(transforms.items()):
-        if Path(scan_id).name != scan_id or not scan_id.startswith("scan_"):
-            raise ValueError(f"Invalid scan identity: {scan_id}")
+    for scan_id in scan_ids:
+        record = transforms[scan_id]
         scan_started = time.perf_counter()
         LOGGER.info("Starting %s for %s", MACRO, scan_id)
         try:
             result = process_scan(scan_id, _rigid(record["transform_matrix"]), alignment_dir,
-                                  metadata, slices, output_dir, width)
+                                  metadata, slices, output_dir, width, optical_geometry, optical_hashes)
             scans.append(result)
             failures.extend(f for f in result["floors"] if f["status"] == "failed")
             LOGGER.info("%s: %d floors processed in %.2f s", scan_id, len(result["floors"]),

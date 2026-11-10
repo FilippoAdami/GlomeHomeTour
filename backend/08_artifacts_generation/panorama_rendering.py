@@ -19,6 +19,15 @@ import numpy as np
 DEFAULT_WIDTH = 4096
 _CUBE_FOV_DEG = 92.0
 _RAY_BATCH_ROWS = 32
+OPTICAL_MODEL = {
+    "max_bounces": 1,
+    "missing_geometry_rgb": [255, 255, 255],
+    "window_transmission": 0.90,
+    "window_reflection": 0.05,
+    "window_tint": 0.05,
+    "window_tint_rgb": [150, 160, 170],
+    "window_missing_transmission_fallback": "missing_geometry_rgb",
+}
 
 
 def equirectangular_directions(width: int, height: int | None = None) -> np.ndarray:
@@ -66,12 +75,36 @@ class GaussianPanoramaModel:
     device: str
 
 
+def panel_faces(scan, vertices, faces, regions):
+    """Identify Phase 07's appended panel triangles after validating their geometry."""
+    panels = [(region['class'], panel) for region in regions if region['scan_id'] == scan
+              for panel in region.get('sealed_panels', []) if region['class'] in ('mirror', 'window')]
+    kinds = np.zeros(len(faces), np.uint8)
+    panel_ids = np.full(len(faces), -1, np.int32)
+    retained = [panel.get('retained_face_indices', [0, 1]) for _, panel in panels]
+    if any(indices not in ([], [0], [1], [0, 1]) for indices in retained):
+        raise ValueError(f'Invalid retained panel faces for {scan}')
+    panel_face_count = sum(len(indices) for indices in retained)
+    if len(faces) < panel_face_count:
+        raise ValueError(f'Panel faces missing from {scan}')
+    first = len(faces) - panel_face_count
+    panel_triangles = np.array([[0, 1, 2], [0, 2, 3]])
+    for index, ((kind, panel), indices) in enumerate(zip(panels, retained)):
+        stop = first + len(indices)
+        corners = np.asarray(panel['plane_corners'])
+        if corners.shape != (4, 3) or not np.allclose(vertices[faces[first:stop]], corners[panel_triangles[indices]], atol=1e-5, rtol=0):
+            raise ValueError(f'Panel geometry does not match the Phase 07 manifest for {scan}')
+        kinds[first:stop] = 1 if kind == 'mirror' else 2
+        panel_ids[first:stop] = index
+        first = stop
+    return kinds, panel_ids
+
+
 def inspect_panel_materials(alignment_dir: Path, scan_id: str) -> dict[str, Any]:
     """Inspect the Phase 07 GLB and panel manifest for one sealed scan.
 
-    Current Phase 07 exports carry RGBA vertex colours only.  Returning no
-    material data keeps mesh rendering faithful when there is no measured PBR
-    material, illumination, or environment to support optical shading.
+    Phase 07 exports carry RGBA vertex colours; optical effects are approximated
+    from panel classifications rather than measured materials.
     """
     alignment_dir = Path(alignment_dir)
     glb_path = alignment_dir / "aligned_sealed_meshes.glb"
@@ -79,15 +112,20 @@ def inspect_panel_materials(alignment_dir: Path, scan_id: str) -> dict[str, Any]
     panel_count = 0
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        panel_count = sum(len(region.get("sealed_panels", [])) for region in manifest.get("regions", [])
-                          if region.get("scan_id") == scan_id)
+        panel_count = sum(1 for region in manifest.get("regions", []) if region.get("scan_id") == scan_id
+                          for panel in region.get("sealed_panels", [])
+                          if panel.get("retained_face_indices", [0, 1]))
     report: dict[str, Any] = {
         "scan_id": scan_id,
         "glb_path": str(glb_path),
         "panel_manifest_path": str(manifest_path),
+        "panel_manifest_status": "available" if manifest_path.is_file() else "missing",
         "sealed_panel_count": panel_count,
-        "optical_effects": "unavailable: Phase 07 GLB has no material properties",
+        "optical_effects": "idealized one-bounce reflection and transmission" if panel_count else "no classified panels",
+        "optical_model": OPTICAL_MODEL,
     }
+    if manifest_path.is_file():
+        report["panel_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     if not glb_path.is_file():
         report["status"] = "glb_missing"
         return report
@@ -113,8 +151,7 @@ def inspect_panel_materials(alignment_dir: Path, scan_id: str) -> dict[str, Any]
     if material is None:
         report["status"] = "vertex_colors_only"
         return report
-    # Phase 07 currently cannot reach this branch.  Do not substitute visual
-    # effects for unmodelled lighting, reflection, or refraction.
+    # Authored materials are reported separately from the idealized panel effect.
     report["status"] = "unsupported_material_type"
     report["material_type"] = type(material).__name__
     return report
@@ -256,9 +293,30 @@ def render_gaussian_panorama(model: GaussianPanoramaModel, center_world: np.ndar
     return rgb, alpha
 
 
+def _secondary_colors(scene, faces, colors, points, directions, epsilon):
+    import open3d as o3d
+
+    environment = np.asarray(OPTICAL_MODEL["missing_geometry_rgb"], dtype=np.float32)
+    result = np.broadcast_to(environment, (len(points), 3)).copy()
+    valid = np.zeros(len(points), dtype=bool)
+    if scene is None or not len(points):
+        return result, valid
+    rays = np.column_stack((points + directions * epsilon, directions)).astype(np.float32)
+    hits = scene.cast_rays(o3d.core.Tensor(rays))
+    ids = hits["primitive_ids"].numpy()
+    valid = ids < len(faces)
+    if valid.any():
+        uv = hits["primitive_uvs"].numpy()[valid]
+        weights = np.column_stack((1.0 - uv.sum(axis=1), uv))
+        result[valid] = np.einsum("ij,ijk->ik", weights, colors[faces[ids[valid]], :3].astype(np.float32))
+    return result, valid
+
+
 def render_mesh_panorama(scene, vertices: np.ndarray, faces: np.ndarray, colors: np.ndarray,
-                         center_world: np.ndarray, width: int = DEFAULT_WIDTH) -> tuple[np.ndarray, np.ndarray]:
-    """Raycast a vertex-coloured mesh directly into an equirectangular panorama."""
+                         center_world: np.ndarray, width: int = DEFAULT_WIDTH,
+                         panel_optics=None, optical_stats: dict | None = None,
+                         panel_optical_colors: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Raycast a vertex-coloured mesh, optionally shading classified panels."""
     import open3d as o3d
 
     if width < 64 or width % 2:
@@ -273,6 +331,14 @@ def render_mesh_panorama(scene, vertices: np.ndarray, faces: np.ndarray, colors:
     center = np.asarray(center_world, dtype=np.float32)
     if center.shape != (3,) or not np.isfinite(center).all():
         raise ValueError("center_world must be a finite XYZ point")
+    if panel_optics is not None:
+        panel_types, secondary_scene, secondary_faces, epsilon = panel_optics
+        secondary_colors = colors if panel_optical_colors is None else panel_optical_colors
+        if np.asarray(panel_types).shape != (len(faces),) or not np.isfinite(epsilon) or epsilon <= 0:
+            raise ValueError("Invalid panel classifications or optical ray offset")
+    if optical_stats is not None:
+        optical_stats.update(mirror_pixels=0, window_pixels=0, mirror_reflected_hits=0,
+                             window_transmitted_hits=0, window_reflected_hits=0)
     for start in range(0, height, _RAY_BATCH_ROWS):
         stop = min(start + _RAY_BATCH_ROWS, height)
         ray_count = (stop - start) * width
@@ -289,5 +355,41 @@ def render_mesh_panorama(scene, vertices: np.ndarray, faces: np.ndarray, colors:
         rgb = np.einsum("ij,ijk->ik", weights, colors[faces[ids[mask]], :3].astype(np.float32))
         output = image[start:stop].reshape(-1, 3)
         output[mask] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+        if panel_optics is not None:
+            pixels = np.flatnonzero(mask)
+            pixels = pixels[panel_types[ids[pixels]] != 0]
+            if len(pixels):
+                # shortcut: one bounce; add more if multi-reflection scenes become necessary.
+                types = panel_types[ids[pixels]]
+                incoming = rays[pixels, 3:]
+                normals = hits["primitive_normals"].numpy().reshape(-1, 3)[pixels]
+                reflected = incoming - 2 * np.sum(incoming * normals, axis=1)[:, None] * normals
+                distances = hits["t_hit"].numpy().reshape(-1)[pixels]
+                points = center + distances[:, None] * incoming
+                mirror = types == 1
+                windows = types == 2
+                outgoing = incoming.copy()
+                outgoing[mirror] = reflected[mirror]
+                optical_rgb, secondary_hit = _secondary_colors(
+                    secondary_scene, secondary_faces, secondary_colors, points, outgoing, epsilon,
+                )
+                if windows.any():
+                    reflected_rgb, reflected_hit = _secondary_colors(
+                        secondary_scene, secondary_faces, secondary_colors, points[windows], reflected[windows], epsilon,
+                    )
+                    transmitted_rgb = optical_rgb[windows].copy()
+                    optical_rgb[windows] = (
+                        transmitted_rgb * OPTICAL_MODEL["window_transmission"]
+                        + reflected_rgb * OPTICAL_MODEL["window_reflection"]
+                        + np.asarray(OPTICAL_MODEL["window_tint_rgb"], np.float32) * OPTICAL_MODEL["window_tint"]
+                    )
+                if optical_stats is not None:
+                    optical_stats["mirror_pixels"] += int(mirror.sum())
+                    optical_stats["window_pixels"] += int(windows.sum())
+                    optical_stats["mirror_reflected_hits"] += int(secondary_hit[mirror].sum())
+                    optical_stats["window_transmitted_hits"] += int(secondary_hit[windows].sum())
+                    if windows.any():
+                        optical_stats["window_reflected_hits"] += int(reflected_hit.sum())
+                output[pixels] = np.clip(np.rint(optical_rgb), 0, 255).astype(np.uint8)
         valid[start:stop].reshape(-1)[mask] = True
     return image, valid

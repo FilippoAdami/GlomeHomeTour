@@ -299,6 +299,8 @@ def run_phase07_alignment(
         f"step4.{name}": value for name, value in red_summary.pop("timings_seconds").items()
     })
     exported_assets["aligned_objects_final_red"] = red_objects_path
+    exported_assets["phase07_outlier_group_scores_manifest"] = (
+        output_dir / "stats" / "phase07_outlier_group_scores.json")
     logger.info(
         "    Published %d fitted objects; %d contour triangles, %d median pulls; original colors restored.",
         plane_report["object_count"], contour_report["contact_contour_triangle_count"],
@@ -373,6 +375,7 @@ def run_phase07_alignment(
             "aligned_window_panels_metadata": output_dir / "stats" / "aligned_window_panels.json",
             "window_panel_regularization_report": output_dir / "stats" / "window_panel_regularization_report.json",
             "phase07_region_replacements_manifest": output_dir / "stats" / "phase07_region_replacements.json",
+            "phase07_outlier_group_scores_manifest": output_dir / "stats" / "phase07_outlier_group_scores.json",
             "phase07_panel_instances_dir": output_dir / "objects",
             "scans_dir": output_dir / "scans",
             "aligned_scans_transforms": output_dir / "stats" / "aligned_scans_transforms.json",

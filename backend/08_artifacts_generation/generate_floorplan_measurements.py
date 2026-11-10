@@ -33,7 +33,7 @@ DIMENSION_OFFSET_PX = 16.0
 DIMENSION_EXTENSION_PX = 5.0
 TEXT_OFFSET_PX = 18.0
 MEASURE_FONT_SIZE_PX = 22
-WARNING_TEXT = "Measures are approximations and precision is not guaranteed."
+WARNING_TEXT = "Wall dimensions are approximate and for reference only."
 INTER_SCAN_ADJACENCY_DISTANCE_M = 0.70
 
 
@@ -398,6 +398,28 @@ def _write_measurement_overlay_png(
     temporary_path = output_path.with_name(output_path.stem + ".tmp.png")
     image.save(temporary_path)
     temporary_path.replace(output_path)
+
+
+def _flip_measurements_vertically(measurements: list[dict], height: int) -> list[dict]:
+    """Flip annotation geometry vertically while leaving dimension labels upright."""
+    flipped = []
+
+    def point(value):
+        return [value[0], height - 1 - value[1]]
+
+    for measurement in measurements:
+        item = measurement.copy()
+        for key in ("span_px", "dimension_span_px"):
+            if key in item:
+                item[key] = [point(p) for p in item[key]]
+        if "extension_spans_px" in item:
+            item["extension_spans_px"] = [
+                [point(p) for p in span] for span in item["extension_spans_px"]
+            ]
+        if "label_center_px" in item:
+            item["label_center_px"] = point(item["label_center_px"])
+        flipped.append(item)
+    return flipped
 
 
 def generate_floorplan_measurements(

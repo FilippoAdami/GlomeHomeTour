@@ -18,11 +18,15 @@ import open3d as o3d
 from PIL import Image, ImageDraw, ImageFont
 
 from generate_floor_level_meshes import _read_mesh
-from generate_floorplan_measurements import _render_svg_png
+from generate_floorplan_measurements import (
+    _render_svg_png,
+    _flip_measurements_vertically,
+    _write_measurement_overlay_png,
+)
 
 STAGE = Path(__file__).resolve().parent
 DEFAULT_SCENE = STAGE.parent / "current_scene"
-STYLES = ("realistic", "regularized", "objects")
+STYLES = ("realistic", "objects", "regularized")
 LOG = logging.getLogger("interactive_viewer")
 
 
@@ -46,7 +50,11 @@ def projection_grid(row):
 
 def project(position, grid):
     return [(position[0] - grid["x_min"]) / grid["size"],
-            (grid["z_max"] - position[2]) / grid["size"]]
+            grid["height"] - (grid["z_max"] - position[2]) / grid["size"]]
+
+
+def _flip_floorplan_vertically(image: Image.Image) -> Image.Image:
+    return image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
 
 def photo_direction(camera):
@@ -110,6 +118,11 @@ def crop_for(points, grid):
     return [int(left), int(top), int(right), int(bottom)]
 
 
+def versioned_asset_url(relative_path, output):
+    digest = hashlib.sha256((Path(output) / relative_path).read_bytes()).hexdigest()[:16]
+    return f"{relative_path}?v={digest}"
+
+
 def marked_plan(image, cameras, style, current=None, crop=None):
     image = image.copy().convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
@@ -117,7 +130,7 @@ def marked_plan(image, cameras, style, current=None, crop=None):
     for camera in cameras:
         x, y = camera["pixels"][style]
         if camera["kind"] == "photo":
-            angles = [camera["yaw"] + d for d in camera["edges"]]
+            angles = [-(camera["yaw"] + d) for d in camera["edges"]]
             points = [(x, y)] + [(x + 90 * math.cos(a), y - 90 * math.sin(a)) for a in angles]
             draw.polygon(points, fill=(30, 115, 225, 85), outline=(20, 80, 190, 210))
         else:
@@ -126,8 +139,6 @@ def marked_plan(image, cameras, style, current=None, crop=None):
         radius = 15 if camera is current else 13
         draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color, outline="white", width=2)
         draw.text((x, y), str(camera["number"]), font=font, anchor="mm", fill="white", stroke_width=0)
-        if current is None:
-            draw.text((x + 18, y + 15), camera["scan"], font=font, fill=(0, 0, 0, 255), stroke_width=2, stroke_fill="white")
     if crop:
         image = image.crop(tuple(crop))
     return image
@@ -153,6 +164,11 @@ def generate(scene_dir):
         expected = pano_manifest.get("source_hashes", {}).get(str(path))
         if expected is None or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise ValueError(f"Panoramas refer to missing or stale input: {path}; rerun Generate 360 Pictures")
+    panel_path = alignment / "stats/phase07_region_replacements.json"
+    panel_hash = pano_manifest.get("source_hashes", {}).get(str(panel_path))
+    if ((panel_hash is None and pano_manifest.get("schema_version", 0) >= 5 and panel_path.is_file())
+            or (panel_hash is not None and (not panel_path.is_file() or hashlib.sha256(panel_path.read_bytes()).hexdigest() != panel_hash))):
+        raise ValueError(f"Panoramas refer to missing or stale panel data: {panel_path}; rerun Generate 360 Pictures")
     metadata = load_json(plans / "floor_level_metadata.json")
     projections = load_json(plans / "floor_level_projections/floor_level_projections_manifest.json")["projections"]
     overlays = load_json(plans / "floorplan_instance_overlays/floorplan_instance_overlays_manifest.json")
@@ -191,7 +207,7 @@ def generate(scene_dir):
         with Image.open(source) as image:
             if image.mode != "RGBA" or image.size != (grid["width"], grid["height"]):
                 raise ValueError(f"Invalid transparent measurement overlay: {source}")
-        measurement_sources[name] = source
+        measurement_sources[name] = row
         levels[name]["measurements"] = {"grid": grid}
     if set(measurement_sources) != set(levels):
         raise ValueError("Every floor must have a measurement overlay")
@@ -239,13 +255,17 @@ def generate(scene_dir):
                 candidates = [(level, *geometries[(scan_id, level)])]
                 if assign_floor(point["position_world"], candidates) != level:
                     raise ValueError(f"Panorama has no support on its stated floor: {report_path}")
-                image_path = report_path.parent / point["gaussian_image"]
-                with Image.open(image_path) as image:
-                    if image.size != (convention["width"], convention["height"]) or image.width != 2 * image.height:
-                        raise ValueError(f"Panorama dimensions do not match its metadata: {image_path}")
+                panorama_images = {}
+                for kind in ("gaussian", "mesh"):
+                    image_path = report_path.parent / point[f"{kind}_image"]
+                    with Image.open(image_path) as image:
+                        if image.size != (convention["width"], convention["height"]) or image.width != 2 * image.height:
+                            raise ValueError(f"Panorama dimensions do not match its metadata: {image_path}")
+                    panorama_images[kind] = image_path
                 cameras.append({"scan": scan_id, "floor": level, "kind": "panorama", "source_id": point["id"],
                                 "position": point["position_world"], "yaw": 0, "edges": [-math.pi/4, math.pi/4],
-                                "source": str(image_path)})
+                                "source": str(panorama_images["gaussian"]),
+                                "mesh_source": str(panorama_images["mesh"])})
     if not cameras:
         raise ValueError("No cameras were selected")
     for camera in cameras:
@@ -264,10 +284,17 @@ def generate(scene_dir):
         (output / name).mkdir()
     for file in ("index.html", "viewer.js", "viewer.css"):
         shutil.copy2(STAGE / "interactive_viewer" / file, output / file)
+    index_path = output / "index.html"
+    index = index_path.read_text(encoding="utf-8")
+    script_url = versioned_asset_url("viewer.js", output)
+    index_path.write_text(index.replace('src="viewer.js"', f'src="{script_url}"'), encoding="utf-8")
     images = {}
     for level in levels.values():
         dest = output / "assets" / f"{level['name']}_measurements.png"
-        shutil.copy2(measurement_sources[level["name"]], dest)
+        row = measurement_sources[level["name"]]
+        grid = level["measurements"]["grid"]
+        flipped = _flip_measurements_vertically(row["measurements"], grid["height"])
+        _write_measurement_overlay_png(dest, flipped, grid["width"])
         level["measurements"]["image"] = dest.relative_to(output).as_posix()
         for style, info in level["styles"].items():
             source = Path(info["source"])
@@ -275,9 +302,11 @@ def generate(scene_dir):
                 raise FileNotFoundError(f"Missing floorplan: {source}")
             dest = output / "assets" / f"{level['name']}_{style}.png"
             if style == "objects":
-                Image.fromarray(_render_svg_png(source, info["grid"]["width"])[:, :, ::-1]).save(dest)
+                image = Image.fromarray(_render_svg_png(source, info["grid"]["width"])[:, :, ::-1])
             else:
-                shutil.copy2(source, dest)
+                image = Image.open(source)
+            _flip_floorplan_vertically(image).save(dest)
+            image.close()
             images[(level["name"], style)] = Image.open(dest).convert("RGB")
             info["image"] = dest.relative_to(output).as_posix()
             info["crops"] = {scan: crop_for(points, info["grid"]) for (scan, floor), (_, points) in geometries.items() if floor == level["name"]}
@@ -286,6 +315,11 @@ def generate(scene_dir):
         dest = output / "assets" / f"{camera['scan']}_{camera['number']:03d}{source.suffix.lower()}"
         shutil.copy2(source, dest)
         camera["image"] = dest.relative_to(output).as_posix()
+        if camera["kind"] == "panorama":
+            source = Path(camera["mesh_source"])
+            dest = output / "assets" / f"{camera['scan']}_{camera['number']:03d}_mesh{source.suffix.lower()}"
+            shutil.copy2(source, dest)
+            camera["mesh_image"] = dest.relative_to(output).as_posix()
     for level in levels.values():
         rows = [c for c in cameras if c["floor"] == level["name"]]
         for style in STYLES:
@@ -315,10 +349,11 @@ def generate(scene_dir):
             dest.parent.mkdir(parents=True, exist_ok=True)
             result.save(dest, quality=94, subsampling=0)
     data = {"levels": [{**level, "styles": {style: {k: v for k, v in info.items() if k != "source"} for style, info in level["styles"].items()}} for level in levels.values()],
-            "cameras": [{k: v for k, v in camera.items() if k != "source"} for camera in cameras], "styles": list(STYLES),
+            "cameras": [{k: versioned_asset_url(v, output) if k in {"image", "mesh_image"} else v
+                         for k, v in camera.items() if k not in {"source", "mesh_source"}} for camera in cameras], "styles": list(STYLES),
             "measurement_warning": measurements["warning_text"]}
     (output / "tour.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    result = {"schema_version": 1, "phase_status": "in_progress", "macro_step": "Generate Interactive Viewer", "macro_step_status": "complete", "source_manifests": [str(p) for p in manifests], "sources": [{"scan": c["scan"], "number": c["number"], "source": c["source"]} for c in cameras], "camera_order": "scan ID, floor name, photographs by image ID, panoramas by point ID; numbering restarts per scan", "tour_data": "tour.json", "entry_point": "index.html", "static_dir": "static", "camera_count": len(cameras), "floor_count": len(levels), "elapsed_seconds": round(time.perf_counter()-started, 3)}
+    result = {"schema_version": 1, "phase_status": "in_progress", "macro_step": "Generate Interactive Viewer", "macro_step_status": "complete", "source_manifests": [str(p) for p in manifests], "sources": [{"scan": c["scan"], "number": c["number"], "source": c["source"], **({"mesh_source": c["mesh_source"]} if "mesh_source" in c else {})} for c in cameras], "camera_order": "scan ID, floor name, photographs by image ID, panoramas by point ID; numbering restarts per scan", "tour_data": "tour.json", "entry_point": "index.html", "static_dir": "static", "camera_count": len(cameras), "floor_count": len(levels), "elapsed_seconds": round(time.perf_counter()-started, 3)}
     (output / "generate_interactive_viewer_manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     LOG.info("Generated %s cameras on %s levels in %.2f s", len(cameras), len(levels), time.perf_counter()-started)
     return result

@@ -165,6 +165,61 @@ def _silver_panel(corners: np.ndarray) -> trimesh.Trimesh:
     return plane
 
 
+def _faces_behind_panel(vertices: np.ndarray, faces: np.ndarray, corners: np.ndarray,
+                        outward: np.ndarray) -> np.ndarray:
+    """Find faces intersecting the panel's outward, axis-aligned projection."""
+    axis = int(np.argmax(np.abs(outward)))
+    projected_axes = [i for i in range(3) if i != axis]
+    lower = corners[:, projected_axes].min(axis=0)
+    upper = corners[:, projected_axes].max(axis=0)
+    normal = np.cross(corners[1] - corners[0], corners[3] - corners[0])
+    normal_length = np.linalg.norm(normal)
+    if normal_length == 0 or abs(normal @ outward) < 1e-12:
+        raise ValueError("Cannot determine the outward side of a sealed panel")
+    normal = normal / normal_length * np.sign(normal @ outward)
+    # Saved sealed-mesh vertices use float32; allow their rounding at this coordinate scale.
+    tolerance = 2 * np.finfo(np.float32).eps * max(1.0, float(np.abs(corners).max()))
+    plane_offset = float(normal @ corners[0]) + tolerance
+    planes = []
+    for i, dimension in enumerate(projected_axes):
+        direction = np.eye(3)[dimension]
+        planes.extend(((direction, lower[i]), (-direction, -upper[i])))
+    planes.append((normal, plane_offset))
+
+    result = np.zeros(len(faces), dtype=bool)
+    for start in range(0, len(faces), 100_000):
+        triangles = vertices[faces[start:start + 100_000]]
+        projected = triangles[:, :, projected_axes]
+        depth = triangles @ normal - plane_offset
+        inside = ((projected >= lower) & (projected <= upper)).all(axis=2) & (depth > 0)
+        hits = inside.any(axis=1)
+        candidates = (~hits & (projected.max(axis=1) >= lower).all(axis=1)
+                      & (projected.min(axis=1) <= upper).all(axis=1) & (depth.max(axis=1) > 0))
+        # A triangle can cross the projection even if none of its vertices are inside it.
+        for index in np.flatnonzero(candidates):
+            polygon = triangles[index]
+            for direction, offset in planes:
+                distances = polygon @ direction - offset
+                if np.all(distances >= 0):
+                    continue
+                if np.all(distances < 0):
+                    break
+                clipped = []
+                previous, previous_distance = polygon[-1], distances[-1]
+                for current, current_distance in zip(polygon, distances):
+                    if (previous_distance >= 0) != (current_distance >= 0):
+                        clipped.append(previous + (current - previous) *
+                                       (previous_distance / (previous_distance - current_distance)))
+                    if current_distance >= 0:
+                        clipped.append(current)
+                    previous, previous_distance = current, current_distance
+                polygon = np.asarray(clipped)
+            else:
+                hits[index] = True
+        result[start:start + len(triangles)] = hits
+    return result
+
+
 def _export_glb(scene: trimesh.Scene, output_path: Path) -> dict[str, Any]:
     staging_path = output_path.with_name(output_path.stem + ".staging.glb")
     try:
@@ -482,6 +537,9 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
         stage_started = time.perf_counter()
         object_panel_meshes: list[trimesh.Trimesh] = []
         sealed_panels_by_scan: dict[str, list[trimesh.Trimesh]] = {scan_id: [] for scan_id in scans}
+        panel_projections_by_scan: dict[str, list[tuple[dict[str, Any], np.ndarray, np.ndarray]]] = {
+            scan_id: [] for scan_id in scans
+        }
         for region in region_data:
             object_panel = _silver_panel(np.asarray(region["plane_corners"], dtype=np.float64))
             object_panel_meshes.append(object_panel)
@@ -489,6 +547,10 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
             for panel_spec in region["sealed_panels"]:
                 sealed_panel = _silver_panel(np.asarray(panel_spec["plane_corners"], dtype=np.float64))
                 sealed_panels_by_scan[region["scan_id"]].append(sealed_panel)
+                panel_projections_by_scan[region["scan_id"]].append(
+                    (panel_spec, np.asarray(panel_spec["plane_corners"], dtype=np.float64),
+                     np.asarray(region["outward_direction"], dtype=np.float64))
+                )
                 stage_ply(sealed_panel, Path(panel_spec["panel_ply"]))
         replacement_timings["write_replacement_panels"] = time.perf_counter() - stage_started
 
@@ -504,6 +566,7 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
         stage_started = time.perf_counter()
         _validate_combined_meshes(alignment_dir, sealed_meshes, "aligned_sealed_meshes.ply")
         sealed_final: dict[str, trimesh.Trimesh] = {}
+        behind_panel_removals: dict[str, int] = {}
         sealed_scene = _new_scene()
         for scan_id, source_mesh in sealed_meshes.items():
             faces = np.asarray(source_mesh.faces, dtype=np.int64)
@@ -536,6 +599,27 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
             additions = sealed_panels_by_scan[scan_id]
             if additions:
                 modified = trimesh.util.concatenate([modified, *additions])
+            vertices = np.asarray(modified.vertices)
+            final_faces = np.asarray(modified.faces, dtype=np.int64)
+            behind = np.zeros(len(final_faces), dtype=bool)
+            panel_projections = panel_projections_by_scan[scan_id]
+            first_panel_face = len(final_faces) - 2 * len(panel_projections)
+            for index, (_, corners, outward) in enumerate(panel_projections):
+                panel_behind = _faces_behind_panel(vertices, final_faces, corners, outward)
+                panel_behind[first_panel_face + 2 * index:first_panel_face + 2 * index + 2] = False
+                behind |= panel_behind
+            for index, (panel_spec, _, _) in enumerate(panel_projections):
+                panel_spec["retained_face_indices"] = [
+                    face_index for face_index in (0, 1)
+                    if not behind[first_panel_face + 2 * index + face_index]
+                ]
+            behind_panel_removals[scan_id] = int(behind.sum())
+            if np.any(behind):
+                if np.all(behind):
+                    raise ValueError(f"Panel projection removal would empty sealed mesh for {scan_id}")
+                colors = _vertex_colors(modified)
+                modified = trimesh.Trimesh(vertices=vertices, faces=final_faces[~behind], process=False)
+                modified.visual.vertex_colors = colors
             sealed_final[scan_id] = modified
             stage_ply(modified, alignment_dir / "scans" / scan_id / "mesh.ply")
             node_name = f"sealed_{scan_id}"
@@ -560,7 +644,7 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
                 "window": "Gemma 2 window association OR bbox minimum > 1.5 m above closest own-scan floor",
                 "mirror_panel_inset_m": MIRROR_INSET_M,
                 "panel_color_rgba": SILVER_RGBA.tolist(),
-                "sealed_mesh_removal": "exact Phase 05 source faces corresponding to selected object faces",
+                "sealed_mesh_removal": "exact Phase 05 source faces corresponding to selected object faces, then all faces intersecting the outward axis-aligned projection of each same-scan sealed panel",
                 "sealed_panel_placement": "reverse each contributing instance placement translation, then fit inside its sealed mesh bounds and above its selected floor plane",
                 "regularized_meshes_modified": False,
             },
@@ -569,6 +653,8 @@ def run(workspace: Path, alignment_dir: Path | None = None) -> dict[str, Any]:
             "aligned_sealed_glb": glb_stats,
             "removed_object_face_count": marked_face_count,
             "removed_sealed_face_count": selected_sealed_face_count,
+            "removed_sealed_behind_panel_face_count": sum(behind_panel_removals.values()),
+            "removed_sealed_behind_panel_face_count_by_scan": behind_panel_removals,
             "timings_seconds": replacement_timings,
             "regions": region_data,
         }

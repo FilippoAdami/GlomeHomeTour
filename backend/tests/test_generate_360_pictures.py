@@ -136,7 +136,7 @@ def test_lower_height_is_tried_when_nominal_fails_hard_clearance():
     candidates, stats, _ = adaptive_candidates(points, grid, np.array([[2, 1.5, 2]]), policy, scene)
     nearest = np.argmin(np.linalg.norm(candidates[:, [0, 2]] - [2, 2], axis=1))
     assert np.linalg.norm(candidates[nearest, [0, 2]] - [2, 2]) < 0.02
-    assert stats[nearest]["height_above_floor"] == 1.4
+    assert stats[nearest]["height_above_floor"] == 1.3
     assert stats[nearest]["height_selection_reason"] == "nominal_height_ineligible"
 
 
