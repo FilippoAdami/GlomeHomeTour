@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add approximate wall-segment measurements to regularized and furnished floorplans."""
+"""Generate transparent approximate wall-segment measurements for each floor."""
 
 from __future__ import annotations
 
@@ -8,11 +8,11 @@ import json
 import shutil
 import subprocess
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from generate_floor_level_meshes import _read_mesh
 from generate_floor_level_projections import (
@@ -22,7 +22,6 @@ from generate_floor_level_projections import (
 )
 from generate_floorplan_instance_overlays import (
     DEFAULT_ARTIFACTS_DIR,
-    SVG_NS,
     _scan_footprint_masks,
 )
 
@@ -33,8 +32,7 @@ CONTOUR_APPROXIMATION_PX = 1.5
 DIMENSION_OFFSET_PX = 16.0
 DIMENSION_EXTENSION_PX = 5.0
 TEXT_OFFSET_PX = 18.0
-MEASURE_FONT_SIZE_PX = 13
-MEASURE_HEADER_HEIGHT_PX = 38
+MEASURE_FONT_SIZE_PX = 22
 WARNING_TEXT = "Measures are approximations and precision is not guaranteed."
 INTER_SCAN_ADJACENCY_DISTANCE_M = 0.70
 
@@ -140,10 +138,10 @@ def _faces_another_scan(
     return facing_samples >= max(1, int(np.ceil(len(sample_fractions) * 0.2)))
 
 
-def _label_box(center: np.ndarray, width: float) -> tuple[float, float, float, float]:
+def _label_box(center: np.ndarray, width: float, font_size: float) -> tuple[float, float, float, float]:
     return (
-        float(center[0] - width * 0.5 - 3), float(center[1] - MEASURE_FONT_SIZE_PX * 0.5 - 3),
-        float(center[0] + width * 0.5 + 3), float(center[1] + MEASURE_FONT_SIZE_PX * 0.5 + 3),
+        float(center[0] - width * 0.5 - 3), float(center[1] - font_size * 0.5 - 3),
+        float(center[0] + width * 0.5 + 3), float(center[1] + font_size * 0.5 + 3),
     )
 
 
@@ -157,7 +155,8 @@ def _choose_label_center(
     placed_boxes: list[tuple[float, float, float, float]],
     clutter_mask: np.ndarray,
 ) -> np.ndarray:
-    text_width = len(label) * MEASURE_FONT_SIZE_PX * 0.66
+    font_size = min(MEASURE_FONT_SIZE_PX, resolution / 5)
+    text_width = len(label) * font_size * 0.66
     max_tangent_shift = max(36.0, min(96.0, length_px * 0.4))
     offsets = [0.0]
     for step in np.arange(12.0, max_tangent_shift + 1.0, 12.0):
@@ -166,7 +165,7 @@ def _choose_label_center(
     for normal_shift in (0.0, 12.0, 24.0, 36.0):
         for tangent_shift in offsets:
             center = base + tangent * tangent_shift + normal * normal_shift
-            box = _label_box(center, text_width)
+            box = _label_box(center, text_width, font_size)
             if (box[0] < 2 or box[2] > resolution - 2
                     or box[1] < 2 or box[3] > resolution - 2):
                 continue
@@ -188,7 +187,7 @@ def _choose_label_center(
         return center
 
     center = np.clip(base, [text_width * 0.5 + 5, 12], [resolution - text_width * 0.5 - 5, resolution - 12])
-    placed_boxes.append(_label_box(center, text_width))
+    placed_boxes.append(_label_box(center, text_width, font_size))
     return center
 
 
@@ -226,8 +225,7 @@ def _measurement_clutter_mask(image: np.ndarray) -> np.ndarray:
     return cv2.dilate(clutter, np.ones((3, 3), dtype=np.uint8))
 
 
-def _append_measurements(
-    root: ET.Element,
+def _wall_segment_measurements(
     occupied: np.ndarray,
     contours: list[np.ndarray],
     resolution: int,
@@ -235,14 +233,8 @@ def _append_measurements(
     clutter_mask: np.ndarray,
     scan_masks: dict[str, np.ndarray],
 ) -> list[dict]:
-    group = ET.SubElement(root, f"{{{SVG_NS}}}g", {
-        "id": "wall-segment-measurements",
-        "fill": "none",
-        "stroke": ORANGE,
-        "stroke-linecap": "round",
-        "stroke-linejoin": "round",
-    })
     measurements = []
+    font_size = min(MEASURE_FONT_SIZE_PX, resolution / 5)
     placed_label_boxes = []
     placed_lines = np.zeros((resolution, resolution), dtype=np.uint8)
     placed_label_mask = np.zeros_like(placed_lines)
@@ -266,10 +258,10 @@ def _append_measurements(
                 max(3, int(np.ceil(INTER_SCAN_ADJACENCY_DISTANCE_M / pixel_size))),
             )
             label = f"{length_m:.2f} m"
-            label_width = len(label) * MEASURE_FONT_SIZE_PX * 0.66
+            label_width = len(label) * font_size * 0.66
             label_normal_extent = (
                 label_width * 0.5 * abs(normal[0])
-                + (MEASURE_FONT_SIZE_PX * 0.5 + 3) * abs(normal[1])
+                + (font_size * 0.5 + 3) * abs(normal[1])
             )
             label_distance = max(
                 DIMENSION_OFFSET_PX + TEXT_OFFSET_PX,
@@ -292,7 +284,7 @@ def _append_measurements(
                     candidate_boxes, clutter_mask,
                 )
                 label_box = _label_box(
-                    label_center, len(label) * MEASURE_FONT_SIZE_PX * 0.66,
+                    label_center, len(label) * font_size * 0.66, font_size,
                 )
                 lines = (
                     (start, extension_start),
@@ -343,37 +335,6 @@ def _append_measurements(
             placed_lines = cv2.bitwise_or(placed_lines, line_mask)
             placed_label_mask = cv2.bitwise_or(placed_label_mask, label_mask)
 
-            annotation = ET.SubElement(group, f"{{{SVG_NS}}}g", {
-                "data-wall-segment-index": str(len(measurements)),
-                "data-length-m": f"{length_m:.6f}",
-                "data-placement-side": side,
-                "data-between-scans": str(between_scans).lower(),
-            })
-            ET.SubElement(annotation, f"{{{SVG_NS}}}title").text = f"Wall segment: {label}"
-            for a, b, width in (
-                (start, extension_start, "1.5"),
-                (end, extension_end, "1.5"),
-                (dimension_start, dimension_end, "2.5"),
-            ):
-                ET.SubElement(annotation, f"{{{SVG_NS}}}line", {
-                    "x1": f"{a[0]:.3f}", "y1": f"{a[1]:.3f}",
-                    "x2": f"{b[0]:.3f}", "y2": f"{b[1]:.3f}",
-                    "stroke": ORANGE, "stroke-width": width,
-                })
-            text = ET.SubElement(annotation, f"{{{SVG_NS}}}text", {
-                "x": f"{label_center[0]:.3f}",
-                "y": f"{label_center[1]:.3f}",
-                "fill": ORANGE,
-                "stroke": "white",
-                "stroke-width": "3.5",
-                "paint-order": "stroke fill",
-                "font-family": "sans-serif",
-                "font-size": str(MEASURE_FONT_SIZE_PX),
-                "font-weight": "bold",
-                "text-anchor": "middle",
-                "dominant-baseline": "central",
-            })
-            text.text = label
             measurements.append({
                 "index": len(measurements),
                 "length_m": length_m,
@@ -390,97 +351,52 @@ def _append_measurements(
                 "label_center_px": label_center.tolist(),
             })
 
-    existing_children = list(root)
-    for child in existing_children:
-        root.remove(child)
-    root.set("height", f"{resolution + MEASURE_HEADER_HEIGHT_PX}px")
-    root.set("viewBox", f"0 0 {resolution} {resolution + MEASURE_HEADER_HEIGHT_PX}")
-    ET.SubElement(root, f"{{{SVG_NS}}}rect", {
-        "x": "0", "y": "0", "width": str(resolution),
-        "height": str(MEASURE_HEADER_HEIGHT_PX), "fill": "white",
-    })
-    content = ET.SubElement(root, f"{{{SVG_NS}}}g", {
-        "transform": f"translate(0 {MEASURE_HEADER_HEIGHT_PX})",
-    })
-    for child in existing_children:
-        content.append(child)
-    warning = ET.SubElement(root, f"{{{SVG_NS}}}text", {
-        "x": str(resolution * 0.5),
-        "y": str(MEASURE_HEADER_HEIGHT_PX * 0.5),
-        "fill": ORANGE,
-        "stroke": "white",
-        "stroke-width": "4",
-        "paint-order": "stroke fill",
-        "font-family": "sans-serif",
-        "font-size": "14",
-        "font-weight": "bold",
-        "text-anchor": "middle",
-        "dominant-baseline": "central",
-        "data-measurement-warning": "true",
-    })
-    warning.text = WARNING_TEXT
     assert all(item["label"] == f"{item['length_m']:.2f} m" for item in measurements)
     return measurements
 
 
-def _write_measured_projection_png(
-    source_path: Path | np.ndarray,
+def _write_measurement_overlay_png(
     output_path: Path,
     measurements: list[dict],
     resolution: int,
 ) -> None:
-    image = source_path if isinstance(source_path, np.ndarray) else cv2.imread(
-        str(source_path), cv2.IMREAD_COLOR,
-    )
-    if image is None or image.shape[:2] != (resolution, resolution):
-        raise ValueError(f"Expected a {resolution}x{resolution} floorplan image: {source_path}")
-    image = cv2.copyMakeBorder(
-        image, MEASURE_HEADER_HEIGHT_PX, 0, 0, 0,
-        cv2.BORDER_CONSTANT, value=(255, 255, 255),
-    )
-    orange = (0, 113, 255)  # BGR equivalent of the SVG's bright orange.
+    lines = np.zeros((resolution, resolution), dtype=np.uint8)
+    labels = np.zeros_like(lines)
 
-    def shifted(point: list[float]) -> tuple[int, int]:
+    def pixel(point: list[float]) -> tuple[int, int]:
         x, y = np.rint(point).astype(int)
-        return int(x), int(y + MEASURE_HEADER_HEIGHT_PX)
+        return int(x), int(y)
 
     for measurement in measurements:
         for start, end in measurement["extension_spans_px"]:
-            cv2.line(image, shifted(start), shifted(end), orange, 2, cv2.LINE_AA)
+            cv2.line(lines, pixel(start), pixel(end), 255, 2, cv2.LINE_AA)
         cv2.line(
-            image,
-            shifted(measurement["dimension_span_px"][0]),
-            shifted(measurement["dimension_span_px"][1]),
-            orange,
+            lines,
+            pixel(measurement["dimension_span_px"][0]),
+            pixel(measurement["dimension_span_px"][1]),
+            255,
             3,
             cv2.LINE_AA,
         )
         label = measurement["label"]
         font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.42
-        (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, 1)
-        center_x, center_y = shifted(measurement["label_center_px"])
+        scale = 0.75 * min(1.0, resolution / 110)
+        thickness = 2 if resolution >= 110 else 1
+        (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, thickness)
+        center_x, center_y = pixel(measurement["label_center_px"])
         origin = (center_x - text_width // 2, center_y + (text_height - baseline) // 2)
-        cv2.putText(image, label, origin, font, scale, (255, 255, 255), 4, cv2.LINE_AA)
-        cv2.putText(image, label, origin, font, scale, orange, 1, cv2.LINE_AA)
+        cv2.putText(labels, label, origin, font, scale, 255, thickness, cv2.LINE_AA)
 
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    warning_scale = 0.40
-    (warning_width, warning_height), warning_baseline = cv2.getTextSize(
-        WARNING_TEXT, font, warning_scale, 1,
-    )
-    warning_origin = (
-        max(4, (resolution - warning_width) // 2),
-        (MEASURE_HEADER_HEIGHT_PX + warning_height - warning_baseline) // 2,
-    )
-    cv2.putText(image, WARNING_TEXT, warning_origin, font, warning_scale,
-                (255, 255, 255), 4, cv2.LINE_AA)
-    cv2.putText(image, WARNING_TEXT, warning_origin, font, warning_scale,
-                orange, 1, cv2.LINE_AA)
+    image = Image.new("RGBA", (resolution, resolution))
+    outlines = cv2.dilate(labels, np.ones((5, 5), dtype=np.uint8))
+    for mask, color in ((lines, (255, 113, 0)), (outlines, (255, 255, 255)),
+                        (labels, (255, 113, 0))):
+        layer = Image.new("RGBA", image.size, color)
+        layer.putalpha(Image.fromarray(mask))
+        image = Image.alpha_composite(image, layer)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(output_path.stem + ".tmp.png")
-    if not cv2.imwrite(str(temporary_path), image):
-        raise OSError(f"Could not write measured floorplan image: {output_path}")
+    image.save(temporary_path)
     temporary_path.replace(output_path)
 
 
@@ -502,23 +418,7 @@ def generate_floorplan_measurements(
             raise FileNotFoundError(f"Required floorplan measurement input is missing: {overlay_manifest_path}")
         overlay_manifest = json.loads(overlay_manifest_path.read_text(encoding="utf-8"))
     if overlay_manifest.get("furnished_views_measured"):
-        existing_manifest = output_dir / "floorplan_measurements_manifest.json"
-        if existing_manifest.is_file():
-            result = json.loads(existing_manifest.read_text(encoding="utf-8"))
-            expected_outputs = [
-                Path(item[key])
-                for item in result.get("floor_levels", [])
-                for key in (
-                    "measured_regularized_floorplan_png",
-                    "measured_furnished_floorplan_svg",
-                    "measured_furnished_floorplan_png",
-                )
-            ]
-            if expected_outputs and all(path.is_file() for path in expected_outputs):
-                return result
-        raise RuntimeError(
-            "Furnished floorplans are already finalized; rerun generate_floor_plans.py to rebuild them"
-        )
+        raise RuntimeError("Furnished floorplans are measured; rerun generate_floor_plans.py to rebuild them")
 
     levels = {item["floor_level_name"]: item for item in mesh_manifest["levels"]}
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -526,31 +426,22 @@ def generate_floorplan_measurements(
     for floor in overlay_manifest["floor_levels"]:
         level = levels[floor["floor_level_name"]]
         source_svg = Path(floor["output_svg"])
-        root = ET.parse(source_svg).getroot()
         resolution = int(floor["projection_resolution_px"][0])
+        if floor["projection_resolution_px"] != [resolution, resolution]:
+            raise ValueError("Floorplan measurement projection must be square")
         furnished_projection = _render_svg_png(source_svg, resolution)
         vertices, faces, _ = _read_mesh(Path(level["regularized_mesh"]))
         grid = _projection_grid(vertices, resolution)
         occupied, contours, scan_masks = _wall_contours(
             vertices, faces, level["scans"], resolution, grid,
         )
-        measurements = _append_measurements(
-            root, occupied, contours, resolution, float(grid["pixel_size"]),
+        measurements = _wall_segment_measurements(
+            occupied, contours, resolution, float(grid["pixel_size"]),
             _measurement_clutter_mask(furnished_projection), scan_masks,
         )
-        measured_furnished_svg = output_dir / f"floor_{floor['floor_level_name']}_regularized_instances_with_measures.svg"
-        temporary_path = measured_furnished_svg.with_suffix(measured_furnished_svg.suffix + ".tmp")
-        temporary_path.write_text(ET.tostring(root, encoding="unicode") + "\n", encoding="utf-8")
-        temporary_path.replace(measured_furnished_svg)
         source_projection = Path(floor["source_projection"])
-        measured_regularized_png = output_dir / f"floor_{floor['floor_level_name']}_regularized_topdown_with_measures.png"
-        _write_measured_projection_png(
-            source_projection, measured_regularized_png, measurements, resolution,
-        )
-        measured_furnished_png = output_dir / f"floor_{floor['floor_level_name']}_regularized_instances_with_measures.png"
-        _write_measured_projection_png(
-            furnished_projection, measured_furnished_png, measurements, resolution,
-        )
+        overlay_png = output_dir / f"floor_{floor['floor_level_name']}_measurements.png"
+        _write_measurement_overlay_png(overlay_png, measurements, resolution)
         side_counts = {
             side: sum(item["annotation_side"] == side for item in measurements)
             for side in ("external", "internal")
@@ -558,13 +449,12 @@ def generate_floorplan_measurements(
         floor_results.append({
             "floor_level_name": floor["floor_level_name"],
             "source_regularized_projection_png": str(source_projection),
-            "measured_regularized_floorplan_png": str(measured_regularized_png),
             "source_furnished_floorplan_svg": str(source_svg),
-            "measured_furnished_floorplan_svg": str(measured_furnished_svg),
-            "measured_furnished_floorplan_png": str(measured_furnished_png),
-            "measured_floorplan": str(measured_furnished_svg),
-            "measured_view_count": 2,
-            "measured_output_file_count": 3,
+            "overlay_png": str(overlay_png),
+            "projection_grid": {
+                "x_min": float(grid["x_min"]), "z_max": float(grid["z_max"]),
+                "size": float(grid["pixel_size"]), "width": resolution, "height": resolution,
+            },
             "wall_segment_count": len(measurements),
             "between_scan_segment_count": sum(item["between_scans"] for item in measurements),
             "annotation_side_counts": side_counts,
@@ -572,7 +462,7 @@ def generate_floorplan_measurements(
         })
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_floor_mesh_manifest": str(mesh_manifest_path),
         "source_floorplan_manifest": str(overlay_manifest_path),
         "output_dir": str(output_dir),
@@ -582,20 +472,26 @@ def generate_floorplan_measurements(
         "warning_text": WARNING_TEXT,
         "measure_color": ORANGE,
         "furnished_png_renderer": "headless Chrome or Chromium",
-        "measured_view_count": sum(item["measured_view_count"] for item in floor_results),
-        "measured_output_file_count": sum(item["measured_output_file_count"] for item in floor_results),
+        "measurement_overlay_count": len(floor_results),
         "between_scan_segment_count": sum(
             item["between_scan_segment_count"] for item in floor_results
         ),
-        "wall_segment_annotation_count": sum(
-            item["wall_segment_count"] * item["measured_view_count"] for item in floor_results
-        ),
+        "wall_segment_annotation_count": sum(item["wall_segment_count"] for item in floor_results),
         "floor_levels": floor_results,
     }
     manifest_path = output_dir / "floorplan_measurements_manifest.json"
     temporary_path = manifest_path.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     temporary_path.replace(manifest_path)
+    for pattern in ("floor_*_regularized_topdown_with_measures.*",
+                    "floor_*_regularized_instances_with_measures.*"):
+        for old in output_dir.glob(pattern):
+            if old.suffix in {".png", ".pdf", ".svg"}:
+                old.unlink()
+    current_overlays = {Path(item["overlay_png"]) for item in floor_results}
+    for old in output_dir.glob("floor_*_measurements.png"):
+        if old not in current_overlays:
+            old.unlink()
     return result
 
 
@@ -606,8 +502,7 @@ def main() -> int:
     args = parser.parse_args()
     result = generate_floorplan_measurements(args.artifacts_dir, args.output_dir)
     print(
-        f"Available {result['measured_view_count']} measured views across "
-        f"{len(result['floor_levels'])} floors with "
+        f"Available {result['measurement_overlay_count']} measurement overlays with "
         f"{result['wall_segment_annotation_count']} wall-segment annotations."
     )
     return 0

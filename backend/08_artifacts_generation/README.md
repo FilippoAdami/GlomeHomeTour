@@ -9,11 +9,12 @@ Stage 08 generates presentation and inspection products after mesh elaboration a
 | [`generate_floor_plans.py`](generate_floor_plans.py) | Runs the complete first Phase 08 macro step, from floor-level metadata through final per-instance categorization. | Canonical entry point: **Generate floor plans**; writes to `artifacts/Generate Floor Plans/`. |
 | [`extract_best_views.py`](extract_best_views.py) | Selects compact acquired-image galleries and preserves their Phase 07 aligned COLMAP calibration and poses. | Completed second macro step: **extract_best_views**; writes to `artifacts/Extract Best Views/`. |
 | [`generate_360_pictures.py`](generate_360_pictures.py) | Selects locations using triangle coverage and adaptive height near acquired poses, then renders paired sealed Gaussian and mesh panoramas. | Third macro step: **Generate 360 Pictures**; writes to `artifacts/Generate 360 Pictures/`. |
+| [`generate_interactive_viewer.py`](generate_interactive_viewer.py) | Combines plans, acquired photos, and panoramas into a local tour and static comparison images. | Fourth macro step: **Generate Interactive Viewer**; writes to `artifacts/Generate Interactive Viewer/`. |
 | [`assign_floor_level_metadata.py`](assign_floor_level_metadata.py) | Assigns scan-level and floor-level names to aligned floor/ceiling planes without rendering images. | Metadata-only classifier for Phase 07 aligned regularized elements. |
 | [`generate_floor_level_meshes.py`](generate_floor_level_meshes.py) | Writes one regularized and one sealed cut mesh per overall floor level, merged across scans. | Uses aligned per-scan meshes and `floor_level_metadata.json`. |
 | [`generate_floor_level_projections.py`](generate_floor_level_projections.py) | Renders one top-down PNG for each regularized and sealed per-floor mesh. | Reads the generated floor-mesh manifest. |
 | [`generate_floorplan_instance_overlays.py`](generate_floorplan_instance_overlays.py) | Overlays final categorized instances on separate regularized top-down views. | Runs after final Phase 08 categorization. |
-| [`generate_floorplan_measurements.py`](generate_floorplan_measurements.py) | Adds approximate two-decimal wall-segment dimensions to each regularized and furnished floorplan. | Final artifact step in **Generate floor plans**. |
+| [`generate_floorplan_measurements.py`](generate_floorplan_measurements.py) | Writes one transparent PNG of approximate wall-segment dimensions per floor. | Final artifact step in **Generate floor plans**. |
 | [`generate_classified_object_floor_slices.py`](generate_classified_object_floor_slices.py) | Creates separate regularized floor-mesh copies with height-fitting classified objects, axis-aligned boxes, and top-face labels. | Experimental overlay from Phase 07 aligned objects and fixed-class associations. |
 | [`extract_cross_section_views.py`](extract_cross_section_views.py) | Renders unobstructed top-down floor views and four orthographic elevation sections from the Stage 04 mesh, using Stage 07 alignment metadata when supplied. | Main section-view generator. |
 | [`generate_scene_views.py`](generate_scene_views.py) | Chooses two wall-aligned vertical cuts and writes matching cutaway views for the sealed mesh and Gaussian Splat model. | Existing Stage 08 view generator; requires the configured GPU renderer. |
@@ -23,8 +24,8 @@ Stage 08 generates presentation and inspection products after mesh elaboration a
 | [`reproject_enhanced_cross_sections.py`](reproject_enhanced_cross_sections.py) | Reprojects enhanced section-image colors to a separate mesh copy using cross-section projection maps. | Optional post-processing. |
 | [`match_real_captured_frames.py`](match_real_captured_frames.py) | Matches Stage 05 synthetic instance views to registered camera frames and writes comparisons. | Optional inspection artifact. |
 
-Phase 08 outputs are collected under `backend/current_scene/artifacts/`. The first three macro steps
-keep their products under `Generate Floor Plans/`, `Extract Best Views/`, and `Generate 360 Pictures/`;
+Phase 08 outputs are collected under `backend/current_scene/artifacts/`. The macro steps
+keep their products under `Generate Floor Plans/`, `Extract Best Views/`, `Generate 360 Pictures/`, and `Generate Interactive Viewer/`;
 other standalone utilities retain their documented per-product output paths. Existing outputs are
 not moved automatically; rerun the relevant macro step to create its products under the new path.
 
@@ -50,27 +51,27 @@ scores and dimensions; it does not rerun semantic segmentation or edit Phase 05 
 rejections and the WC-anchored room rule can move an instance to its next eligible prediction; the
 single-class-per-scan constraint applies only to the selected fixture categories. The final
 associations drive furnished regularized floorplans, including eligible Phase 07 door/window
-panels. Last, it adds wall-segment measurements to both the regularized view without furniture and
-the furnished floorplan.
+panels. Last, it creates a reusable measurement overlay for each floor.
 
 Within `current_scene/artifacts/Generate Floor Plans/`, the macro produces these floorplan variants:
 
 | Variant | Artifact |
 | --- | --- |
+| Realistic, without measures | Sealed top-down PNG in `floor_level_projections/` |
 | Regularized, without furniture or measures | Top-down PNG in `floor_level_projections/` |
-| Regularized, without furniture, with measures | PNG in `floorplan_measurements/` |
-| Regularized, with furniture and measures | Measured SVG and matching PNG in `floorplan_measurements/` |
+| Regularized, with furniture, without measures | SVG in `floorplan_instance_overlays/` |
+| Measurements for each floor | Transparent PNG in `floorplan_measurements/` |
 
-The unmeasured furnished SVG is staged in a temporary directory for measurement and discarded
-automatically, including when a later step fails. Only the measured SVG and PNG are published, with
-the orange dimension spans, numeric labels, and approximation notice.
+Each `floor_<level>_measurements.png` has a transparent RGBA background, orange dimension spans,
+and rasterized numeric labels. Its manifest records the reference projection grid and the
+approximation notice; the viewer displays the notice when measurements are enabled.
 
 It also saves the floor/scan plane metadata, both types of per-floor cut meshes, projection and
-categorization reports, final instance associations, measured furnished SVGs, and per-step manifests
+categorization reports, final instance associations, unmeasured furnished SVGs, and per-step manifests
 under `current_scene/artifacts/Generate Floor Plans/`. `generate_floor_plans_manifest.json` in that
 folder links the outputs and summarizes the run. Its macro status is complete on success;
 `phase_status` remains `in_progress` because
-Phase 08 has further macro steps to come. Measured furnished PNGs require Chrome or Chromium on
+Phase 08 has further macro steps to come. Measurement placement requires Chrome or Chromium on
 `PATH`. `--alignment-dir` selects another Phase 07 output, and `--resolution` sets the square
 projection resolution (default 1024 px).
 
@@ -275,6 +276,43 @@ and 85.11% (scan_2/BASE). This is 23% faster than the previous recorded 86.07 s 
 scene, which preceded the 20 cm height schedule and the coverage-map and Gaussian-rendering
 optimizations. The aggregate manifest and log remain the source for timings from each run;
 total runtime varies with the scene and hardware.
+
+## Macro step 4: Generate Interactive Viewer
+
+After completing the first three macro steps, generate the tour and static comparisons:
+
+```bash
+backend/.venv/bin/python backend/08_artifacts_generation/generate_interactive_viewer.py
+backend/.venv/bin/python -m http.server 8765 --bind 127.0.0.1 --directory 'backend/current_scene/artifacts/Generate Interactive Viewer'
+```
+
+Open `http://127.0.0.1:8765/` on the same machine. The preview server binds only to loopback;
+stop it with Ctrl-C when finished to release port 8765.
+`--scene-dir` selects a different scene. The viewer copies its images and uses relative paths;
+it does not require the original artifacts at runtime or access to the internet. It requires WebGL
+for panoramas. The generator validates completed upstream manifests, the photo transform hash,
+projection geometry, and floor support; a missing floor under a photo is an error.
+
+Camera order is scan ID, floor name, photograph image ID, then panorama point ID. Numbering
+restarts per scan and is shared by the tour and static images. Plans use each projection's own
+saved grid; photo directions use aligned COLMAP poses and horizontal calibration. Panorama
+longitude zero is +X and positive longitude is +Z. The minimap is cropped to the current
+scan's attributed floor geometry. The floor plan's **Show measurements** control starts off and
+toggles the selected floor's transparent PNG over all three styles; the viewer maps it into each
+style's projection grid. Measurements never appear on interactive or static minimaps.
+`static/plans/<level>/` contains the three camera-marked plans;
+`static/<scan>/<number>_<kind>/` contains the three minimap variants and, for panoramas, the
+original equirectangular image. Minimap overlays in the static panorama variants are embedded in
+the equirectangular image and therefore move and distort in a spherical viewer.
+
+The manifest links each copied camera image to its source, the three upstream macro manifests,
+and the measurement manifest;
+the browser's `tour.json` uses relative asset paths. Execution logs are written to
+`generate_interactive_viewer.log`. Click the minimap to return to the full floor plan; choose the
+plan style there or right-click a plan or minimap. Side arrows navigate between cameras. The
+controls support keyboard, mouse, and touch; panoramas open at the widest supported view and use
+drag, arrow keys, or zoom buttons. A brief movement and label identify a newly opened panorama;
+the movement is skipped when the browser requests reduced motion and stops on interaction.
 
 ## Top-down and elevation views
 
@@ -490,17 +528,15 @@ The `floorplan_instance_overlays_manifest.json` is written under
 `current_scene/artifacts/Generate Floor Plans/floorplan_instance_overlays/` by the macro; a standalone
 run uses `current_scene/artifacts/floorplan_instance_overlays/`. It records displayed and suppressed
 instances, including objects fully covered by the current floor, and each reason; its furnished
-SVG output paths point to the final measured views.
+SVG output paths point to the unmeasured views.
 
-The macro writes the regularized top-down PNG without furniture and measures, plus a furnished SVG
-and matching PNG with measures, under `current_scene/artifacts/Generate Floor Plans/floorplan_measurements/`. The
-unmeasured furnished SVG is staged in a temporary directory during composition and measurement and
-is never retained under `artifacts/`. The furnished PNG is rendered from the measured SVG with headless Chrome or Chromium, so
-both furnished formats include the orange dimensions, numeric labels, and notice.
+The macro retains the furnished SVG in `floorplan_instance_overlays/` and writes one transparent
+measurement PNG per floor in `floorplan_measurements/`. It renders the furnished view using headless
+Chrome or Chromium to choose label positions that avoid existing marks.
 Orange dimension spans and numeric labels measure the straight segments of that floor's regularized
 PLI wall contours; furniture and door/window symbols are not measured. Labels use metres to two
-decimal places, and segments shorter than 10 cm are omitted as contour noise. Each view includes
-the orange notice “Measures are approximations and precision is not guaranteed.” Annotation
+decimal places, and segments shorter than 10 cm are omitted as contour noise. The viewer displays
+the approximation notice when measurements are shown. Annotation
 placement checks nearby plan marks and other dimensions, choosing the clearer inside or outside side
 of each wall segment. A segment facing another scan within 70 cm is always placed inward, so its
 annotations cannot spill into the gap or neighboring scan. The measurement manifest records each

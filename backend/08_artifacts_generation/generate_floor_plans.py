@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import tempfile
 import time
 from collections.abc import Callable
 from collections import Counter
@@ -56,29 +55,6 @@ def _run_timed_step(
     elapsed = time.perf_counter() - started
     timings.append({"step": name, "status": "complete", "elapsed_seconds": round(elapsed, 3)})
     LOGGER.info("Completed substep: %s in %.2f s", name, elapsed)
-    return result
-
-
-def _generate_final_floorplan_measurements(artifacts_dir: Path, overlay_manifest: dict) -> dict:
-    result = generate_floorplan_measurements(artifacts_dir, overlay_manifest=overlay_manifest)
-    measured_by_floor = {item["floor_level_name"]: item for item in result["floor_levels"]}
-    for floor in overlay_manifest["floor_levels"]:
-        measured = measured_by_floor[floor["floor_level_name"]]
-        intermediate_svg = Path(floor["output_svg"])
-        floor["output_svg"] = measured["measured_furnished_floorplan_svg"]
-        measured.pop("source_furnished_floorplan_svg", None)
-        intermediate_svg.unlink(missing_ok=True)
-    overlay_manifest["furnished_views_measured"] = True
-    overlay_manifest["output_dir"] = str(artifacts_dir / "floorplan_instance_overlays")
-
-    _write_json(
-        artifacts_dir / "floorplan_instance_overlays" / "floorplan_instance_overlays_manifest.json",
-        overlay_manifest,
-    )
-    _write_json(
-        artifacts_dir / "floorplan_measurements" / "floorplan_measurements_manifest.json",
-        result,
-    )
     return result
 
 
@@ -158,19 +134,18 @@ def generate_floor_plans(
         timings,
         macro_started,
     )
-    with tempfile.TemporaryDirectory(prefix="phase08_floorplan_overlays_") as temporary_overlay_dir:
-        instance_overlay_manifest = _run_timed_step(
-            "floorplan_instance_overlays",
-            lambda: generate_floorplan_instance_overlays(artifacts_dir, Path(temporary_overlay_dir)),
-            timings,
-            macro_started,
-        )
-        measurement_manifest = _run_timed_step(
-            "floorplan_measurements",
-            lambda: _generate_final_floorplan_measurements(artifacts_dir, instance_overlay_manifest),
-            timings,
-            macro_started,
-        )
+    instance_overlay_manifest = _run_timed_step(
+        "floorplan_instance_overlays",
+        lambda: generate_floorplan_instance_overlays(artifacts_dir, artifacts_dir / "floorplan_instance_overlays"),
+        timings,
+        macro_started,
+    )
+    measurement_manifest = _run_timed_step(
+        "floorplan_measurements",
+        lambda: generate_floorplan_measurements(artifacts_dir, overlay_manifest=instance_overlay_manifest),
+        timings,
+        macro_started,
+    )
 
     final_associations = room_check_manifest["associations"]
     result = {
@@ -238,15 +213,11 @@ def generate_floor_plans(
                 + level["phase07_panel_count"]
                 for level in instance_overlay_manifest["floor_levels"]
             ),
-            "floorplan_measured_views": measurement_manifest["measured_view_count"],
-            "floorplan_measurement_output_files": measurement_manifest["measured_output_file_count"],
+            "floorplan_measurement_overlays": measurement_manifest["measurement_overlay_count"],
             "floorplan_unique_wall_segments": sum(
                 level["wall_segment_count"] for level in measurement_manifest["floor_levels"]
             ),
-            "floorplan_wall_segment_measurements": sum(
-                level["wall_segment_count"] * level["measured_view_count"]
-                for level in measurement_manifest["floor_levels"]
-            ),
+            "floorplan_wall_segment_measurements": measurement_manifest["wall_segment_annotation_count"],
             "floorplan_between_scan_internal_segments": measurement_manifest[
                 "between_scan_segment_count"
             ],
@@ -283,9 +254,8 @@ def main() -> int:
         f"{counts['floorplan_instance_overlay_symbols']} floorplan symbols "
         f"({counts['floorplan_instance_overlay_panels']} Phase 07 panels), "
         f"{counts['floorplan_wall_segment_measurements']} wall-segment annotations across "
-        f"{counts['floorplan_measured_views']} measured views "
+        f"{counts['floorplan_measurement_overlays']} measurement overlays "
         f"({counts['floorplan_unique_wall_segments']} unique wall segments, "
-        f"{counts['floorplan_measurement_output_files']} files, "
         f"{counts['floorplan_between_scan_internal_segments']} between-scan segments forced inside). "
         f"Total: {result['total_duration_seconds']:.2f} s. Phase 08 remains in progress."
     )

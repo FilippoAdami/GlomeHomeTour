@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Property tour</title><link rel="stylesheet" href="viewer.css"></head>
+<body>
+<main><section id="plan-view" class="plan-page" aria-label="Floor plan">
+  <header class="plan-header"><div class="brand"><span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V21H3z M9 21v-7h6v7"/></svg></span><span>PROPERTY TOUR</span></div><span class="header-note"><span></span> Interactive viewing</span></header>
+  <div class="plan-shell"><div class="plan-intro"><p class="eyebrow">EXPLORE THE SPACE</p><h1>Find your point of view.</h1><p>Choose a camera on the plan to look around the property.</p></div>
+    <div class="plan-card"><div class="card-top"><div><p class="eyebrow">YOUR FLOOR PLAN</p><h2>Explore by room</h2></div><div class="plan-controls"><label>Level <select id="level"></select></label><label>Plan style <select id="style"><option value="realistic">Realistic</option><option value="regularized">Regularized</option><option value="objects">Regularized with objects</option></select></label><label class="measurement-toggle"><input type="checkbox" id="measurements"> Show measurements</label></div></div>
+      <div class="plan-canvas"><div id="plan" class="map"></div></div>
+      <p id="measurement-warning" class="measurement-warning" role="note" hidden></p>
+      <div class="card-footer"><div class="legend" aria-label="Map legend"><span><i class="legend-photo" aria-hidden="true"></i> Photograph</span><span><i class="legend-pano" aria-hidden="true"></i> 360° panorama</span></div><p>Select a marker to open a view <span aria-hidden="true">↗</span></p></div>
+    </div>
+  </div>
+</section>
+<section id="image-view" hidden><div class="image-area"><img id="photo" alt="Selected property photograph"><canvas id="panorama" tabindex="0" aria-label="Interactive panorama. Drag or use arrow keys to look around; use plus and minus to zoom."></canvas><button id="previous" class="navigation previous" aria-label="Previous camera">‹</button><button id="next" class="navigation next" aria-label="Next camera">›</button><button id="minimap-open" class="minimap-wrap" aria-label="Return to floor plan"><span id="minimap" class="map" aria-hidden="true"></span></button><div id="panorama-hint" class="panorama-hint" role="status" hidden><strong>360°</strong><span>Drag to look around</span></div><div id="pano-controls"><button id="zoom-in" aria-label="Zoom in">+</button><button id="zoom-out" aria-label="Zoom out">−</button></div></div></section></main>
+<div id="plan-menu" class="plan-menu" role="menu" aria-label="Floor plan style" hidden><button role="menuitem" data-style="realistic">Realistic</button><button role="menuitem" data-style="regularized">Regularized</button><button role="menuitem" data-style="objects">Regularized with objects</button></div>
+<script src="viewer.js" defer></script></body></html>
