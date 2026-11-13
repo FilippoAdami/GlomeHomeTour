@@ -10,6 +10,8 @@ Stage 08 generates presentation and inspection products after mesh elaboration a
 | [`extract_best_views.py`](extract_best_views.py) | Selects compact acquired-image galleries and preserves their Phase 07 aligned COLMAP calibration and poses. | Completed second macro step: **extract_best_views**; writes to `artifacts/Extract Best Views/`. |
 | [`generate_360_pictures.py`](generate_360_pictures.py) | Selects locations using triangle coverage and adaptive height near acquired poses, then renders paired sealed Gaussian and mesh panoramas. | Third macro step: **Generate 360 Pictures**; writes to `artifacts/Generate 360 Pictures/`. |
 | [`generate_interactive_viewer.py`](generate_interactive_viewer.py) | Combines plans, acquired photos, and panoramas into a local tour and static comparison images. | Fourth macro step: **Generate Interactive Viewer**; writes to `artifacts/Generate Interactive Viewer/`. |
+| [`generate_cinematic_flythrough.py`](generate_cinematic_flythrough.py) | Plans and validates the viewer's numbered tour, then renders synchronized mesh and Gaussian portrait videos with a Standard minimap. | **Generate Cinematic Flythrough**; preview must be inspected before the final render. |
+| [`generate_possible_views.py`](generate_possible_views.py) | Generates and selects per-scan orthographic cutaway candidates with per-slice provenance and coverage. | Standalone **Generate Possible Views** macro; writes to `artifacts/Generate Possible Views/`. |
 | [`assign_floor_level_metadata.py`](assign_floor_level_metadata.py) | Assigns scan-level and floor-level names to aligned floor/ceiling planes without rendering images. | Metadata-only classifier for Phase 07 aligned regularized elements. |
 | [`generate_floor_level_meshes.py`](generate_floor_level_meshes.py) | Writes one regularized and one sealed cut mesh per overall floor level, merged across scans. | Uses aligned per-scan meshes and `floor_level_metadata.json`. |
 | [`generate_floor_level_projections.py`](generate_floor_level_projections.py) | Renders one top-down PNG for each regularized and sealed per-floor mesh. | Reads the generated floor-mesh manifest. |
@@ -25,7 +27,7 @@ Stage 08 generates presentation and inspection products after mesh elaboration a
 | [`match_real_captured_frames.py`](match_real_captured_frames.py) | Matches Stage 05 synthetic instance views to registered camera frames and writes comparisons. | Optional inspection artifact. |
 
 Phase 08 outputs are collected under `backend/current_scene/artifacts/`. The macro steps
-keep their products under `Generate Floor Plans/`, `Extract Best Views/`, `Generate 360 Pictures/`, and `Generate Interactive Viewer/`;
+keep their products under `Generate Floor Plans/`, `Extract Best Views/`, `Generate 360 Pictures/`, `Generate Interactive Viewer/`, `Generate Cinematic Flythrough/`, and `Generate Possible Views/`;
 other standalone utilities retain their documented per-product output paths. Existing outputs are
 not moved automatically; rerun the relevant macro step to create its products under the new path.
 
@@ -274,7 +276,7 @@ contains timings for floor sampling, target filtering, height search and visibil
 diagnostics, and panorama rendering; the final report write and publication time is recorded
 in the aggregate manifest. Failed floor stages are timed and logged as well.
 
-Latest measured run of the current scene (2026-11-09) completed in **66.38 s** across three
+A pre-optics measured run of the current scene (2026-11-09) completed in **66.38 s** across three
 scans and four scan-floor pairs, producing four Gaussian/mesh panorama pairs at 4096 x 2048.
 Exact triangle coverage was 78.43% (scan_0/BASE), 74.82% (scan_0/BASEa), 81.69% (scan_1/BASE),
 and 85.11% (scan_2/BASE). This is 23% faster than the previous recorded 86.07 s run on this
@@ -298,10 +300,15 @@ it does not require the original artifacts at runtime or access to the internet.
 for panoramas. The generator validates completed upstream manifests, the photo transform hash,
 projection geometry, and floor support; a missing floor under a photo is an error.
 
-Camera order is scan ID, floor name, photograph image ID, then panorama point ID. Numbering
-restarts per scan and is shared by the tour and static images. Interactive and exported plan and
+Camera order is numeric scan ID. For each later scan, if Phase 07 has exactly one aligned door
+panel contributed by that scan and its predecessor, the photo or 360° viewpoint nearest the panel
+center by absolute 3D distance is first. The remaining cameras on all floors follow absolute 3D
+distance from the scan's earliest timestamped capture pose. If there is no unique valid paired
+door, the scan uses capture-start distance for all its cameras. Photos and 360° viewpoints count
+equally, and numbering starts at 1 and continues across scans. The tour, static image labels,
+static image paths, and camera markers use that same sequence. Interactive and exported plan and
 minimap markers display only camera numbers; scan and floor identifiers come from the input
-manifests and are not hardcoded in the rendering logic. Plans use each projection's own
+manifests. Plans use each projection's own
 saved grid; photo directions use aligned COLMAP poses and horizontal calibration. Panorama
 longitude zero is +X and positive longitude is +Z. The minimap is cropped to the current
 scan's attributed floor geometry. The floor plan's **Show measurements** control starts off and
@@ -311,10 +318,10 @@ For display, the viewer vertically flips copied plan images (top to bottom) and 
 pixel transform to camera positions and measurement geometry; measurement labels stay upright. This
 puts world +Z downward on screen, so static photo cones and the live 360° minimap cone negate yaw
 when drawing their screen-space direction. The source floor-plan artifacts are unchanged.
-`static/plans/<level>/` contains the three camera-marked plans;
-`static/<scan>/<number>_<kind>/` contains the three minimap variants and, for panoramas, the
-original equirectangular image. Minimap overlays in the static panorama variants are embedded in
-the equirectangular image and therefore move and distort in a spherical viewer.
+`static/plans/<level>/` contains each of the three camera-marked plans both without measures
+(`<style>.png`) and with measures (`<style>_with_measures.png`). Measurement overlays are aligned
+to each style's saved projection grid. `static/<scan>/<number>_<kind>/` contains one static image,
+with the Standard floor plan in its minimap (`standard.jpg`).
 
 The manifest links each copied camera image to its source, the three upstream macro manifests,
 and the measurement manifest. `tour.json` is fetched without cache, and camera-image and viewer
@@ -329,6 +336,111 @@ Mesh panoramas simulate reflections and transmission for classified Phase 07 pan
 images use the Gaussian panorama. A brief movement and label
 identify a newly opened panorama; the movement is skipped when the browser requests reduced motion
 and stops on interaction.
+
+## Generate Cinematic Flythrough
+
+Run after the viewer and a Phase 07 run that retained its trajectory-pairing report:
+
+```bash
+backend/.venv/bin/python backend/08_artifacts_generation/generate_cinematic_flythrough.py --mode preview
+backend/.venv/bin/python backend/08_artifacts_generation/generate_cinematic_flythrough.py --mode final
+
+# Or run both passes continuously with in-memory model reuse:
+backend/.venv/bin/python backend/08_artifacts_generation/generate_cinematic_flythrough.py --mode both
+```
+
+Inspect the paired videos and `preview/representative_frames/` between commands. The final command
+refuses changed inputs or trajectory data. The output directory is
+`artifacts/Generate Cinematic Flythrough/`; preview refuses to replace an existing directory.
+Use `--scene-dir` or `--output-dir` for another scene or a separate run.
+
+Older Phase 07 outputs may lack the deleted pairing report. Reconstruct the identities from current
+inputs without modifying segmentation, then pass the resulting provenance file to the preview:
+
+```bash
+backend/.venv/bin/python backend/07_alignment/recover_trajectory_pairings.py \
+  --workspace backend/current_scene --output /path/to/new/reconstructed_pairings.json
+backend/.venv/bin/python backend/08_artifacts_generation/generate_cinematic_flythrough.py \
+  --pairings /path/to/new/reconstructed_pairings.json --mode preview
+```
+
+Reconstruction compares saved relative rotations and aligned-panel source identities, but cannot
+prove that inputs still match the original Phase 07 run. A missing or ambiguous connection fails
+with the affected checkpoint numbers rather than reordering or cutting the tour.
+
+The generator follows the viewer's published numbers, passes through each saved photo pose without
+stopping, and passes within 31 cm of each panorama. It uses a fixed 70° horizontal field of view at
+30 fps. Between photo poses, it chooses viewing directions using mesh visibility and a preference
+for the direction of travel, while fully preserving cinematic sideways or backward viewing when
+open-space geometry warrants it.
+Each panorama viewpoint receives at least a 240° turn during the moving flight; the viewing direction
+is chosen using scene visibility. When a panorama lies on a different floor from an adjacent
+checkpoint in the same scan (such as mezzanine level `BASEa`), localized velocity pacing ($0.22\text{ m/s}$)
+is applied across its level footprint so that the turn is concentrated near that viewpoint and validated
+to cover at least 180° continuously while the camera remains on that floor. Doorway passages are
+centered comfortably through door openings with fallback safety offsets if obstructions are present.
+When nearby surfaces dominate a panorama, a bounded yaw adjustment can reduce a three-ray
+near-surface penalty without increasing it over the full adjustment window, moving photo poses, or
+adding significant rotation. The complete trajectory is revalidated after the adjustment; the
+original view is retained if validation fails.
+This geometry heuristic does not identify objects or establish semantic coverage.
+
+### Trajectory, velocity scheduling, and motion
+
+All participating scans must have a Phase 01 `metric_scale.json` recording that metric scale was
+available and applied to the geometry. Calibrate upstream and regenerate dependent artifacts if it
+is missing or uncalibrated; this step does not infer or apply a scale.
+
+The planner tries bounded alternatives when a paired door or scan route fails. If its coarse grid
+cannot connect a leg, it retries with 6 cm grids around that connection at margins of 0.6, 1.2,
+and 2.4 m, then tries a scan-wide fine grid if its cell limit permits. It compares at most three feasible scan routes using a heuristic
+for length, clearance, turning, and door crossings; the selected route is not necessarily globally
+optimal. If smoothing, retiming, ascent planning or sampled validation fails, it tries combinations
+of retained alternatives, ordered by their spatial scores, up to 16 full trajectory attempts.
+Retiming uses an F1-inspired curvature-aware velocity scheduler:
+- Peak cruise velocity: **1.25 m/s** (configurable via `speed`).
+- Apex velocity: $v_{\text{apex}} = \min(v_{\text{max}}, \sqrt{a_{\text{lat}} / \max(\kappa, 10^{-8})})$, holding a steady, fast pace through turns.
+- Asymmetric braking and acceleration: $a_{\text{brake}} = 1.10\text{ m/s}^2$ creates a crisp braking zone before corners via backward DP pass; $a_{\text{accel}} = 0.95\text{ m/s}^2$ accelerates out of turns via forward DP pass.
+- Door transit speed: paced up to $\min(v_{\text{max}}, 1.25\text{ m/s})$ for snappy, centered door passages.
+- Panorama pacing: paced down to $\le 0.35\text{ m/s}$ ($0.22\text{ m/s}$ on floor transitions) during the $\ge 240^\circ$ continuous panorama sweeps.
+
+Sampled interior acceleration and turning/cruise angular speed are checked against 1.21 m/s²,
+65.1°/s and 37.6°/s respectively; the overall angular speed limit is 120°/s. The manifest reports
+measured speed, jerk, acceleration, angular speed, clearance, panorama turns, and each door's speed
+and duration. Photo poses are checked to 1e-6. A turn of $\ge 240^\circ$ is validated at each panorama;
+where a same-scan neighboring checkpoint is on a different floor, the turn is also checked on the
+panorama's floor. Camera framing uses geometry and does not establish semantic scene coverage.
+
+The trajectory routes inside supported floor geometry, validates the sampled path against the sealed mesh,
+and allows panel-shaped intersections only at designated paired doors when the hit also matches a source door-class face.
+After a Phase 07 split, source face labels may identify the original instance rather than its derived child.
+Long clear stretches curve where clearance permits. The last panorama is followed by an ascent through validated
+horizontal ceiling surfaces to a scene-wide overhead view; terminal panoramas seamlessly continue their sweep into
+the ascent ($+60^\circ$) before tilting downward. Doors and ceiling are rendered from the actual moving camera.
+Sealed surfaces can temporarily fill the view during a crossing. The Standard minimap uses the
+viewer’s flipped plan images and world mapping.
+It shows the nearest supporting floor below the camera; inside an unsupported door gap or during
+the overhead ascent it retains the previous floor. Photo and panorama markers are revealed when their
+checkpoints are passed; route and revealed-marker state persist across floor changes.
+
+### Performance and measured benchmarks
+
+Key optimizations accelerate the pipeline:
+1. **Native GPU Hardware MSAA ($4\times$)**: Configured Open3D Filament's offscreen view with native $4\times$ multisample antialiasing and antialiasing enabled, completely eliminating CPU-side 2× supersampling and `cv2.resize` bilinear downsamping. Native frame rendering runs at $3.59\text{ ms/frame}$ (a **3.05× speedup** over CPU downscaling).
+2. **Asynchronous Non-Blocking Video Encoding (`AsyncVideoWriter`)**: Video pipe writes (`os.write` to ffmpeg stdin) are offloaded to a dedicated background worker thread with a bounded queue (`maxsize=16`), completely decoupling OpenGL/CUDA rendering from video encoding pipe bottlenecks ($0.12\text{ s}$ preview / $0.58\text{ s}$ final IO overhead, down from ~11 s).
+3. **In-Memory Model Caching Across Passes (`--mode both`)**: Preloaded GLB mesh geometry arrays and the resolution-independent PyTorch `GaussianRenderer` are held in memory across preview and final passes, reducing duplicate disk re-loading from $12.36\text{ s}$ down to $0.62\text{ s}$ (**19.9× faster**).
+4. **Fast SE(3) Matrix Inversion & CUDA Tensor Caching**: Replaced general $O(N^3)$ LU matrix inversions (`np.linalg.inv`) with closed-form rigid Euclidean camera pose transpositions ($R^T$ and $-R^T t$), and cached GPU intrinsic and background tensors on device.
+5. **Direct NumPy Minimap Composition**: In-place array slicing and assignment in `compose_minimap()` without unnecessary full-frame copies, keeping HUD overlay time to $< 0.8\text{ s}$ for 1,911 frames.
+6. **Floor-First Clearance Pruning & Raycast Early Exit**: Downward floor raycasts are evaluated first in `clearance_and_support` to immediately discard out-of-bounds cells, pruning 60%–85% of full-mesh distance queries during grid initialization.
+
+A measured end-to-end run on `current_scene` (1,911 trajectory frames, 63.7s video, 3 scans, 4 floors, 4 panoramas) achieved:
+- **Preview Pass (270×480)**: **52.89 s** (Input validation & setup: 0.9s, Planning & retiming: 9.3s, Model loading: 11.9s, Mesh: 19.87s, Gaussian: 9.35s, Minimap: 0.38s, Async Encoding IO: 0.12s).
+- **Final Pass (540×960)**: **47.49 s** (Verification: 0.7s, In-memory model reuse: 0.62s, Mesh: 34.59s, Gaussian: 9.51s, Minimap: 0.81s, Async Encoding IO: 0.58s).
+- **Combined Active Wall Time**: **100.38 s** (~1 min 40 s) for 3,822 frames (7,644 total video frames across mesh and Gaussian channels), a **33.82 s (25%) speedup** over the 134.20 s baseline.
+
+Preview and final hash all input assets, calibration, code, and encoders; inputs are verified before and after each render.
+The manifest records structured atomic timings, validation metrics, and trajectory hashes.
+The videos are silent, 270×480 previews and 540×960 finals.
 
 ## Top-down and elevation views
 
@@ -587,3 +699,73 @@ backend/.venv/bin/python backend/08_artifacts_generation/generate_floorplan_symb
 `project_valid_instances_by_floor.py` consumes the Stage 05 associations at `segmentation/non_structural_similarity/valid_class_associations.json`, but it also requires `structural_levels_manifest.json` and a refined structural mesh from the older standalone floor-level workflow. The current `run_phase06.py` publishes `mesh_elaboration/complete.ply` and `elements/` only, so those older plan inputs must be supplied explicitly; this utility is not run automatically by Stage 08. Its default output is `current_scene/artifacts/floorplan/instance_projections/`.
 
 `extract_floor_ceiling_residual.py` requires explicit source mesh, labels, structural metadata, fitted-wall inputs, and a new output PLY path; place it under `current_scene/artifacts/floor_ceiling_residual/`. It reads the same Stage 05 association artifact when available. Its result is an auxiliary evaluation mesh, not a replacement for `mesh_elaboration/complete.ply`. `reproject_enhanced_cross_sections.py` also takes an explicit `--output-dir`; use `current_scene/artifacts/reprojected_cross_sections/`.
+
+## Generate Possible Views
+
+Run `backend/.venv/bin/python backend/08_artifacts_generation/generate_possible_views.py`
+after Generate Floor Plans and Phase 07. The macro clips each actual per-scan
+floor to its floor and associated ceiling. Adjacent levels of the same scan meet
+at the lower level's ceiling plane, retaining the mezzanine floor and slab rather
+than leaving a clearance gap. Scan faces within 10 cm of their floor plane and
+whose normals are within about 26° of the plane normal (either winding) are
+protected; aligned Phase 7
+floor elements fill holes in the scanned floor. Where both are
+present, the scanned floor colors take precedence. The first floor allows 5 cm
+below its floor plane; a missing ceiling falls back to the mesh upper bound.
+
+Scan slices are assembled once, then scans render concurrently on CPU (one worker
+per represented scan); the GPU is not used because this environment's Open3D
+raycasting runtime has no GPU device. The full-size view render stays at the
+requested resolution, while the cutaway seed pass is capped at 3072 px. Compared
+with full-resolution cutaway sampling, this changed at most 0.08% of pixels per image;
+all 12 selected view IDs and each slice's coverage-target outcome were preserved.
+Geometry and provenance NPZ archives are written without ZIP compression to avoid
+their measured compression bottleneck; view pixel-ID and cutaway archives remain
+compressed. On 2026-11-10, the 4096-pixel macro completed in 64.9 s wall time
+(63.2 s in the manifest), 17.4% faster than the prior 78.6 s wall run, with
+identical output to the measured optimized prototype. The artifact directory grew
+from 172 MB to 392 MB. The manifest records the cutaway sampling resolution,
+archive compression, summed per-scan render time, and concurrent `scan_work_wall`.
+
+Each scan is rendered independently, combining its actual floor slices and framing
+four orthographic cameras at that scan’s bounding-box corners. View selection runs separately for each
+scan, while coverage remains reported per floor slice. For each camera, the renderer identifies first-hit triangles whose
+normals point along the viewing direction, removes that visible back-facing layer,
+and removes nearby triangles within 15 cm in 3D. This applies to walls, ceilings,
+and other first-hit back-facing geometry, except the protected floors. Triangle
+proximity is conservative:
+subdivision bounds uncertainty to 5 mm before an entire intersecting triangle is
+removed, so long triangles can extend farther than the radius. The rule depends
+on the source mesh's triangle winding; it can also remove objects that are close
+to a removed wall. Images and coverage are computed from the same camera-specific
+cutaway. No source mesh is modified.
+
+Phase 07 replacement-panel records identify mirrors and windows in the scan mesh.
+The macro validates their faces against the recorded corners, then casts one reflected
+ray for a mirror or one transmitted ray for a window, with transmitted light, a partial reflection, a light gray tint, and a
+contrasting edge. For each view, a panel is removed only when more than half of its non-panel
+triangle neighbors within 30 cm were removed by that view’s cutaway; otherwise it
+is retained. Only retained geometry in the same scan can appear in these effects; missing
+geometry is white. The current
+GLB contains vertex colors but no optical material values, so these are idealized
+surfaces rather than measured material properties. Pixel provenance identifies the
+panel itself; secondary hits do not add surface coverage. The manifest records panel
+classes and visible optical pixel counts per candidate.
+
+Outputs are staged and published under `artifacts/Generate Possible Views/`.
+The manifest links candidate images, per-pixel composite face IDs, removed and
+first-layer face IDs, per-slice reports, and selected views. Each `scan_levels/`
+slice contains uncompressed NPZ arrays for vertices, faces, vertex colors, source face IDs,
+source-mesh indices, and the floor-protection mask. The indices select the
+slice's `source_meshes` list, which contains the aligned per-scan `mesh.ply`
+and its aligned floor elements; split faces retain their source IDs. Contact sheets include all four candidates and the selected set for each scan,
+plus a combined sheet of selected views. The default 4096-pixel render counts a face only if at least two
+pixels hit it. Selection uses area, a 70% per-slice target, and stops when
+marginal coverage is at most 10% of the best first view. `--resolution`,
+`--coverage-threshold`, and `--minimum-gain` change these settings;
+`--alignment-dir`, `--metadata`, and `--output-dir` select inputs and output.
+
+Per-slice coverage uses actual visible scan faces and excludes the supplemental
+fitted floors from its area totals to avoid counting overlapping floor area twice.
+Greedy selection uses the visible face areas within each scan. The manifest
+reports attainable coverage and an individual stopping reason for each slice.

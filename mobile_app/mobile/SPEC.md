@@ -166,7 +166,7 @@ Intrinsics are read once per session from the first tracked frame and asserted u
 All exported JSON manifests are guaranteed to conform to the shared interchange schemas (`shared/schemas/*.schema.json`, schema_version 1.0.0):
 
 ```
-Documents/GlomeHomeTour/scan_<yyyyMMdd_HHmmss>/
+Documents/GlomeHomeTour/scan_<yyyyMMdd_HHmmss_SSS>_<8-hex-id>/
 ├── images/
 │   ├── frame_00000.jpg …           decimation-filtered keyframes, camera-native orientation
 ├── transforms.json                 NeRF/instant-ngp/2DGS format (schema_version: 1.0.0,

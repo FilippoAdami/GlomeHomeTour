@@ -17,6 +17,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.view.Surface
 import com.google.ar.core.Session
 
 /**
@@ -252,7 +253,9 @@ class CameraPipeline(
         }
     }
 
-    fun triggerAutoFocus(normX: Float = 0.5f, normY: Float = 0.5f) {
+    fun triggerAutoFocus(
+        normX: Float, normY: Float, viewWidth: Int, viewHeight: Int, displayRotation: Int,
+    ) {
         val cameraDevice = device ?: return
         val session = captureSession ?: return
         val chars = characteristics ?: return
@@ -262,14 +265,20 @@ class CameraPipeline(
             configureManualOverrides(builder, chars)
             val sensorRect = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             if (sensorRect != null) {
-                val cx = (normX * sensorRect.width()).toInt().coerceIn(0, sensorRect.width() - 1)
-                val cy = (normY * sensorRect.height()).toInt().coerceIn(0, sensorRect.height() - 1)
-                val halfSize = (sensorRect.width() * 0.1f).toInt()
+                val (sensorX, sensorY) = previewPointToSensorNormalized(
+                    normX, normY, viewWidth, viewHeight, sensorRect.width(), sensorRect.height(),
+                    chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0, displayRotation,
+                )
+                val cx = (sensorRect.left + sensorX * sensorRect.width()).toInt()
+                    .coerceIn(sensorRect.left, sensorRect.right - 1)
+                val cy = (sensorRect.top + sensorY * sensorRect.height()).toInt()
+                    .coerceIn(sensorRect.top, sensorRect.bottom - 1)
+                val halfSize = (sensorRect.width() * 0.1f).toInt().coerceAtLeast(1)
                 val rect = Rect(
-                    (cx - halfSize).coerceAtLeast(0),
-                    (cy - halfSize).coerceAtLeast(0),
-                    (cx + halfSize).coerceAtMost(sensorRect.width() - 1),
-                    (cy + halfSize).coerceAtMost(sensorRect.height() - 1),
+                    (cx - halfSize).coerceAtLeast(sensorRect.left),
+                    (cy - halfSize).coerceAtLeast(sensorRect.top),
+                    (cx + halfSize).coerceAtMost(sensorRect.right),
+                    (cy + halfSize).coerceAtMost(sensorRect.bottom),
                 )
                 val maxAfRegions = chars.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0
                 if (maxAfRegions > 0) {
@@ -284,19 +293,11 @@ class CameraPipeline(
     }
 
     private fun configureManualOverrides(builder: CaptureRequest.Builder, chars: CameraCharacteristics) {
-        // Keep continuous autofocus running (README §6). Prefer CONTINUOUS_VIDEO / CONTINUOUS_PICTURE,
-        // falling back to AUTO if available.
+        // AUTO waits for CONTROL_AF_TRIGGER_START, so repeating requests hold focus until a tap.
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
-        val afMode = when {
-            afModes?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true ->
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
-            afModes?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) == true ->
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true ->
-                CaptureRequest.CONTROL_AF_MODE_AUTO
-            else -> CaptureRequest.CONTROL_AF_MODE_OFF
-        }
+        val afMode = if (afModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true)
+            CaptureRequest.CONTROL_AF_MODE_AUTO else CaptureRequest.CONTROL_AF_MODE_OFF
         builder.set(CaptureRequest.CONTROL_AF_MODE, afMode)
 
         // Sensor readout rate: 60 FPS (README §4), clamped to whatever the device actually
@@ -399,5 +400,41 @@ class CameraPipeline(
         /** No color-correction adjustment: what the sensor reads until the operator explicitly
          * locks white balance in the pre-flight flow. */
         val NEUTRAL_GAINS = RggbChannelVector(1f, 1f, 1f, 1f)
+    }
+}
+
+internal fun previewPointToSensorNormalized(
+    x: Float, y: Float,
+    viewWidth: Int, viewHeight: Int,
+    sensorWidth: Int, sensorHeight: Int,
+    sensorOrientation: Int, displayRotation: Int,
+): Pair<Float, Float> {
+    if (viewWidth <= 0 || viewHeight <= 0 || sensorWidth <= 0 || sensorHeight <= 0) return 0.5f to 0.5f
+    val displayDegrees = when (displayRotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+    val rotation = (sensorOrientation - displayDegrees + 360) % 360
+    val swapsAxes = rotation == 90 || rotation == 270
+    val orientedWidth = if (swapsAxes) sensorHeight else sensorWidth
+    val orientedHeight = if (swapsAxes) sensorWidth else sensorHeight
+    val sensorAspect = orientedWidth.toFloat() / orientedHeight
+    val viewAspect = viewWidth.toFloat() / viewHeight
+    var orientedX = x.coerceIn(0f, 1f)
+    var orientedY = y.coerceIn(0f, 1f)
+    if (sensorAspect > viewAspect) {
+        val visibleWidth = viewAspect / sensorAspect
+        orientedX = (1f - visibleWidth) * 0.5f + orientedX * visibleWidth
+    } else {
+        val visibleHeight = sensorAspect / viewAspect
+        orientedY = (1f - visibleHeight) * 0.5f + orientedY * visibleHeight
+    }
+    return when (rotation) {
+        90 -> orientedY to (1f - orientedX)
+        180 -> (1f - orientedX) to (1f - orientedY)
+        270 -> (1f - orientedY) to orientedX
+        else -> orientedX to orientedY
     }
 }

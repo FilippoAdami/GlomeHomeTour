@@ -123,6 +123,69 @@ def versioned_asset_url(relative_path, output):
     return f"{relative_path}?v={digest}"
 
 
+def scan_number(scan_id):
+    match = re.fullmatch(r"scan_(\d+)", scan_id)
+    if not match:
+        raise ValueError(f"Invalid scan identity: {scan_id}")
+    return int(match.group(1))
+
+
+def scan_start_position(alignment, scan_id):
+    scan_number(scan_id)
+    frames = load_json(Path(alignment) / "scans" / scan_id / "transforms.json").get("frames", [])
+    if not frames:
+        raise ValueError(f"No timestamped capture poses for {scan_id}")
+    first = min(frames, key=lambda frame: int(frame["timestamp_ns"]))
+    matrix = np.asarray(first["transform_matrix"], dtype=float)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError(f"Invalid first capture pose for {scan_id}")
+    return matrix[:3, 3]
+
+
+def incoming_door_centers(alignment, scan_ids):
+    path = Path(alignment) / "stats/aligned_door_panels.json"
+    if not path.is_file():
+        LOG.warning("Door panel data is missing; camera order will use capture-start distances")
+        return {}
+    panels = load_json(path).get("panels", [])
+    centers = {}
+    for previous, current in zip(scan_ids, scan_ids[1:]):
+        paired = [panel for panel in panels
+                  if {source["scan_id"] for source in panel["source_instances"]} >= {previous, current}]
+        if len(paired) != 1:
+            if paired:
+                LOG.warning("Expected one paired door for %s -> %s, found %d; using capture-start order",
+                            previous, current, len(paired))
+            continue
+        panel = paired[0]
+        center = np.asarray(panel["panel_center_xyz_m"], dtype=float)
+        if panel.get("coordinate_frame") != "phase07_aligned_global_y_up" or center.shape != (3,) or not np.isfinite(center).all():
+            LOG.warning("Invalid paired door center for %s -> %s; using capture-start order", previous, current)
+            continue
+        centers[current] = center
+    return centers
+
+
+def number_cameras(cameras, scan_starts, door_centers):
+    entry_cameras = {}
+    for scan_id, center in door_centers.items():
+        scan_cameras = [camera for camera in cameras if camera["scan"] == scan_id]
+        if scan_cameras:
+            entry_cameras[scan_id] = min(scan_cameras, key=lambda camera: (
+                float(np.linalg.norm(np.asarray(camera["position"], dtype=float) - center)),
+                camera["kind"] != "photo", camera["source_id"],
+            ))
+    cameras.sort(key=lambda camera: (
+        scan_number(camera["scan"]),
+        camera is not entry_cameras.get(camera["scan"]),
+        float(np.linalg.norm(np.asarray(camera["position"], dtype=float) - scan_starts[camera["scan"]])),
+        camera["kind"] != "photo", camera["source_id"],
+    ))
+    for number, camera in enumerate(cameras, 1):
+        camera["number"] = number
+    return cameras
+
+
 def marked_plan(image, cameras, style, current=None, crop=None):
     image = image.copy().convert("RGB")
     draw = ImageDraw.Draw(image, "RGBA")
@@ -218,10 +281,12 @@ def generate(scene_dir):
         floor_groups[(floor["scan_id"], floor["floor_level_name"])].append(floor)
     geometries = {key: floor_geometry(records, alignment) for key, records in floor_groups.items()}
     cameras = []
+    scan_starts = {}
     for scan in photo_manifest["scans"]:
         scan_id = scan["scan_id"]
         if scan["status"] != "complete":
             raise ValueError(f"Incomplete photo selection: {scan_id}")
+        scan_starts[scan_id] = scan_start_position(alignment, scan_id)
         selection_path = Path(scan["selected_images"])
         selection = load_json(selection_path)
         if selection["scan_id"] != scan_id or selection["coordinate_frame"] != "phase07_aligned_world":
@@ -245,6 +310,8 @@ def generate(scene_dir):
             report_path = Path(floor["report"])
             report = load_json(report_path)
             scan_id, level = scan["scan_id"], floor["floor_level_name"]
+            if scan_id not in scan_starts:
+                scan_starts[scan_id] = scan_start_position(alignment, scan_id)
             convention = report["panorama"]
             if (report["scan_id"] != scan_id or report["floor_level_name"] != level or report["coordinate_frame"] != "phase07_aligned_world" or
                     any(convention.get(key) != value for key, value in {"projection": "equirectangular", "longitude_zero": "+X", "positive_longitude": "+Z", "up": "+Y"}.items())):
@@ -271,11 +338,10 @@ def generate(scene_dir):
     for camera in cameras:
         if (camera["scan"], camera["floor"]) not in geometries or camera["floor"] not in levels or not Path(camera["source"]).is_file():
             raise ValueError(f"Missing or inconsistent camera input: {camera}")
-    cameras.sort(key=lambda c: (c["scan"], c["floor"], c["kind"] != "photo", c["source_id"]))
-    counts = defaultdict(int)
+    scan_ids = sorted(scan_starts, key=scan_number)
+    door_centers = incoming_door_centers(alignment, scan_ids)
+    number_cameras(cameras, scan_starts, door_centers)
     for camera in cameras:
-        counts[camera["scan"]] += 1
-        camera["number"] = counts[camera["scan"]]
         camera["pixels"] = {style: project(camera["position"], levels[camera["floor"]]["styles"][style]["grid"]) for style in STYLES}
     output = artifacts / "Generate Interactive Viewer"
     output.mkdir(parents=True, exist_ok=True)
@@ -322,38 +388,48 @@ def generate(scene_dir):
             camera["mesh_image"] = dest.relative_to(output).as_posix()
     for level in levels.values():
         rows = [c for c in cameras if c["floor"] == level["name"]]
-        for style in STYLES:
-            dest = output / "static" / "plans" / level["name"] / f"{style}.png"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            marked_plan(images[(level["name"], style)], rows, style).save(dest)
+        plan_dir = output / "static" / "plans" / level["name"]
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        measurement_grid = level["measurements"]["grid"]
+        with Image.open(output / level["measurements"]["image"]) as source_overlay:
+            source_overlay = source_overlay.convert("RGBA")
+            for style, info in level["styles"].items():
+                plan = images[(level["name"], style)]
+                marked_plan(plan, rows, style).save(plan_dir / f"{style}.png")
+
+                grid = info["grid"]
+                scale = measurement_grid["size"] / grid["size"]
+                overlay = source_overlay.resize((max(1, round(measurement_grid["width"] * scale)), max(1, round(measurement_grid["height"] * scale))), Image.Resampling.BILINEAR)
+                x = round((measurement_grid["x_min"] - grid["x_min"]) / grid["size"])
+                y = round(grid["height"] - (grid["z_max"] - measurement_grid["z_max"]) / grid["size"] - overlay.height)
+                overlay_layer = Image.new("RGBA", plan.size)
+                overlay_layer.paste(overlay, (x, y))
+                measured = Image.alpha_composite(plan.convert("RGBA"), overlay_layer)
+                marked_plan(measured.convert("RGB"), rows, style).save(plan_dir / f"{style}_with_measures.png")
     for camera in cameras:
         level = levels[camera["floor"]]
         base = Image.open(output / camera["image"]).convert("RGB")
-        if camera["kind"] == "panorama":
-            original = output / "static" / camera["scan"] / f"{camera['number']:03d}_panorama" / "original.jpg"
-            original.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(output / camera["image"], original)
-        for style in STYLES:
-            crop = level["styles"][style]["crops"][camera["scan"]]
-            minimap = marked_plan(images[(camera["floor"], style)], [camera], style, current=camera, crop=crop)
-            minimap.thumbnail((max(200, base.width // 4), max(160, base.height // 3)))
-            result = base.copy()
-            pad = max(10, base.width // 100)
-            draw = ImageDraw.Draw(result)
-            x, y = base.width - minimap.width - pad, pad * 3
-            draw.rectangle((x-4, y-4, x+minimap.width+4, y+minimap.height+4), fill="white")
-            result.paste(minimap, (x, y))
-            font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(18, base.width // 65))
-            draw.text((pad, pad), f"{camera['scan']}  camera {camera['number']}  |  {camera['floor']}", font=font, fill="white", stroke_width=2, stroke_fill="black")
-            dest = output / "static" / camera["scan"] / f"{camera['number']:03d}_{camera['kind']}" / f"{style}.jpg"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            result.save(dest, quality=94, subsampling=0)
+        style = "objects"
+        crop = level["styles"][style]["crops"][camera["scan"]]
+        minimap = marked_plan(images[(camera["floor"], style)], [camera], style, current=camera, crop=crop)
+        minimap.thumbnail((max(200, base.width // 4), max(160, base.height // 3)))
+        result = base.copy()
+        pad = max(10, base.width // 100)
+        draw = ImageDraw.Draw(result)
+        x, y = base.width - minimap.width - pad, pad * 3
+        draw.rectangle((x-4, y-4, x+minimap.width+4, y+minimap.height+4), fill="white")
+        result.paste(minimap, (x, y))
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(18, base.width // 65))
+        draw.text((pad, pad), f"{camera['scan']}  camera {camera['number']}  |  {camera['floor']}", font=font, fill="white", stroke_width=2, stroke_fill="black")
+        dest = output / "static" / camera["scan"] / f"{camera['number']:03d}_{camera['kind']}" / "standard.jpg"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        result.save(dest, quality=94, subsampling=0)
     data = {"levels": [{**level, "styles": {style: {k: v for k, v in info.items() if k != "source"} for style, info in level["styles"].items()}} for level in levels.values()],
             "cameras": [{k: versioned_asset_url(v, output) if k in {"image", "mesh_image"} else v
                          for k, v in camera.items() if k not in {"source", "mesh_source"}} for camera in cameras], "styles": list(STYLES),
             "measurement_warning": measurements["warning_text"]}
     (output / "tour.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    result = {"schema_version": 1, "phase_status": "in_progress", "macro_step": "Generate Interactive Viewer", "macro_step_status": "complete", "source_manifests": [str(p) for p in manifests], "sources": [{"scan": c["scan"], "number": c["number"], "source": c["source"], **({"mesh_source": c["mesh_source"]} if "mesh_source" in c else {})} for c in cameras], "camera_order": "scan ID, floor name, photographs by image ID, panoramas by point ID; numbering restarts per scan", "tour_data": "tour.json", "entry_point": "index.html", "static_dir": "static", "camera_count": len(cameras), "floor_count": len(levels), "elapsed_seconds": round(time.perf_counter()-started, 3)}
+    result = {"schema_version": 1, "phase_status": "in_progress", "macro_step": "Generate Interactive Viewer", "macro_step_status": "complete", "source_manifests": [str(p) for p in manifests], "sources": [{"scan": c["scan"], "number": c["number"], "source": c["source"], **({"mesh_source": c["mesh_source"]} if "mesh_source" in c else {})} for c in cameras], "camera_order": "numeric scan ID; nearest camera to the incoming paired door first when available, then 3D distance from the scan's first timestamped capture pose; photos and panoramas share one continuous numbering sequence", "tour_data": "tour.json", "entry_point": "index.html", "static_dir": "static", "camera_count": len(cameras), "floor_count": len(levels), "elapsed_seconds": round(time.perf_counter()-started, 3)}
     (output / "generate_interactive_viewer_manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     LOG.info("Generated %s cameras on %s levels in %.2f s", len(cameras), len(levels), time.perf_counter()-started)
     return result

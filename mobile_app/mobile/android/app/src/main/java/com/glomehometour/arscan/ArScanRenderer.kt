@@ -217,8 +217,8 @@ class ArScanRenderer(
 
     val pipeline: CameraPipeline? get() = cameraPipeline
 
-    fun triggerAutoFocus(normX: Float = 0.5f, normY: Float = 0.5f) {
-        cameraPipeline?.triggerAutoFocus(normX, normY)
+    fun triggerAutoFocus(normX: Float, normY: Float, viewWidth: Int, viewHeight: Int, displayRotation: Int) {
+        cameraPipeline?.triggerAutoFocus(normX, normY, viewWidth, viewHeight, displayRotation)
     }
 
     fun destroy() {

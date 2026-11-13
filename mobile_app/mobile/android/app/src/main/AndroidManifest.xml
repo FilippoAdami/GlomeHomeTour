@@ -40,6 +40,11 @@
             android:exported="false"
             android:screenOrientation="portrait"
             android:theme="@style/Theme.GlomeArScan" />
+        <activity
+            android:name=".PointCloudViewerActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.GlomeArScan" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

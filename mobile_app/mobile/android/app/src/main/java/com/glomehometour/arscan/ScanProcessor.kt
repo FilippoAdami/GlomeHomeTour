@@ -50,6 +50,41 @@ class ScanProcessor(private val context: Context? = null) {
             }
         }
 
+        fun listScanFolders(context: Context, sessionName: String): List<String> {
+            val fallbackDir = File(context.getExternalFilesDir(null), sessionName)
+            if (fallbackDir.isDirectory) return DirectoryFileAccessor(fallbackDir).listScanFolders()
+
+            fun folders(zip: java.util.zip.ZipFile): List<String> {
+                val scanFolders = zip.entries().asSequence().mapNotNull { entry ->
+                    Regex("^(scan_\\d+)/transforms\\.json$").matchEntire(entry.name)?.groupValues?.get(1)
+                }.distinct().sortedBy { it.removePrefix("scan_").toIntOrNull() ?: 0 }.toList()
+                return scanFolders.ifEmpty { if (zip.getEntry("transforms.json") != null) listOf("") else emptyList() }
+            }
+
+            val file = findZipFile(context, sessionName)
+            if (file != null) {
+                try {
+                    return java.util.zip.ZipFile(file).use(::folders)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not inspect room folders in ${file.name}", e)
+                }
+            }
+
+            val id = queryMediaStoreZipId(context, sessionName)
+            if (id != null) {
+                val uri = ContentUris.withAppendedId(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), id)
+                try {
+                    context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        return java.util.zip.ZipFile(File("/proc/self/fd/${pfd.fd}")).use(::folders)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not inspect MediaStore room archive for $sessionName", e)
+                }
+            }
+
+            return getAccessor(context, sessionName).listScanFolders()
+        }
+
         fun findZipFile(context: Context, sessionName: String): File? {
             val fallbackZip = File(context.getExternalFilesDir(null), "$sessionName.zip")
             if (fallbackZip.isFile) return fallbackZip
@@ -65,11 +100,11 @@ class ScanProcessor(private val context: Context? = null) {
         fun queryMediaStoreZipId(context: Context, sessionName: String): Long? {
             val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             val projection = arrayOf(MediaStore.Files.FileColumns._ID)
-            val selection = "(${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?) AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} = ?"
+            val selection = "${MediaStore.Files.FileColumns.DISPLAY_NAME} = ? AND (${MediaStore.Files.FileColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?)"
             val selectionArgs = arrayOf(
-                "Documents/${DatasetWriter.ALBUM}/",
-                "Documents/${DatasetWriter.ALBUM}",
                 "$sessionName.zip",
+                "Documents/${DatasetWriter.ALBUM}%",
+                "Documents/${DatasetWriter.ALBUM}",
             )
             return try {
                 context.contentResolver.query(uri, projection, selection, selectionArgs, null)?.use { cursor ->
@@ -81,7 +116,70 @@ class ScanProcessor(private val context: Context? = null) {
             }
         }
 
+        fun readTrajectoryCsv(context: Context, sessionName: String, scanFolder: String): String? {
+            val roomPath = "$scanFolder/trajectory.csv"
+            val dirs = listOfNotNull(
+                context.getExternalFilesDir(null)?.let { File(it, sessionName) },
+                File(context.filesDir, sessionName),
+            )
+            for (dir in dirs) {
+                try {
+                    val roomFile = File(dir, roomPath)
+                    if (roomFile.isFile) return roomFile.readText()
+                    if (scanFolder == "scan_0") {
+                        val legacyFile = File(dir, "trajectory.csv")
+                        if (legacyFile.isFile) return legacyFile.readText()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not read trajectory from ${dir.name}", e)
+                }
+            }
+
+            try {
+                val accessor = getAccessor(context, sessionName)
+                accessor.readText(roomPath)?.let { return it }
+                if (scanFolder == "scan_0") accessor.readText("trajectory.csv")?.let { return it }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read trajectory for $sessionName/$scanFolder", e)
+            }
+
+            val zipFile = findZipFile(context, sessionName)
+            if (zipFile != null) {
+                try {
+                    java.util.zip.ZipFile(zipFile).use { zip ->
+                        val entry = zip.getEntry(roomPath)
+                            ?: if (scanFolder == "scan_0") zip.getEntry("trajectory.csv") else null
+                        if (entry != null) return zip.getInputStream(entry).bufferedReader().use { it.readText() }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Could not read trajectory from ${zipFile.name}", e)
+                }
+            }
+
+            val zipId = queryMediaStoreZipId(context, sessionName) ?: return null
+            val zipUri = ContentUris.withAppendedId(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), zipId)
+            return try {
+                context.contentResolver.openInputStream(zipUri)?.use rawStream@ { raw ->
+                    java.util.zip.ZipInputStream(raw).use zipStream@ { zip ->
+                        var entry = zip.nextEntry
+                        while (entry != null) {
+                            if (entry.name == roomPath || (scanFolder == "scan_0" && entry.name == "trajectory.csv")) {
+                                return@zipStream zip.readBytes().toString(Charsets.UTF_8)
+                            }
+                            entry = zip.nextEntry
+                        }
+                        null
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not read trajectory from MediaStore archive for $sessionName", e)
+                null
+            }
+        }
+
         private val processedCache = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+        private data class PropertyRoomSource(val file: File, val scanFolder: String)
 
         fun markProcessed(sessionName: String) {
             processedCache.add(sessionName)
@@ -173,26 +271,29 @@ class ScanProcessor(private val context: Context? = null) {
             val zipName = "${cleanAddress}_scan.zip"
             val targetZipFile = File(context.getExternalFilesDir(null), zipName)
 
-            val roomSources = mutableListOf<File>()
+            val roomSources = mutableListOf<PropertyRoomSource>()
             val tempFilesToDelete = mutableListOf<File>()
+            val sourcesBySession = mutableMapOf<String, File?>()
 
             for (room in rooms) {
-                val zipFile = getSessionZipFile(context, room.sessionName)
+                val zipFile = sourcesBySession.getOrPut(room.sessionName) {
+                    getSessionZipFile(context, room.sessionName)
+                }
                 if (zipFile != null && zipFile.isFile) {
                     if (zipFile.parentFile == context.cacheDir) {
                         tempFilesToDelete.add(zipFile)
                     }
-                    roomSources.add(zipFile)
+                    roomSources.add(PropertyRoomSource(zipFile, room.scanFolder.ifBlank { "scan_0" }))
                 } else {
                     val fallbackDir = File(context.getExternalFilesDir(null), room.sessionName)
                     if (fallbackDir.isDirectory) {
-                        roomSources.add(fallbackDir)
+                        roomSources.add(PropertyRoomSource(fallbackDir, room.scanFolder.ifBlank { "scan_0" }))
                     }
                 }
             }
 
             try {
-                val ok = packagePropertyScanArchive(targetZipFile, roomSources, onProgress)
+                val ok = packagePropertyRoomsArchive(targetZipFile, roomSources, onProgress)
                 if (!ok) return null
 
                 // Copy to Documents/GlomeHomeTour for user visibility if possible
@@ -224,9 +325,21 @@ class ScanProcessor(private val context: Context? = null) {
             roomSources: List<File>,
             onProgress: ((Int) -> Unit)? = null,
         ): Boolean {
+            val expandedSources = roomSources.flatMap { source ->
+                listRoomFolders(source).map { folder -> PropertyRoomSource(source, folder) }
+            }
+            return packagePropertyRoomsArchive(targetZipFile, expandedSources, onProgress)
+        }
+
+        private fun packagePropertyRoomsArchive(
+            targetZipFile: File,
+            roomSources: List<PropertyRoomSource>,
+            onProgress: ((Int) -> Unit)? = null,
+        ): Boolean {
             if (roomSources.isEmpty()) return false
             val manifestHashes = mutableMapOf<String, String>()
             val imageHashes = mutableMapOf<String, String>()
+            val countedCertificates = mutableSetOf<String>()
 
             var overallRawW = 1920
             var overallRawH = 1080
@@ -243,7 +356,9 @@ class ScanProcessor(private val context: Context? = null) {
                     ZipOutputStream(fos).use { zos ->
                         zos.setLevel(java.util.zip.Deflater.BEST_SPEED)
 
-                        for ((roomIdx, source) in roomSources.withIndex()) {
+                        for ((roomIdx, roomSource) in roomSources.withIndex()) {
+                            val source = roomSource.file
+                            val sourceFolder = roomSource.scanFolder
                             val scanFolder = "scan_$roomIdx"
                             val startPct = 5 + (roomIdx * 85 / roomSources.size)
                             val endPct = 5 + ((roomIdx + 1) * 85 / roomSources.size)
@@ -255,8 +370,10 @@ class ScanProcessor(private val context: Context? = null) {
                                     for (entry in entries) {
                                         if (entry.isDirectory) continue
                                         val entryName = entry.name
+                                        if (!belongsToRoom(entryName, sourceFolder)) continue
                                         if (entryName.endsWith("processing_checkpoint.json")) continue
                                         if (entryName == "certificate.json" || entryName.endsWith("/certificate.json")) {
+                                            if (!countedCertificates.add(source.absolutePath)) continue
                                             try {
                                                 val certText = zf.getInputStream(entry).bufferedReader().readText()
                                                 val certObj = JSONObject(certText)
@@ -279,7 +396,7 @@ class ScanProcessor(private val context: Context? = null) {
                                             continue
                                         }
 
-                                        val cleanRel = entryName.replace(Regex("""^scan_\d+/"""), "")
+                                        val cleanRel = roomRelativePath(entryName, sourceFolder)
                                         val targetEntryName = "$scanFolder/$cleanRel"
 
                                         if (cleanRel == "transforms.json") {
@@ -300,7 +417,7 @@ class ScanProcessor(private val context: Context? = null) {
                                             zos.putNextEntry(ZipEntry(targetEntryName))
                                             zos.write(cleanBytes)
                                             zos.closeEntry()
-                                        } else if (cleanRel in listOf("trajectory.csv", "coverage_summary.json", "focus_metadata.json")) {
+                                        } else if (cleanRel in listOf("trajectory.csv", "coverage_summary.json", "focus_metadata.json", "pointcloud.ply")) {
                                             val bytes = zf.getInputStream(entry).readBytes()
                                             val sha = computeSha256(bytes.inputStream())
                                             manifestHashes[targetEntryName] = sha
@@ -328,8 +445,10 @@ class ScanProcessor(private val context: Context? = null) {
                                 val files = source.walkTopDown().filter { it.isFile }.toList()
                                 for (file in files) {
                                     val entryName = file.relativeTo(source).path
+                                    if (!belongsToRoom(entryName, sourceFolder)) continue
                                     if (entryName.endsWith("processing_checkpoint.json")) continue
                                     if (entryName == "certificate.json" || entryName.endsWith("/certificate.json")) {
+                                        if (!countedCertificates.add(source.absolutePath)) continue
                                         try {
                                             val certObj = JSONObject(file.readText())
                                             val fObj = certObj.optJSONObject("frames")
@@ -351,7 +470,7 @@ class ScanProcessor(private val context: Context? = null) {
                                         continue
                                     }
 
-                                    val cleanRel = entryName.replace(Regex("""^scan_\d+/"""), "")
+                                    val cleanRel = roomRelativePath(entryName, sourceFolder)
                                     val targetEntryName = "$scanFolder/$cleanRel"
 
                                     if (cleanRel == "transforms.json") {
@@ -372,7 +491,7 @@ class ScanProcessor(private val context: Context? = null) {
                                         zos.putNextEntry(ZipEntry(targetEntryName))
                                         zos.write(cleanBytes)
                                         zos.closeEntry()
-                                    } else if (cleanRel in listOf("trajectory.csv", "coverage_summary.json", "focus_metadata.json")) {
+                                    } else if (cleanRel in listOf("trajectory.csv", "coverage_summary.json", "focus_metadata.json", "pointcloud.ply")) {
                                         val bytes = file.readBytes()
                                         val sha = computeSha256(bytes.inputStream())
                                         manifestHashes[targetEntryName] = sha
@@ -441,12 +560,214 @@ class ScanProcessor(private val context: Context? = null) {
             }
         }
 
-        fun getLastFrameBitmap(context: Context, sessionName: String): Bitmap? {
+        private fun listRoomFolders(source: File): List<String> {
+            if (source.isDirectory) {
+                val folders = source.listFiles()?.filter {
+                    it.isDirectory && it.name.matches(Regex("^scan_\\d+$")) && File(it, "transforms.json").isFile
+                }?.map { it.name }?.sortedBy { it.removePrefix("scan_").toIntOrNull() ?: 0 }.orEmpty()
+                return folders.ifEmpty { if (File(source, "transforms.json").isFile) listOf("") else emptyList() }
+            }
+            return try {
+                java.util.zip.ZipFile(source).use { zf ->
+                    val folders = zf.entries().asSequence().mapNotNull { entry ->
+                        Regex("^(scan_\\d+)/transforms\\.json$").matchEntire(entry.name)?.groupValues?.get(1)
+                    }.distinct().sortedBy { it.removePrefix("scan_").toIntOrNull() ?: 0 }.toList()
+                    folders.ifEmpty { if (zf.getEntry("transforms.json") != null) listOf("") else emptyList() }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not list room folders in ${source.name}", e)
+                emptyList()
+            }
+        }
+
+        private fun belongsToRoom(entryName: String, scanFolder: String): Boolean {
+            if (entryName == "certificate.json") return true
+            if (scanFolder.isEmpty()) return !entryName.matches(Regex("^scan_\\d+/.*"))
+            return entryName.startsWith("$scanFolder/") ||
+                (scanFolder == "scan_0" && !entryName.matches(Regex("^scan_\\d+/.*")))
+        }
+
+        private fun roomRelativePath(entryName: String, scanFolder: String): String =
+            if (scanFolder.isNotEmpty() && entryName.startsWith("$scanFolder/")) {
+                entryName.removePrefix("$scanFolder/")
+            } else {
+                entryName
+            }
+
+        fun getFirstFrameBitmap(
+            context: Context,
+            sessionName: String,
+            sampleSize: Int = 4,
+            scanFolder: String = "scan_0",
+        ): Bitmap? {
+            val options = BitmapFactory.Options().apply { inSampleSize = sampleSize }
+            fun isFrame(path: String) = path.startsWith("$scanFolder/images/") ||
+                (scanFolder == "scan_0" && path.startsWith("images/"))
+
             // Check fallback dir first
             val fallbackDir = File(context.getExternalFilesDir(null), sessionName)
             if (fallbackDir.isDirectory) {
                 val frameFiles = fallbackDir.walkTopDown()
-                    .filter { it.isFile && it.name.startsWith("frame_") && it.name.endsWith(".jpg") }
+                    .filter { it.isFile && it.name.startsWith("frame_") && it.name.endsWith(".jpg") && isFrame(it.relativeTo(fallbackDir).invariantSeparatorsPath) }
+                    .toList()
+                    .sortedBy { it.name }
+                if (frameFiles.isNotEmpty()) {
+                    return ensurePortraitBitmap(BitmapFactory.decodeFile(frameFiles.first().absolutePath, options))
+                }
+            }
+
+            // Check MediaStore flat files
+            val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val projection = arrayOf(MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.DISPLAY_NAME)
+            val selection = "(${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?) AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ? AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?"
+            val selectionArgs = arrayOf(
+                "Documents/${DatasetWriter.ALBUM}/",
+                "Documents/${DatasetWriter.ALBUM}",
+                "${sessionName}_%",
+                "%.jpg",
+            )
+            val frames = mutableListOf<Pair<Long, String>>()
+            try {
+                context.contentResolver.query(uri, projection, selection, selectionArgs, "${MediaStore.Files.FileColumns.DISPLAY_NAME} ASC")?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                    while (cursor.moveToNext()) {
+                        val dName = cursor.getString(nameCol) ?: continue
+                        if (dName.startsWith("${sessionName}_${scanFolder}_images_frame_") ||
+                            (scanFolder == "scan_0" && dName.startsWith("${sessionName}_images_frame_"))) {
+                            frames.add(cursor.getLong(idCol) to dName)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Querying MediaStore for first frame failed", e)
+            }
+            if (frames.isNotEmpty()) {
+                val firstId = frames.first().first
+                val firstUri = ContentUris.withAppendedId(uri, firstId)
+                try {
+                    context.contentResolver.openInputStream(firstUri)?.use { input ->
+                        return ensurePortraitBitmap(BitmapFactory.decodeStream(input, null, options))
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to decode first frame from MediaStore", e)
+                }
+            }
+
+            // Check fallback zip archive in app-private external files dir
+            val fallbackZip = File(context.getExternalFilesDir(null), "$sessionName.zip")
+            if (fallbackZip.isFile) {
+                try {
+                    java.util.zip.ZipFile(fallbackZip).use { zf ->
+                        val entries = zf.entries().asSequence()
+                            .filter { !it.isDirectory && isFrame(it.name) && it.name.endsWith(".jpg") }
+                            .sortedBy { it.name }
+                            .toList()
+                        if (entries.isNotEmpty()) {
+                            zf.getInputStream(entries.first()).use { stream ->
+                                return ensurePortraitBitmap(BitmapFactory.decodeStream(stream, null, options))
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read first frame from fallback zip", e)
+                }
+            }
+
+            // Check MediaStore zip archive via ContentResolver
+            val zipId = queryMediaStoreZipId(context, sessionName)
+            if (zipId != null) {
+                val zipUri = ContentUris.withAppendedId(
+                    MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), zipId
+                )
+                // 1. Try random-access ZipFile via /proc/self/fd (instant central directory read)
+                try {
+                    context.contentResolver.openFileDescriptor(zipUri, "r")?.use { pfd ->
+                        val fdFile = File("/proc/self/fd/${pfd.fd}")
+                        java.util.zip.ZipFile(fdFile).use { zf ->
+                            val entries = zf.entries().asSequence()
+                                .filter { !it.isDirectory && isFrame(it.name) && it.name.endsWith(".jpg") }
+                                .sortedBy { it.name }
+                                .toList()
+                            if (entries.isNotEmpty()) {
+                                zf.getInputStream(entries.first()).use { stream ->
+                                    return ensurePortraitBitmap(BitmapFactory.decodeStream(stream, null, options))
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "ZipFile via /proc/self/fd failed for $sessionName, falling back to streaming", e)
+                }
+
+                // 2. Streaming fallback via ZipInputStream (returns first found frame immediately)
+                try {
+                    context.contentResolver.openInputStream(zipUri)?.use { rawStream ->
+                        java.util.zip.ZipInputStream(rawStream).use { zis ->
+                            var entry = zis.nextEntry
+                            var count = 0
+                            while (entry != null) {
+                                if (!entry.isDirectory && isFrame(entry.name) && entry.name.endsWith(".jpg")) {
+                                    val bytes = zis.readBytes()
+                                    val bmp = ensurePortraitBitmap(BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options))
+                                    if (bmp != null) return bmp
+                                }
+                                count++
+                                if (count > 50) break
+                                entry = zis.nextEntry
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read first frame from MediaStore zip", e)
+                }
+            }
+
+            // Check property scan archives (if session belongs to a packaged property)
+            try {
+                val store = PropertyStore(context)
+                val room = store.roomScan(sessionName, scanFolder)
+                if (room != null) {
+                    val property = store.property(room.propertyId)
+                    if (property != null) {
+                        if (room.scanFolder.isNotBlank()) {
+                            val scanPrefix = "${room.scanFolder}/images/"
+                            val cleanAddress = property.address.replace(Regex("[^a-zA-Z0-9_-]"), "_").trim('_').ifEmpty { "property" }
+                            val propZip = File(context.getExternalFilesDir(null), "${cleanAddress}_scan.zip")
+                            if (propZip.isFile) {
+                                try {
+                                    java.util.zip.ZipFile(propZip).use { zf ->
+                                        val entry = zf.entries().asSequence()
+                                            .filter { !it.isDirectory && it.name.startsWith(scanPrefix) && it.name.endsWith(".jpg") }
+                                            .minByOrNull { it.name }
+                                        if (entry != null) {
+                                            zf.getInputStream(entry).use { stream ->
+                                                return ensurePortraitBitmap(BitmapFactory.decodeStream(stream, null, options))
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed reading first frame from property zip", e)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed checking property store for first frame", e)
+            }
+
+            return null
+        }
+
+        fun getLastFrameBitmap(context: Context, sessionName: String, scanFolder: String = "scan_0"): Bitmap? {
+            fun isFrame(path: String) = path.startsWith("$scanFolder/images/") ||
+                (scanFolder == "scan_0" && path.startsWith("images/"))
+            // Check fallback dir first
+            val fallbackDir = File(context.getExternalFilesDir(null), sessionName)
+            if (fallbackDir.isDirectory) {
+                val frameFiles = fallbackDir.walkTopDown()
+                    .filter { it.isFile && it.name.startsWith("frame_") && it.name.endsWith(".jpg") && isFrame(it.relativeTo(fallbackDir).invariantSeparatorsPath) }
                     .toList()
                     .sortedBy { it.name }
                 if (frameFiles.isNotEmpty()) {
@@ -471,7 +792,8 @@ class ScanProcessor(private val context: Context? = null) {
                     val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
                     while (cursor.moveToNext()) {
                         val dName = cursor.getString(nameCol) ?: continue
-                        if (dName.contains("images_frame_")) {
+                        if (dName.startsWith("${sessionName}_${scanFolder}_images_frame_") ||
+                            (scanFolder == "scan_0" && dName.startsWith("${sessionName}_images_frame_"))) {
                             frames.add(cursor.getLong(idCol) to dName)
                         }
                     }
@@ -491,13 +813,13 @@ class ScanProcessor(private val context: Context? = null) {
                 }
             }
 
-            // Check zip archive if already zipped
-            val zipFile = findZipFile(context, sessionName)
-            if (zipFile != null && zipFile.isFile) {
+            // Check fallback zip archive in app-private external files dir
+            val fallbackZip = File(context.getExternalFilesDir(null), "$sessionName.zip")
+            if (fallbackZip.isFile) {
                 try {
-                    java.util.zip.ZipFile(zipFile).use { zf ->
+                    java.util.zip.ZipFile(fallbackZip).use { zf ->
                         val entries = zf.entries().asSequence()
-                            .filter { !it.isDirectory && it.name.contains("images/frame_") && it.name.endsWith(".jpg") }
+                            .filter { !it.isDirectory && isFrame(it.name) && it.name.endsWith(".jpg") }
                             .sortedBy { it.name }
                             .toList()
                         if (entries.isNotEmpty()) {
@@ -507,9 +829,168 @@ class ScanProcessor(private val context: Context? = null) {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Failed to read last frame from zip", e)
+                    Log.w(TAG, "Failed to read last frame from fallback zip", e)
                 }
             }
+
+            // Check MediaStore zip archive via ContentResolver
+            val zipId = queryMediaStoreZipId(context, sessionName)
+            if (zipId != null) {
+                val zipUri = ContentUris.withAppendedId(
+                    MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), zipId
+                )
+                try {
+                    context.contentResolver.openInputStream(zipUri)?.use { rawStream ->
+                        java.util.zip.ZipInputStream(rawStream).use { zis ->
+                            var entry = zis.nextEntry
+                            var lastBitmap: Bitmap? = null
+                            while (entry != null) {
+                                if (!entry.isDirectory && isFrame(entry.name) && entry.name.endsWith(".jpg")) {
+                                    val bytes = zis.readBytes()
+                                    lastBitmap = ensurePortraitBitmap(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+                                }
+                                entry = zis.nextEntry
+                            }
+                            if (lastBitmap != null) {
+                                return lastBitmap
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read last frame from MediaStore zip", e)
+                }
+            }
+
+            // Check property scan archives (if session belongs to a packaged property)
+            try {
+                val store = PropertyStore(context)
+                val room = store.roomScan(sessionName, scanFolder)
+                if (room != null) {
+                    val property = store.property(room.propertyId)
+                    if (property != null) {
+                        if (room.scanFolder.isNotBlank()) {
+                            val scanPrefix = "${room.scanFolder}/images/"
+                            val cleanAddress = property.address.replace(Regex("[^a-zA-Z0-9_-]"), "_").trim('_').ifEmpty { "property" }
+                            val propZip = File(context.getExternalFilesDir(null), "${cleanAddress}_scan.zip")
+                            if (propZip.isFile) {
+                                try {
+                                    java.util.zip.ZipFile(propZip).use { zf ->
+                                        val entry = zf.entries().asSequence()
+                                            .filter { !it.isDirectory && it.name.startsWith(scanPrefix) && it.name.endsWith(".jpg") }
+                                            .maxByOrNull { it.name }
+                                        if (entry != null) {
+                                            zf.getInputStream(entry).use { stream ->
+                                                return ensurePortraitBitmap(BitmapFactory.decodeStream(stream))
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    Log.w(TAG, "Failed reading last frame from property zip", e)
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed checking property store for last frame", e)
+            }
+
+            return null
+        }
+
+        fun openPointCloudStream(context: Context, sessionName: String, scanFolder: String = "scan_0"): InputStream? {
+            // Check fallback dir first (external app files)
+            val fallbackDir = File(context.getExternalFilesDir(null), sessionName)
+            if (fallbackDir.isDirectory) {
+                val f1 = File(fallbackDir, "$scanFolder/pointcloud.ply")
+                if (f1.isFile) return f1.inputStream()
+                if (scanFolder == "scan_0") {
+                    val f2 = File(fallbackDir, "pointcloud.ply")
+                    if (f2.isFile) return f2.inputStream()
+                }
+            }
+
+            // Check internal files
+            val internalDir = File(context.filesDir, sessionName)
+            if (internalDir.isDirectory) {
+                val f1 = File(internalDir, "$scanFolder/pointcloud.ply")
+                if (f1.isFile) return f1.inputStream()
+                if (scanFolder == "scan_0") {
+                    val f2 = File(internalDir, "pointcloud.ply")
+                    if (f2.isFile) return f2.inputStream()
+                }
+            }
+
+            // Check MediaStore flat files
+            val uri = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val projection = arrayOf(MediaStore.Files.FileColumns._ID, MediaStore.Files.FileColumns.DISPLAY_NAME)
+            val selection = "(${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?) AND ${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?"
+            val selectionArgs = arrayOf(
+                "Documents/${DatasetWriter.ALBUM}/",
+                "Documents/${DatasetWriter.ALBUM}",
+                "${sessionName}_%",
+            )
+            val roomPointCloudName = flatMediaName(sessionName, scanFolder, "pointcloud.ply")
+            val legacyPointCloudName = if (scanFolder == "scan_0") {
+                flatMediaName(sessionName, null, "pointcloud.ply")
+            } else {
+                null
+            }
+            try {
+                context.contentResolver.query(uri, projection, selection, selectionArgs, null)?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                    while (cursor.moveToNext()) {
+                        val dName = cursor.getString(nameCol) ?: continue
+                        if (dName == roomPointCloudName || dName == legacyPointCloudName) {
+                            val id = cursor.getLong(idCol)
+                            val itemUri = ContentUris.withAppendedId(uri, id)
+                            return context.contentResolver.openInputStream(itemUri)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to query MediaStore for pointcloud.ply", e)
+            }
+
+            // Check zip archive on disk
+            val zipFile = findZipFile(context, sessionName)
+            if (zipFile != null && zipFile.isFile) {
+                try {
+                    val zf = java.util.zip.ZipFile(zipFile)
+                    val entry = zf.getEntry("$scanFolder/pointcloud.ply")
+                        ?: if (scanFolder == "scan_0") zf.getEntry("pointcloud.ply") else null
+                    if (entry != null) {
+                        return zf.getInputStream(entry)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read pointcloud.ply from zip file", e)
+                }
+            }
+
+            // Check MediaStore zip stream
+            val zipId = queryMediaStoreZipId(context, sessionName)
+            if (zipId != null) {
+                try {
+                    val zipUri = ContentUris.withAppendedId(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), zipId)
+                    context.contentResolver.openInputStream(zipUri)?.use { rawStream ->
+                        val zis = java.util.zip.ZipInputStream(rawStream)
+                        var entry = zis.nextEntry
+                        while (entry != null) {
+                            if (entry.name == "$scanFolder/pointcloud.ply" ||
+                                (scanFolder == "scan_0" && entry.name == "pointcloud.ply")
+                            ) {
+                                val bytes = zis.readBytes()
+                                return java.io.ByteArrayInputStream(bytes)
+                            }
+                            entry = zis.nextEntry
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to stream pointcloud.ply from MediaStore zip", e)
+                }
+            }
+
             return null
         }
 
@@ -991,7 +1472,7 @@ class ScanProcessor(private val context: Context? = null) {
                 }
 
                 // Collect manifest hashes for this scan folder
-                listOf("transforms.json", "trajectory.csv", "coverage_summary.json", "focus_metadata.json").forEach { mName ->
+                listOf("transforms.json", "trajectory.csv", "coverage_summary.json", "focus_metadata.json", "pointcloud.ply").forEach { mName ->
                     val fullMPath = if (scanFolder.isEmpty()) mName else "$scanFolder/$mName"
                     accessor.openInput(fullMPath)?.use { stream ->
                         manifestHashes[fullMPath] = computeSha256(stream)
@@ -1343,4 +1824,19 @@ class ScanProcessor(private val context: Context? = null) {
             }
         }
     }
+}
+
+internal fun trajectoryPointsFromCsv(csv: String): FloatArray {
+    val points = ArrayList<Float>()
+    csv.lineSequence().drop(1).forEach { line ->
+        val fields = line.split(',')
+        if (fields.size < 4 || (fields.size >= 9 && fields[8].trim() != "TRACKING")) return@forEach
+        val x = fields[1].trim().toFloatOrNull() ?: return@forEach
+        val y = fields[2].trim().toFloatOrNull() ?: return@forEach
+        val z = fields[3].trim().toFloatOrNull() ?: return@forEach
+        if (x.isFinite() && y.isFinite() && z.isFinite()) {
+            points.add(x); points.add(y); points.add(z)
+        }
+    }
+    return points.toFloatArray()
 }

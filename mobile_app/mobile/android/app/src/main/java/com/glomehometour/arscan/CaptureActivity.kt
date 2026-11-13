@@ -80,6 +80,7 @@ class CaptureActivity : AppCompatActivity() {
     private lateinit var alignmentOverlay: FrameLayout
     private lateinit var alignmentGhostImage: ImageView
     private var alignToSession: String? = null
+    private var alignToScanFolder = "scan_0"
     private var lastFinishedSessionName: String? = null
 
     private lateinit var root: FrameLayout
@@ -123,6 +124,7 @@ class CaptureActivity : AppCompatActivity() {
     private var gate = PhotometricGate()
     val parallaxTracker = FeatureParallaxTracker()
     private val pointSpriteExportBuf = FloatArray(ArScanRenderer.MAX_POINT_SPRITES * 4)
+    private val pointCloudAccumulator = ScanPointCloudAccumulator()
 
     @Volatile private var state = State.IDLE
     @Volatile private var pending: Pending? = null
@@ -151,6 +153,8 @@ class CaptureActivity : AppCompatActivity() {
      * meanwhile queues up (one slot per kind, no duplicates) instead of interrupting it.
      */
     private fun pickWarning(nowNanos: Long, active: List<Pair<WarningKind, String>>): String? {
+        val activeKinds = active.mapTo(HashSet()) { it.first }
+        warningQueue.removeAll { it.first !in activeKinds }
         for (candidate in active) {
             if (currentWarning?.first == candidate.first) continue
             if (warningQueue.any { it.first == candidate.first }) continue
@@ -274,6 +278,8 @@ class CaptureActivity : AppCompatActivity() {
 
     @Volatile private var lastVerdict = PhotometricGate.Verdict.OK
     @Volatile private var finishedPath: String? = null
+    @Volatile private var saveFailed = false
+    @Volatile private var roomLinkFailed = false
 
     /** Which property/room this capture belongs to, supplied by PropertyDetailActivity. Null
      * when the capture screen was opened without one -- the scan is still written normally and
@@ -311,7 +317,6 @@ class CaptureActivity : AppCompatActivity() {
     private var relocalizedToastUntilNanos = 0L
     private var isTrackingLost = false
     private var consecutiveLostFrames = 0
-    private var trackingLostTimestampNs = 0L
     private val trackingLostCamPos = FloatArray(3)
     private var trackingLossWarningShown = false
     private val scratchLandmarkX = FloatArray(35000)
@@ -409,36 +414,10 @@ class CaptureActivity : AppCompatActivity() {
         alignmentOverlay = findViewById(R.id.alignmentOverlay)
         alignmentGhostImage = findViewById(R.id.alignmentGhostImage)
         alignToSession = intent.getStringExtra(EXTRA_ALIGN_TO_SESSION)
+        alignToScanFolder = intent.getStringExtra(EXTRA_ALIGN_TO_SCAN_FOLDER) ?: "scan_0"
         hintText = findViewById(R.id.hintText)
         bottomPadBase = bottomColumn.paddingBottom
         applyInsets()
-
-        val touchSlopPx = android.view.ViewConfiguration.get(this).scaledTouchSlop
-        var afDownX = 0f
-        var afDownY = 0f
-        root.setOnTouchListener { _, event ->
-            when (event.action) {
-                android.view.MotionEvent.ACTION_DOWN -> {
-                    afDownX = event.x
-                    afDownY = event.y
-                }
-                android.view.MotionEvent.ACTION_UP -> {
-                    val moved = kotlin.math.hypot((event.x - afDownX).toDouble(), (event.y - afDownY).toDouble()) > touchSlopPx
-                    val now = System.nanoTime()
-                    // A tap-to-focus is a deliberate, stationary tap, not a drag, and is
-                    // debounced: continuous AF is already running (configureManualOverrides),
-                    // so spamming CONTROL_AF_TRIGGER_START on every incidental touch just makes
-                    // the lens hunt instead of settle (README §6 relies on continuous AF).
-                    if (!moved && event.y > topColumn.bottom && event.y < bottomColumn.top &&
-                        now - lastAutoFocusTriggerNanos > AUTO_FOCUS_COOLDOWN_NANOS
-                    ) {
-                        lastAutoFocusTriggerNanos = now
-                        renderer?.triggerAutoFocus(event.x / root.width.toFloat(), event.y / root.height.toFloat())
-                    }
-                }
-            }
-            false
-        }
 
         restartButton.setOnClickListener { view ->
             view.performHapticFeedback(HapticFeedbackConstants.CONFIRM)
@@ -649,16 +628,45 @@ class CaptureActivity : AppCompatActivity() {
         root.addView(view, 0, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         glSurfaceView = view
         renderer = r
+        installTapToFocus(view)
         val toAlign = alignToSession
         if (toAlign != null) {
             alignToSession = null
-            enterAlignmentMode(toAlign)
+            enterAlignmentMode(toAlign, alignToScanFolder)
         }
     }
 
-    private fun enterAlignmentMode(sessionName: String) {
+    private fun installTapToFocus(view: View) {
+        val touchSlopPx = android.view.ViewConfiguration.get(this).scaledTouchSlop
+        var downX = 0f
+        var downY = 0f
+        view.setOnTouchListener { _, event ->
+            when (event.actionMasked) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    downX = event.x
+                    downY = event.y
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    val moved = kotlin.math.hypot((event.x - downX).toDouble(), (event.y - downY).toDouble()) > touchSlopPx
+                    val now = System.nanoTime()
+                    if (!moved && event.y > topColumn.bottom && event.y < bottomColumn.top &&
+                        now - lastAutoFocusTriggerNanos > AUTO_FOCUS_COOLDOWN_NANOS
+                    ) {
+                        lastAutoFocusTriggerNanos = now
+                        renderer?.triggerAutoFocus(
+                            event.x / view.width.toFloat(), event.y / view.height.toFloat(),
+                            view.width, view.height, view.display?.rotation ?: android.view.Surface.ROTATION_0,
+                        )
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    private fun enterAlignmentMode(sessionName: String, scanFolder: String = "scan_0") {
         Thread {
-            val bmp = ScanProcessor.getLastFrameBitmap(this, sessionName)
+            val bmp = ScanProcessor.getLastFrameBitmap(this, sessionName, scanFolder)
             if (bmp != null) {
                 val cutout = ScanProcessor.createCenterCutout(bmp, 0.20f)
                 runOnUiThread {
@@ -697,7 +705,17 @@ class CaptureActivity : AppCompatActivity() {
         val currentPose = pose ?: lastKnownPose
         pending = null
         when (action) {
-            Pending.START -> beginPreflight()
+            Pending.START -> {
+                if (state == State.DONE) {
+                    roomIndex = 0
+                    currentRoomName = upcomingRoomName
+                    roomLabel = currentRoomName
+                    roomLabelsByIndex.clear()
+                    roomLabelsByIndex[0] = currentRoomName
+                    upcomingRoomName = "Room 2"
+                }
+                beginPreflight()
+            }
             Pending.PREFLIGHT_NEXT -> advancePreflight(currentPose)
             Pending.RESUME -> interrupted = false
             // CLAUDE.md's enforced entry-door loop closure. Coverage stays advisory-only (see
@@ -717,38 +735,7 @@ class CaptureActivity : AppCompatActivity() {
             }
             Pending.NEXT_ROOM -> {
                 archiveCurrentRoomLandmarks2D()
-                val w = writer
-                val g = worker
-                val r = renderer
-                val stats = g?.stats
-                val summary = DatasetFormat.summaryJson(
-                    durationSeconds = (System.nanoTime() - sessionStartNanos) / 1e9f,
-                    coverageFraction = stats?.coverage ?: 0f,
-                    occupiedVoxels = stats?.occupied ?: 0,
-                    verifiedVoxels = stats?.verified ?: 0,
-                    freeVoxels = stats?.free ?: 0,
-                    occludedVoxels = stats?.occluded ?: 0,
-                    voxelSizeM = g?.grid?.voxelSizeM ?: 0f,
-                    gridFull = stats?.gridFull ?: false,
-                    framesSeen = framesSeen,
-                    framesExported = w?.currentRoomKeyframeCount ?: 0,
-                    droppedDark = droppedDark,
-                    droppedBlown = droppedBlown,
-                    droppedTransition = droppedTransition,
-                    droppedMotion = droppedMotion,
-                    droppedQueue = w?.droppedQueue?.get() ?: 0,
-                    trackingLosses = trackingLosses,
-                    depthSource = when {
-                        r?.depthSupported == true -> "arcore_depth"
-                        else -> "arcore_point_cloud"
-                    },
-                )
-                w?.finishCurrentRoom(
-                    r?.focalX ?: 0f, r?.focalY ?: 0f, r?.principalX ?: 0f, r?.principalY ?: 0f,
-                    r?.imageWidth ?: 0, r?.imageHeight ?: 0, summary,
-                    k1 = r?.pipeline?.lensDistortionK1, k2 = r?.pipeline?.lensDistortionK2,
-                )
-                state = State.TRANSITION
+                finishSession(nextRoom = true)
             }
             Pending.START_NEW_ROOM -> {
                 startNewRoom(currentPose)
@@ -811,6 +798,7 @@ class CaptureActivity : AppCompatActivity() {
 
         // 4. Reset landmarks and triangulation
         parallaxTracker.reset()
+        pointCloudAccumulator.reset()
 
         // 5. Re-anchor starting position to current pose
         activePose.getTranslation(startPosition, 0)
@@ -848,7 +836,6 @@ class CaptureActivity : AppCompatActivity() {
 
         isTrackingLost = false
         trackingLossWarningShown = false
-        trackingLostTimestampNs = 0L
         consecutiveLostFrames = 0
 
         speedMetresPerSec = 0f
@@ -915,7 +902,6 @@ class CaptureActivity : AppCompatActivity() {
     }
 
     private fun startNewRoom(pose: Pose?) {
-        val w = writer
         val activePose = pose ?: lastKnownPose ?: Pose.makeTranslation(0f, 0f, 0f)
         archiveCurrentRoomLandmarks2D()
         parallaxTracker.reset()
@@ -926,10 +912,7 @@ class CaptureActivity : AppCompatActivity() {
         camMinZ = Float.MAX_VALUE; camMaxZ = -Float.MAX_VALUE
         lastDimensionCheckNanos = 0L
         currentDimensions = null
-        if (w != null && w.currentRoomKeyframeCount > 0) {
-            roomIndex++
-            w.startNewRoom(roomIndex)
-        }
+        roomIndex++
         currentRoomName = upcomingRoomName
         roomLabel = currentRoomName
         roomLabelsByIndex[roomIndex] = currentRoomName
@@ -952,7 +935,6 @@ class CaptureActivity : AppCompatActivity() {
         hapticLoopClosed = false
         isTrackingLost = false
         trackingLossWarningShown = false
-        trackingLostTimestampNs = 0L
         consecutiveLostFrames = 0
         speedMetresPerSec = 0f
         angularRateDegPerSec = 0f
@@ -984,7 +966,6 @@ class CaptureActivity : AppCompatActivity() {
         hapticLoopClosed = false
         isTrackingLost = false
         trackingLossWarningShown = false
-        trackingLostTimestampNs = 0L
         consecutiveLostFrames = 0
         speedMetresPerSec = 0f
         angularRateDegPerSec = 0f
@@ -1050,9 +1031,11 @@ class CaptureActivity : AppCompatActivity() {
     }
 
     private fun beginSession(pose: Pose) {
-        val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val name = "scan_" + SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date()) +
+            "_" + java.util.UUID.randomUUID().toString().take(8)
         worker?.shutdown()
         writer?.shutdown()
+        pointCloudAccumulator.reset()
         worker = CoverageWorker(
             if (renderer?.depthSupported == true) CoverageWorker.DEFAULT_VOXEL_SIZE_M
             else CoverageWorker.MONO_VOXEL_SIZE_M
@@ -1066,13 +1049,14 @@ class CaptureActivity : AppCompatActivity() {
         floorY = pose.ty() - PHONE_HEIGHT_M
         pose.getTranslation(startPosition, 0)
         pose.getTranslation(lastPathPos, 0)
-        roomIndex = 0
         isLoopClosedLatched = false
         isObjectCentricMode = false
         roomPathLengthM = 0f
         compassLocked = false
-        miniMapView.resetDoorways()
-        miniMapView.resetTrail()
+        if (roomIndex == 0) {
+            miniMapView.resetDoorways()
+            miniMapView.resetTrail()
+        }
         miniMapView.setStart(startPosition[0], startPosition[2])
         sessionStartNanos = System.nanoTime()
         framesSeen = 0
@@ -1080,6 +1064,8 @@ class CaptureActivity : AppCompatActivity() {
         trackingLosses = 0
         gatePassedCounter = 0L
         finishedPath = null
+        saveFailed = false
+        roomLinkFailed = false
         interrupted = false
         hapticMilestoneTarget = false
         hapticMilestoneGood = false
@@ -1089,7 +1075,6 @@ class CaptureActivity : AppCompatActivity() {
         isTrackingLost = false
         consecutiveLostFrames = 0
         trackingLossWarningShown = false
-        trackingLostTimestampNs = 0L
         needsRelocalizationCheck = false
         lastRelocalizationNanos = 0L
         relocalizedToastUntilNanos = 0L
@@ -1102,9 +1087,11 @@ class CaptureActivity : AppCompatActivity() {
         state = State.SCANNING
     }
 
-    private fun finishSession() {
+    private fun finishSession(nextRoom: Boolean = false) {
         val w = writer ?: return
         lastFinishedSessionName = w.sessionName
+        val savedRoomName = currentRoomName
+        val savedPropertyId = propertyId
         val g = worker
         val r = renderer
         val stats = g?.stats
@@ -1130,27 +1117,53 @@ class CaptureActivity : AppCompatActivity() {
                 else -> "arcore_point_cloud"
             },
         )
+        pointCloudAccumulator.clipToTrajectory()
+        val plyBytes = java.io.ByteArrayOutputStream().use { out ->
+            pointCloudAccumulator.writeBinaryPly(out)
+            out.toByteArray()
+        }
         w.finish(
             r?.focalX ?: 0f, r?.focalY ?: 0f, r?.principalX ?: 0f, r?.principalY ?: 0f,
             r?.imageWidth ?: 0, r?.imageHeight ?: 0, summary,
             k1 = r?.pipeline?.lensDistortionK1, k2 = r?.pipeline?.lensDistortionK2,
-        ) { path ->
-            finishedPath = path
-            android.util.Log.i(TAG, "dataset written to $path")
-            // Index the finished zip against its property only once the write actually landed,
-            // so a row can never point at a zip that isn't there (see the 2026-09-18
-            // save-completion race).
-            val id = propertyId
-            if (id != null) {
-                propertyStore.recordRoomScan(
-                    propertyId = id,
-                    label = currentRoomName,
-                    sessionName = w.sessionName,
-                    coveragePercent = (stats?.coverage ?: 0f) * 100f,
-                )
+            pointCloudPly = plyBytes,
+        ) { path, success ->
+            if (success) {
+                if (!nextRoom) finishedPath = path
+                android.util.Log.i(TAG, "dataset written to $path")
+            } else {
+                android.util.Log.e(TAG, "dataset save failed for ${w.sessionName}")
+                if (!nextRoom) saveFailed = true
+            }
+            // Keep each asynchronously saved session bound to the room name/property captured here.
+            var linkFailed = false
+            if (success && savedPropertyId != null) {
+                try {
+                    propertyStore.recordRoomScan(
+                        propertyId = savedPropertyId,
+                        label = savedRoomName,
+                        sessionName = w.sessionName,
+                        coveragePercent = (stats?.coverage ?: 0f) * 100f,
+                    )
+                } catch (e: Exception) {
+                    linkFailed = true
+                    android.util.Log.e(TAG, "could not link ${w.sessionName} to property $savedPropertyId", e)
+                }
+            }
+            if (!nextRoom) roomLinkFailed = linkFailed
+            w.shutdown()
+            runOnUiThread {
+                if (nextRoom && (!success || linkFailed)) {
+                    val message = if (success) "Room saved, but could not be linked to the property." else
+                        "This room could not be saved. Continue with the next room or retry."
+                    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                } else if (!nextRoom) {
+                    updateUi(null)
+                }
             }
         }
-        state = State.DONE
+        writer = null
+        state = if (nextRoom) State.TRANSITION else State.DONE
         renderer?.guidanceTarget = null
         renderer?.occlusionTarget = null
     }
@@ -1191,7 +1204,6 @@ class CaptureActivity : AppCompatActivity() {
                 if (!isTrackingLost) {
                     trackingLosses++
                     isTrackingLost = true
-                    trackingLostTimestampNs = System.nanoTime()
                     trackingLostCamPos[0] = translation[0]
                     trackingLostCamPos[1] = translation[1]
                     trackingLostCamPos[2] = translation[2]
@@ -1205,28 +1217,30 @@ class CaptureActivity : AppCompatActivity() {
             return
         }
         consecutiveLostFrames = 0
+        val pose = sample.pose
+        pose.getTranslation(translation, 0)
         if (!wasTracking && state == State.SCANNING) {
             isTrackingLost = false
             needsRelocalizationCheck = true
+            lastRelocalizationNanos = System.nanoTime()
+            lastPathPos[0] = translation[0]
+            lastPathPos[1] = translation[1]
+            lastPathPos[2] = translation[2]
+        }
+        if (needsRelocalizationCheck && lastRelocalizationNanos > 0L &&
+            System.nanoTime() - lastRelocalizationNanos >= RELOCALIZATION_CHECK_NANOS
+        ) {
+            needsRelocalizationCheck = false
         }
         wasTracking = true
         framesSeen++
 
-        val pose = sample.pose
         lastKnownPose = pose
-        pose.getTranslation(translation, 0)
         pose.getRotationQuaternion(quaternion, 0)
         updateKinematics()
 
         // Feed sparse feature points to parallax tracker continuously (live viewport feedback & triangulation)
         if (sample.points != null && sample.pointIds != null && sample.numPoints > 0) {
-            val now = System.nanoTime()
-            val recoveryElapsedNs = now - trackingLostTimestampNs
-            // Exit relocalization check cleanly once 3 seconds have elapsed after tracking loss
-            if (needsRelocalizationCheck && trackingLostTimestampNs > 0L && recoveryElapsedNs > 3_000_000_000L) {
-                needsRelocalizationCheck = false
-            }
-
             // Note: ARCore's internal SLAM maintains the world coordinate frame across tracking pauses.
             // Verified landmarks must NOT be mutated with unconstrained 3-point RANSAC transforms, as false-positive
             // triangle matches in furnished rooms scramble the map and cause existing points to jump/tilt.
@@ -1235,7 +1249,13 @@ class CaptureActivity : AppCompatActivity() {
             val dyP = translation[1] - lastPathPos[1]
             val dzP = translation[2] - lastPathPos[2]
             val stepM = sqrt(dxP * dxP + dyP * dyP + dzP * dzP)
-            if (stepM in 0.01f..1.5f) {
+            val plausiblePose = needsRelocalizationCheck || stepM <= MAX_ROOM_POSE_STEP_M
+            if (needsRelocalizationCheck) {
+                lastPathPos[0] = translation[0]
+                lastPathPos[1] = translation[1]
+                lastPathPos[2] = translation[2]
+                pointCloudAccumulator.reanchorTrajectory(translation[0], translation[1], translation[2])
+            } else if (stepM in 0.01f..MAX_ROOM_POSE_STEP_M) {
                 roomPathLengthM += stepM
                 lastPathPos[0] = translation[0]
                 lastPathPos[1] = translation[1]
@@ -1249,7 +1269,8 @@ class CaptureActivity : AppCompatActivity() {
             }
 
             val isFastMotion = tooFastForCapture()
-            val allowNewLandmarks = !isFastMotion && consecutiveLostFrames == 0 && state == State.SCANNING
+            val allowNewLandmarks = !isFastMotion && consecutiveLostFrames == 0 && state == State.SCANNING &&
+                !needsRelocalizationCheck && plausiblePose
             val updateStartNs = System.nanoTime()
             parallaxTracker.update(
                 sample.points, sample.pointIds, sample.numPoints,
@@ -1260,17 +1281,24 @@ class CaptureActivity : AppCompatActivity() {
             logIfSlow("parallaxTracker.update", updateStartNs, parallaxTracker.verifiedLandmarkCount)
 
             if (state == State.SCANNING) {
-                if (translation[0] < camMinX) camMinX = translation[0]
-                if (translation[0] > camMaxX) camMaxX = translation[0]
-                if (translation[1] < camMinY) camMinY = translation[1]
-                if (translation[1] > camMaxY) camMaxY = translation[1]
-                if (translation[2] < camMinZ) camMinZ = translation[2]
-                if (translation[2] > camMaxZ) camMaxZ = translation[2]
+                if (plausiblePose && !needsRelocalizationCheck) {
+                    pointCloudAccumulator.addPointsFromBuffer(sample.points, sample.numPoints)
+                    pointCloudAccumulator.addTrajectoryPoint(translation[0], translation[1], translation[2])
+
+                    if (translation[0] < camMinX) camMinX = translation[0]
+                    if (translation[0] > camMaxX) camMaxX = translation[0]
+                    if (translation[1] < camMinY) camMinY = translation[1]
+                    if (translation[1] > camMaxY) camMaxY = translation[1]
+                    if (translation[2] < camMinZ) camMinZ = translation[2]
+                    if (translation[2] > camMaxZ) camMaxZ = translation[2]
+                }
 
                 val nowNs = sample.timestampNs
-                if (lastDimensionCheckNanos == 0L) {
+                if (plausiblePose && !needsRelocalizationCheck && lastDimensionCheckNanos == 0L) {
                     lastDimensionCheckNanos = nowNs
-                } else if ((nowNs - lastDimensionCheckNanos) >= 10_000_000_000L) {
+                } else if (plausiblePose && !needsRelocalizationCheck &&
+                    (nowNs - lastDimensionCheckNanos) >= 10_000_000_000L
+                ) {
                     lastDimensionCheckNanos = nowNs
                     // 1. Update running average median distance and dynamic max inlier distance (2.5x median)
                     parallaxTracker.updateRunningMedianDistance(translation[0], translation[1], translation[2])
@@ -1718,11 +1746,11 @@ class CaptureActivity : AppCompatActivity() {
             if (lastVerdict == PhotometricGate.Verdict.TRANSITION) {
                 active += WarningKind.LIGHT_TRANSITION to "Adjusting to the light change…"
             }
-            val isWalkingFast = speedMetresPerSec > MAX_WALK_SPEED_MS || instantSpeedMetresPerSec > 0.45f
+            val isWalkingFast = speedMetresPerSec > MAX_WALK_SPEED_MS || instantSpeedMetresPerSec > 0.75f
             if (isWalkingFast) {
                 active += WarningKind.TOO_FAST to "Slow down\nWalk slower for sharp frames"
             }
-            val isTurningFast = angularRateDegPerSec > MAX_TURN_RATE_DEG_S || instantAngularRateDegPerSec > 32f
+            val isTurningFast = angularRateDegPerSec > MAX_TURN_RATE_DEG_S || instantAngularRateDegPerSec > 48f
             if (isTurningFast) {
                 active += WarningKind.TURN_SLOWLY to "Turn more slowly"
             }
@@ -1805,6 +1833,13 @@ class CaptureActivity : AppCompatActivity() {
                     body = "Slowly pan the phone across $currentRoomName for 5 seconds. The optimal ISO and shutter speed are being calibrated to maximize brightness."
                     label = "Calibrating (%.0fs)…".format(remainingS)
                     enabled = false
+                } else if (roomLinkFailed) {
+                    title = "Scan saved; property link failed"
+                    body = "The scan is on this device, but it could not be added to the property. It remains available under Unassigned."
+                    label = "Start new scan"
+                    enabled = true
+                    secondaryButton.setVisible(false)
+                    secondaryButton.isEnabled = false
                 } else {
                     title = "✓ Lighting Calibrated ($currentRoomName)"
                     body = "Exposure optimized for clear visibility. Tap Next to review color balance."
@@ -1961,11 +1996,25 @@ class CaptureActivity : AppCompatActivity() {
                 hint = if (!tracking) trackingAdvice(r?.trackingState) else null
             }
             else -> {
-                if (finishedPath == null) {
+                if (saveFailed) {
+                    title = "Scan could not be saved"
+                    body = "A file could not be written. This room was not added to the property. Start another scan to retry."
+                    label = "Start new scan"
+                    enabled = true
+                    secondaryButton.setVisible(false)
+                    secondaryButton.isEnabled = false
+                } else if (finishedPath == null) {
                     title = "Saving scan…"
-                    body = "$frames frames · compressing and writing to disk. Keep the app open until this finishes."
+                    body = "$frames frames · writing scan files to disk. Keep the app open until this finishes."
                     label = "Saving…"
                     enabled = false
+                    secondaryButton.setVisible(false)
+                    secondaryButton.isEnabled = false
+                } else if (roomLinkFailed) {
+                    title = "Scan saved; property link failed"
+                    body = "The scan is on this device, but it could not be added to the property. It remains available under Unassigned."
+                    label = "Start new scan"
+                    enabled = true
                     secondaryButton.setVisible(false)
                     secondaryButton.isEnabled = false
                 } else {
@@ -2064,6 +2113,7 @@ class CaptureActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "ArScan"
         const val EXTRA_ALIGN_TO_SESSION = "com.glomehometour.arscan.extra.ALIGN_TO_SESSION"
+        const val EXTRA_ALIGN_TO_SCAN_FOLDER = "com.glomehometour.arscan.extra.ALIGN_TO_SCAN_FOLDER"
 
         /** camera2 refusing a change to a session it already closed -- see installCameraRaceGuard. */
         fun isClosedCaptureSessionRace(e: Throwable): Boolean =
@@ -2098,14 +2148,12 @@ class CaptureActivity : AppCompatActivity() {
         const val UI_EVERY_N_FRAMES = 5L
         private const val LANDMARK_COVERAGE_INTERVAL_NS = 1_500_000_000L
 
-        /** Operator-facing kinematic limits (projet.md §2.4): warn here. */
-        const val MAX_WALK_SPEED_MS = 0.40f
-        const val MAX_TURN_RATE_DEG_S = 28f
+        /** Warn only for clearly fast motion; keyframe blur limits below remain stricter. */
+        const val MAX_WALK_SPEED_MS = 0.65f
+        const val MAX_TURN_RATE_DEG_S = 42f
 
-        /** Minimum gap between tap-to-focus triggers (see root.setOnTouchListener): continuous
-         * AF is already running, so this only exists to stop rapid incidental touches from
-         * making the lens hunt. Calibration knob. */
-        const val AUTO_FOCUS_COOLDOWN_NANOS = 1_200_000_000L
+        /** Avoid a double-trigger while keeping deliberate repeat taps responsive. */
+        const val AUTO_FOCUS_COOLDOWN_NANOS = 500_000_000L
 
         /** Every operator-facing warning stays up at least this long once triggered, queued
          * behind whichever one is currently showing -- most underlying conditions (autofocus,
@@ -2125,6 +2173,8 @@ class CaptureActivity : AppCompatActivity() {
         /** Frame intervals outside this band are a dropped frame or a tracking gap, not motion. */
         const val MIN_KINEMATIC_DT_S = 0.005f
         const val MAX_KINEMATIC_DT_S = 0.5f
+        private const val MAX_ROOM_POSE_STEP_M = 0.5f
+        private const val RELOCALIZATION_CHECK_NANOS = 3_000_000_000L
 
         private const val PHONE_HEIGHT_M = 1.35f
         private const val SMOOTH_ALPHA = 0.3f

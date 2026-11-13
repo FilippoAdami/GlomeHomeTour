@@ -6,32 +6,86 @@
   html {
     font-family: 'Inter', system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
+    scroll-behavior: smooth;
   }
   body {
-    @apply bg-glome-off-white text-glome-navy;
+    @apply bg-glome-cream text-glome-charcoal selection:bg-glome-orange/20 selection:text-glome-orange-dark;
   }
 }
 
 @layer components {
+  /* Liquid Glass Core Utilities */
+  .liquid-glass {
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.85);
+    box-shadow: 0 10px 30px -4px rgba(20, 23, 26, 0.05), inset 0 1px 1px 0 rgba(255, 255, 255, 0.9);
+  }
+
+  .liquid-glass-dark {
+    background: rgba(20, 23, 26, 0.78);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: 0 12px 36px -4px rgba(0, 0, 0, 0.3), inset 0 1px 1px 0 rgba(255, 255, 255, 0.15);
+  }
+
+  .liquid-glass-card {
+    background: rgba(255, 255, 255, 0.65);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    border: 1px solid rgba(255, 255, 255, 0.75);
+    box-shadow: 0 12px 36px -4px rgba(20, 23, 26, 0.06), inset 0 1px 1px 0 rgba(255, 255, 255, 0.85);
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .liquid-glass-card:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 20px 48px -6px rgba(20, 23, 26, 0.1), inset 0 1px 2px 0 rgba(255, 255, 255, 0.95);
+    border-color: rgba(255, 255, 255, 0.95);
+  }
+
+  .glass-pill {
+    background: rgba(255, 255, 255, 0.6);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.8);
+    box-shadow: 0 4px 16px -2px rgba(20, 23, 26, 0.04), inset 0 1px 1px 0 rgba(255, 255, 255, 0.7);
+  }
+
+  /* Product-Themed Buttons */
   .btn-primary {
-    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg
-           bg-glome-blue text-white font-semibold text-sm
-           hover:bg-glome-navy transition-colors duration-150
-           disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+           bg-glome-orange text-white font-semibold text-sm
+           hover:bg-glome-orange-dark active:scale-[0.98] transition-all duration-150
+           shadow-sm hover:shadow-md disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn-secondary {
-    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg
-           border border-gray-200 bg-white text-glome-navy font-semibold text-sm
-           hover:border-glome-blue hover:text-glome-blue transition-colors duration-150
-           disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+           border border-glome-stone/80 bg-white/80 backdrop-blur-md text-glome-charcoal font-semibold text-sm
+           hover:bg-white hover:border-glome-orange hover:text-glome-orange active:scale-[0.98] transition-all duration-150
+           shadow-sm disabled:opacity-50 disabled:cursor-not-allowed;
   }
+  .btn-moss {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+           bg-glome-moss text-white font-semibold text-sm
+           hover:bg-glome-moss-dark active:scale-[0.98] transition-all duration-150
+           shadow-sm disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-blueprint {
+    @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl
+           bg-glome-blueprint text-white font-semibold text-sm
+           hover:bg-glome-blueprint-dark active:scale-[0.98] transition-all duration-150
+           shadow-sm disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
   .input {
-    @apply w-full px-3.5 py-2.5 rounded-lg border border-gray-200 bg-white
-           text-sm text-glome-navy placeholder-gray-400
-           focus:outline-none focus:ring-2 focus:ring-glome-blue/30 focus:border-glome-blue
-           transition-colors duration-150;
+    @apply w-full px-4 py-2.5 rounded-xl border border-glome-stone/80 bg-white/90 backdrop-blur-sm
+           text-sm text-glome-charcoal placeholder-glome-muted/70
+           focus:outline-none focus:ring-2 focus:ring-glome-orange/30 focus:border-glome-orange
+           transition-all duration-150 shadow-sm;
   }
   .card {
-    @apply bg-white rounded-2xl border border-gray-100 shadow-sm;
+    @apply bg-white/90 backdrop-blur-md rounded-2xl border border-glome-stone/50 shadow-glass-sm;
   }
 }

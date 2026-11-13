@@ -35,7 +35,7 @@ export function PipelineTimeline({ job, overallStatus }: Props) {
 
         {totalTime > 0 && (
           <div className="text-right">
-            <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-blue-50 text-glome-blue border border-blue-100">
+            <span className="text-xs font-semibold px-3 py-1 rounded-full bg-glome-orange/10 text-glome-orange border border-glome-orange/20">
               ⏱ Total Time: {totalTime.toFixed(1)}s
             </span>
           </div>
@@ -53,10 +53,10 @@ export function PipelineTimeline({ job, overallStatus }: Props) {
               key={stage.name}
               className={`p-4 rounded-xl border transition-all ${
                 isRunning
-                  ? 'border-glome-blue/40 bg-blue-50/40 shadow-sm'
+                  ? 'border-glome-orange/40 bg-glome-orange-tint/40 shadow-sm'
                   : isDone
-                  ? 'border-gray-100 bg-white'
-                  : 'border-dashed border-gray-200 bg-gray-50/50 opacity-70'
+                  ? 'border-glome-stone/40 bg-white'
+                  : 'border-dashed border-glome-stone/50 bg-glome-cream/50 opacity-70'
               }`}
             >
               <div className="flex items-start justify-between gap-4">
@@ -67,7 +67,7 @@ export function PipelineTimeline({ job, overallStatus }: Props) {
                       isDone
                         ? 'bg-emerald-500 text-white'
                         : isRunning
-                        ? 'bg-glome-blue text-white animate-spin'
+                        ? 'bg-glome-orange text-white animate-spin'
                         : isError
                         ? 'bg-red-500 text-white'
                         : 'bg-gray-200 text-gray-500'
@@ -78,17 +78,17 @@ export function PipelineTimeline({ job, overallStatus }: Props) {
 
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="text-sm font-semibold text-glome-navy">
+                      <h3 className="text-sm font-semibold text-glome-charcoal">
                         {stage.displayName}
                       </h3>
                       {stage.frames && (
-                        <span className="text-[11px] font-medium text-gray-400 bg-gray-100 px-2 py-0.5 rounded">
+                        <span className="text-[11px] font-medium text-glome-muted bg-glome-cream border border-glome-stone/40 px-2 py-0.5 rounded">
                           {stage.frames} frames
                         </span>
                       )}
                     </div>
                     {stage.description && (
-                      <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                      <p className="text-xs text-glome-muted mt-1 leading-relaxed">
                         {stage.description}
                       </p>
                     )}
@@ -102,7 +102,7 @@ export function PipelineTimeline({ job, overallStatus }: Props) {
                       ✓ {stage.elapsedSeconds.toFixed(2)}s
                     </span>
                   ) : isRunning ? (
-                    <span className="text-xs font-medium text-glome-blue bg-blue-100/70 px-2.5 py-1 rounded-full animate-pulse">
+                    <span className="text-xs font-semibold text-glome-orange bg-glome-orange/15 px-2.5 py-1 rounded-full animate-pulse border border-glome-orange/30">
                       Processing…
                     </span>
                   ) : isError ? (

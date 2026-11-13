@@ -4,12 +4,15 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ViewFlipper
 import androidx.appcompat.app.AppCompatActivity
 
 import android.content.ClipData
@@ -53,7 +56,14 @@ class PropertyDetailActivity : AppCompatActivity() {
             startActivity(Intent(this, TourViewerActivity::class.java).putExtra(TourViewerActivity.EXTRA_PROPERTY_ID, id))
         }
 
-        processPropertyButton.setOnClickListener { startBatchProcessing() }
+        processPropertyButton.setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle("Process Property")
+                .setMessage("Low quality scans produce low quality results. Processing is irreversible. Make sure you have inspected all room 3D point clouds before proceeding.\n\nContinue with processing all rooms?")
+                .setPositiveButton("Process all") { _, _ -> startBatchProcessing() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
         sharePropertyButton.setOnClickListener { startShareProperty() }
     }
 
@@ -65,6 +75,7 @@ class PropertyDetailActivity : AppCompatActivity() {
             finish()
             return
         }
+        store.expandLegacyRoomFolders(this, property.id)
         findViewById<TextView>(R.id.addressText).text = property.address
         findViewById<Button>(R.id.viewTourButton).visibility =
             if (property.serverPropertyId == null) android.view.View.GONE else android.view.View.VISIBLE
@@ -87,7 +98,7 @@ class PropertyDetailActivity : AppCompatActivity() {
             propertyActionLayout.visibility = android.view.View.GONE
         } else {
             propertyActionLayout.visibility = android.view.View.VISIBLE
-            val unprocessed = rooms.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
+            val unprocessed = rooms.distinctBy { it.sessionName }.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
             val hasCheckpointAny = unprocessed.any { ScanProcessor.hasCheckpoint(this, it.sessionName) }
 
             if (unprocessed.isEmpty()) {
@@ -133,7 +144,7 @@ class PropertyDetailActivity : AppCompatActivity() {
             Toast.makeText(this, "No rooms to process", Toast.LENGTH_SHORT).show()
             return
         }
-        val unprocessed = rooms.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
+        val unprocessed = rooms.distinctBy { it.sessionName }.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
         if (unprocessed.isEmpty()) {
             property.isProcessed = true
             store.updateProperty(property)
@@ -204,7 +215,7 @@ class PropertyDetailActivity : AppCompatActivity() {
             Toast.makeText(this, "No rooms to share", Toast.LENGTH_SHORT).show()
             return
         }
-        val unprocessed = rooms.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
+        val unprocessed = rooms.distinctBy { it.sessionName }.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
         if (unprocessed.isNotEmpty()) {
             AlertDialog.Builder(this)
                 .setTitle("Processing required")
@@ -247,109 +258,133 @@ class PropertyDetailActivity : AppCompatActivity() {
         }.start()
     }
 
-    private fun buildRow(room: PropertyStore.RoomScan): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(14), dp(12), dp(14))
-            background = getDrawable(R.drawable.card)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(8) }
+    private fun showProcessConfirmationDialog(room: PropertyStore.RoomScan, onProceed: () -> Unit) {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_process_confirmation, null)
+        val dialog = AlertDialog.Builder(this)
+            .setView(dialogView)
+            .create()
+
+        dialogView.findViewById<TextView>(R.id.dialogTitle).text = "Quality Check & Processing"
+        dialogView.findViewById<TextView>(R.id.dialogScanSubtitle).text = "${room.label} (${room.sessionName})"
+
+        dialogView.findViewById<TextView>(R.id.btnDialogInspect3d).setOnClickListener {
+            dialog.dismiss()
+            PointCloudViewerActivity.start(this, room.sessionName, room.scanFolder, room.label)
         }
 
-        val info = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        dialogView.findViewById<TextView>(R.id.btnDialogProceed).setOnClickListener {
+            dialog.dismiss()
+            onProceed()
         }
-        info.addView(TextView(this).apply {
-            text = room.label
-            setTextColor(color(R.color.text_primary))
-            textSize = 15f
-        })
-        info.addView(TextView(this).apply {
-            val coverage = room.coveragePercent?.let { "${it.toInt()}% coverage" } ?: "coverage unknown"
-            text = "$coverage · ${room.status.name.lowercase()}"
-            setTextColor(color(R.color.text_faint))
-            textSize = 12f
-        })
-        info.addView(TextView(this).apply {
-            text = room.sessionName
-            setTextColor(color(R.color.text_faint))
-            textSize = 10f
-        })
-        row.addView(info)
 
+        dialogView.findViewById<TextView>(R.id.btnDialogCancel).setOnClickListener {
+            dialog.dismiss()
+        }
+
+        dialog.show()
+    }
+
+    private fun buildRow(room: PropertyStore.RoomScan): android.view.View {
+        val card = layoutInflater.inflate(R.layout.item_scan_card, listContainer, false)
+        val thumbnailContainer = card.findViewById<View>(R.id.thumbnailContainer)
+        val thumbnailFlipper = card.findViewById<ViewFlipper>(R.id.thumbnailFlipper)
+        val thumbnailView = card.findViewById<ImageView>(R.id.scanThumbnail)
+        val pcPreviewView = card.findViewById<ImageView>(R.id.scanPointcloudPreview)
+        val thumbnailBadge = card.findViewById<TextView>(R.id.thumbnailBadge)
+        val labelView = card.findViewById<TextView>(R.id.scanLabel)
+        val statusBadge = card.findViewById<TextView>(R.id.scanStatusBadge)
+        val subtitleView = card.findViewById<TextView>(R.id.scanSubtitle)
+        val metricCoverage = card.findViewById<TextView>(R.id.metricCoverage)
+        val metricFrames = card.findViewById<TextView>(R.id.metricFrames)
+        val metricPoints = card.findViewById<TextView>(R.id.metricPoints)
+
+        val progressLayout = card.findViewById<LinearLayout>(R.id.scanProgressLayout)
+        val progressBar = card.findViewById<ProgressBar>(R.id.scanProgressBar)
+        val progressText = card.findViewById<TextView>(R.id.scanProgressText)
+        val actionsLayout = card.findViewById<LinearLayout>(R.id.scanActionsLayout)
+
+        val btnInspect3d = card.findViewById<TextView>(R.id.btnInspect3d)
+        val btnAddCoverage = card.findViewById<TextView>(R.id.btnAddCoverage)
+        val btnProcess = card.findViewById<TextView>(R.id.btnProcess)
+        val btnDelete = card.findViewById<TextView>(R.id.btnDelete)
+
+        labelView.text = room.label
         val isProcessed = ScanProcessor.isProcessed(this, room.sessionName)
         var hasCheckpoint = if (!isProcessed) ScanProcessor.hasCheckpoint(this, room.sessionName) else false
 
-        val actionArea = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+        subtitleView.text = room.sessionName
+
+        val covInt = room.coveragePercent?.toInt()
+        metricCoverage.text = if (covInt != null) "$covInt% Coverage" else "Coverage --"
+        metricFrames.text = "Keyframes"
+        metricPoints.text = "3D Cloud"
+
+        ScanPreviewLoader.bindScanCardPreview(
+            this,
+            room.sessionName,
+            thumbnailContainer,
+            thumbnailFlipper,
+            thumbnailView,
+            pcPreviewView,
+            thumbnailBadge,
+            scanFolder = room.scanFolder,
+        )
+
+        fun updateStatusUi() {
+            when {
+                isProcessed -> {
+                    statusBadge.text = "PROCESSED"
+                    statusBadge.setTextColor(color(R.color.action_ready))
+                    btnProcess.text = "Share"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_secondary)
+                    btnAddCoverage.isEnabled = false
+                    btnAddCoverage.alpha = 0.4f
+                    btnAddCoverage.text = "Locked"
+                }
+                hasCheckpoint -> {
+                    statusBadge.text = "RESUME"
+                    statusBadge.setTextColor(color(R.color.warn))
+                    btnProcess.text = "Resume"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_action)
+                    btnAddCoverage.isEnabled = true
+                    btnAddCoverage.alpha = 1.0f
+                    btnAddCoverage.text = "＋ Add Coverage"
+                }
+                else -> {
+                    statusBadge.text = "READY"
+                    statusBadge.setTextColor(color(R.color.action))
+                    btnProcess.text = "⚙ Process"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_action)
+                    btnAddCoverage.isEnabled = true
+                    btnAddCoverage.alpha = 1.0f
+                    btnAddCoverage.text = "＋ Add Coverage"
+                }
+            }
+        }
+        updateStatusUi()
+
+        btnInspect3d.setOnClickListener {
+            PointCloudViewerActivity.start(this, room.sessionName, room.scanFolder, room.label)
+        }
+
+        btnAddCoverage.setOnClickListener {
+            if (ScanProcessor.isProcessed(this, room.sessionName)) {
+                Toast.makeText(this, "Processed scans cannot be extended.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val id = propertyId ?: return@setOnClickListener
+            startActivity(
+                Intent(this, CaptureActivity::class.java)
+                    .putExtra(PropertyStore.EXTRA_PROPERTY_ID, id)
+                    .putExtra(PropertyStore.EXTRA_ROOM_LABEL, room.label)
+                    .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SCAN_FOLDER, room.scanFolder)
+                    .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SESSION, room.sessionName)
             )
         }
 
-        val processLabel = TextView(this).apply {
-            text = when {
-                isProcessed -> "Processed"
-                hasCheckpoint -> "Resume"
-                else -> "Process"
-            }
-            setTextColor(color(if (isProcessed) R.color.action_ready else R.color.action))
-            textSize = 13f
-            isClickable = !isProcessed
-            isEnabled = !isProcessed
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { rightMargin = dp(14) }
-        }
-
-        val shareLabel = TextView(this).apply {
-            text = "Share"
-            setTextColor(color(R.color.action))
-            textSize = 13f
-            visibility = if (isProcessed) android.view.View.VISIBLE else android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { rightMargin = dp(14) }
-            setOnClickListener { ScanProcessor.shareScan(this@PropertyDetailActivity, room.sessionName) }
-        }
-
-        val removeLabel = TextView(this).apply {
-            text = "Remove"
-            setTextColor(color(R.color.danger))
-            textSize = 13f
-            setOnClickListener { confirmRemove(room) }
-        }
-
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            visibility = android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(dp(100), LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-
-        val progressText = TextView(this).apply {
-            setTextColor(color(R.color.text_faint))
-            textSize = 11f
-            visibility = android.view.View.GONE
-            setPadding(dp(6), 0, 0, 0)
-        }
-
-        actionArea.addView(processLabel)
-        actionArea.addView(shareLabel)
-        actionArea.addView(removeLabel)
-        actionArea.addView(progressBar)
-        actionArea.addView(progressText)
-
-        processLabel.setOnClickListener {
-            if (ScanProcessor.isProcessed(this, room.sessionName)) return@setOnClickListener
-            processLabel.visibility = android.view.View.GONE
-            shareLabel.visibility = android.view.View.GONE
-            removeLabel.visibility = android.view.View.GONE
-            progressBar.visibility = android.view.View.VISIBLE
-            progressText.visibility = android.view.View.VISIBLE
+        fun runProcessing() {
+            actionsLayout.visibility = android.view.View.GONE
+            progressLayout.visibility = android.view.View.VISIBLE
 
             Thread {
                 val accessor = ScanProcessor.getAccessor(this, room.sessionName)
@@ -361,34 +396,36 @@ class PropertyDetailActivity : AppCompatActivity() {
                     }
                 }
                 runOnUiThread {
-                    progressBar.visibility = android.view.View.GONE
-                    progressText.visibility = android.view.View.GONE
+                    progressLayout.visibility = android.view.View.GONE
+                    actionsLayout.visibility = android.view.View.VISIBLE
                     if (success) {
                         ScanProcessor.markProcessed(room.sessionName)
-                        processLabel.text = "Processed"
-                        processLabel.setTextColor(color(R.color.action_ready))
-                        processLabel.isClickable = false
-                        processLabel.isEnabled = false
-                        processLabel.visibility = android.view.View.VISIBLE
-                        shareLabel.visibility = android.view.View.VISIBLE
-                        removeLabel.visibility = android.view.View.VISIBLE
+                        reload()
                         Toast.makeText(this, "Processing complete!", Toast.LENGTH_SHORT).show()
                     } else {
                         hasCheckpoint = true
-                        processLabel.text = "Resume"
-                        processLabel.setTextColor(color(R.color.action))
-                        processLabel.isClickable = true
-                        processLabel.isEnabled = true
-                        processLabel.visibility = android.view.View.VISIBLE
-                        removeLabel.visibility = android.view.View.VISIBLE
+                        updateStatusUi()
                         Toast.makeText(this, "Processing interrupted. Tap Resume to continue.", Toast.LENGTH_LONG).show()
                     }
                 }
             }.start()
         }
 
-        row.addView(actionArea)
-        return row
+        btnProcess.setOnClickListener {
+            if (ScanProcessor.isProcessed(this, room.sessionName)) {
+                ScanProcessor.shareScan(this, room.sessionName)
+                return@setOnClickListener
+            }
+            showProcessConfirmationDialog(room) {
+                runProcessing()
+            }
+        }
+
+        btnDelete.setOnClickListener {
+            confirmRemove(room)
+        }
+
+        return card
     }
 
     private fun confirmRemove(room: PropertyStore.RoomScan) {
@@ -399,7 +436,7 @@ class PropertyDetailActivity : AppCompatActivity() {
                     "the phone and moves to Unassigned in All scans."
             )
             .setPositiveButton("Remove") { _, _ ->
-                store.deleteRoomScan(room.sessionName)
+                store.deleteRoomScan(room.sessionName, room.scanFolder)
                 reload()
             }
             .setNegativeButton("Cancel", null)
@@ -433,6 +470,7 @@ class PropertyDetailActivity : AppCompatActivity() {
                                 Intent(this, CaptureActivity::class.java)
                                     .putExtra(PropertyStore.EXTRA_PROPERTY_ID, id)
                                     .putExtra(PropertyStore.EXTRA_ROOM_LABEL, text)
+                                    .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SCAN_FOLDER, lastRoom.scanFolder)
                                     .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SESSION, lastRoom.sessionName)
                             )
                         }

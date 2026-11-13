@@ -11,7 +11,10 @@ import open3d as o3d
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "08_artifacts_generation"))
-from generate_interactive_viewer import assign_floor, generate, photo_direction, project, projection_grid, versioned_asset_url, _flip_floorplan_vertically
+from generate_interactive_viewer import (
+    _flip_floorplan_vertically, assign_floor, generate, incoming_door_centers,
+    number_cameras, photo_direction, project, projection_grid, versioned_asset_url,
+)
 from generate_floorplan_measurements import _flip_measurements_vertically
 
 
@@ -23,6 +26,47 @@ def test_projection_maps_world_axes_and_each_style_has_own_grid():
     assert project([5, 0, 3], grid) == pytest.approx([60, 60])
     row["pixel_size_m"] = .2
     assert project([5, 0, 3], projection_grid(row)) == pytest.approx([55, 55])
+
+
+def test_incoming_door_centers_match_only_adjacent_scan_panels(tmp_path):
+    stats = tmp_path / "stats"
+    stats.mkdir()
+    panels = [
+        {"coordinate_frame": "phase07_aligned_global_y_up", "panel_center_xyz_m": [1, 2, 3],
+         "source_instances": [{"scan_id": "scan_0"}, {"scan_id": "scan_1"}]},
+        {"coordinate_frame": "phase07_aligned_global_y_up", "panel_center_xyz_m": [4, 5, 6],
+         "source_instances": [{"scan_id": "scan_1"}, {"scan_id": "scan_2"}]},
+        {"coordinate_frame": "phase07_aligned_global_y_up", "panel_center_xyz_m": [7, 8, 9],
+         "source_instances": [{"scan_id": "scan_0"}, {"scan_id": "scan_2"}]},
+    ]
+    (stats / "aligned_door_panels.json").write_text(json.dumps({"panels": panels}))
+
+    centers = incoming_door_centers(tmp_path, ["scan_0", "scan_1", "scan_2"])
+
+    assert set(centers) == {"scan_1", "scan_2"}
+    assert centers["scan_1"] == pytest.approx([1, 2, 3])
+    assert centers["scan_2"] == pytest.approx([4, 5, 6])
+
+
+def test_camera_numbers_pin_incoming_door_camera_then_continue_by_3d_start_distance():
+    cameras = [
+        {"scan": "scan_1", "floor": "UPPER", "kind": "panorama", "source_id": 1, "position": [1, 0, 0]},
+        {"scan": "scan_0", "floor": "BASE", "kind": "panorama", "source_id": 2, "position": [0, 2, 0]},
+        {"scan": "scan_1", "floor": "BASE", "kind": "photo", "source_id": 5, "position": [10, 0, 0]},
+        {"scan": "scan_0", "floor": "BASE", "kind": "photo", "source_id": 4, "position": [1, 0, 0]},
+        {"scan": "scan_1", "floor": "BASE", "kind": "photo", "source_id": 6, "position": [2, 0, 0]},
+    ]
+
+    ordered = number_cameras(
+        cameras,
+        {"scan_0": np.array([0, 0, 0]), "scan_1": np.array([10, 0, 0])},
+        {"scan_1": np.array([0, 0, 0])},
+    )
+
+    assert [(camera["scan"], camera["source_id"], camera["number"]) for camera in ordered] == [
+        ("scan_0", 4, 1), ("scan_0", 2, 2),
+        ("scan_1", 1, 3), ("scan_1", 5, 4), ("scan_1", 6, 5),
+    ]
 
 
 def test_floorplan_measurements_flip_vertically_with_plan_and_keep_readable_labels():

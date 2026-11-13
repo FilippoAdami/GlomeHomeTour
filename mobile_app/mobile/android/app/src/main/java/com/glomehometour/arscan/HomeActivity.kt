@@ -45,80 +45,107 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun reload() {
+        val existingProperties = store.properties()
+        existingProperties.forEach { store.expandLegacyRoomFolders(this, it.id) }
         val properties = store.properties()
         listContainer.removeAllViews()
         emptyText.setVisible(properties.isEmpty())
         for (property in properties) listContainer.addView(buildRow(property))
     }
 
-    private fun buildRow(property: PropertyStore.Property): LinearLayout {
+    private fun buildRow(property: PropertyStore.Property): android.view.View {
         val rooms = store.rooms(property.id)
         val roomCount = rooms.size
         val unprocessedRooms = rooms.filter { !ScanProcessor.isProcessed(this, it.sessionName) }
         val hasCheckpointAny = unprocessedRooms.any { ScanProcessor.hasCheckpoint(this, it.sessionName) }
 
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(14), dp(12), dp(14))
-            background = getDrawable(R.drawable.card)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(8) }
-            setOnClickListener {
-                startActivity(
-                    Intent(this@HomeActivity, PropertyDetailActivity::class.java)
-                        .putExtra(PropertyStore.EXTRA_PROPERTY_ID, property.id)
-                )
+        val card = layoutInflater.inflate(R.layout.item_property_card, listContainer, false)
+        val addressView = card.findViewById<TextView>(R.id.propertyAddress)
+        val statusBadge = card.findViewById<TextView>(R.id.propertyStatusBadge)
+        val subtitleView = card.findViewById<TextView>(R.id.propertySubtitle)
+        val btnListing = card.findViewById<TextView>(R.id.btnPropertyListing)
+        val btnAddRoom = card.findViewById<TextView>(R.id.btnPropertyAddRoom)
+        val btnDelete = card.findViewById<TextView>(R.id.btnPropertyDelete)
+
+        addressView.text = property.address
+
+        val roomsStr = if (roomCount == 1) "1 room" else "$roomCount rooms"
+        val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(property.createdAtMs)
+        subtitleView.text = "$roomsStr · Created $dateStr"
+
+        when {
+            roomCount == 0 -> {
+                statusBadge.text = "EMPTY"
+                statusBadge.setTextColor(color(R.color.text_faint))
+            }
+            unprocessedRooms.isEmpty() -> {
+                statusBadge.text = "PROCESSED"
+                statusBadge.setTextColor(color(R.color.action_ready))
+            }
+            hasCheckpointAny -> {
+                statusBadge.text = "RESUME"
+                statusBadge.setTextColor(color(R.color.warn))
+            }
+            else -> {
+                statusBadge.text = "READY"
+                statusBadge.setTextColor(color(R.color.action))
             }
         }
 
-        val info = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        val openListing = {
+            startActivity(
+                Intent(this, PropertyDetailActivity::class.java)
+                    .putExtra(PropertyStore.EXTRA_PROPERTY_ID, property.id)
+            )
         }
-        info.addView(TextView(this).apply {
-            text = property.address
-            setTextColor(color(R.color.text_primary))
-            textSize = 15f
-        })
-        info.addView(TextView(this).apply {
-            val roomsStr = if (roomCount == 1) "1 room" else "$roomCount rooms"
-            val statusStr = if (unprocessedRooms.isNotEmpty()) {
-                if (hasCheckpointAny) " · Resume processing" else " · Ready to process"
-            } else if (roomCount > 0) {
-                " · Processed"
-            } else ""
-            text = "$roomsStr$statusStr · ${SimpleDateFormat("yyyy-MM-dd", Locale.US).format(property.createdAtMs)}"
-            setTextColor(color(if (unprocessedRooms.isNotEmpty()) R.color.action else R.color.text_faint))
-            textSize = 12f
-        })
-        row.addView(info)
 
-        if (unprocessedRooms.isNotEmpty()) {
-            row.addView(TextView(this).apply {
-                text = if (hasCheckpointAny) "Resume" else "Process"
-                setTextColor(color(R.color.action))
-                textSize = 13f
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { rightMargin = dp(14) }
-                setOnClickListener {
-                    startActivity(
-                        Intent(this@HomeActivity, PropertyDetailActivity::class.java)
-                            .putExtra(PropertyStore.EXTRA_PROPERTY_ID, property.id)
-                    )
-                }
+        card.setOnClickListener { openListing() }
+        btnListing.setOnClickListener { openListing() }
+        btnAddRoom.setOnClickListener { promptAddRoom(property) }
+        btnDelete.setOnClickListener { confirmDelete(property, roomCount) }
+
+        return card
+    }
+
+    private fun promptAddRoom(property: PropertyStore.Property) {
+        val existingRooms = store.rooms(property.id)
+        val existing = existingRooms.size
+        val label = EditText(this).apply {
+            hint = "Room name"
+            setText("Room ${existing + 1}")
+            setSelection(text.length)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Scan a room")
+            .setView(LinearLayout(this).apply {
+                setPadding(dp(24), dp(8), dp(24), 0)
+                addView(label)
             })
-        }
-
-        row.addView(TextView(this).apply {
-            text = "Delete"
-            setTextColor(color(R.color.danger))
-            textSize = 13f
-            setOnClickListener { confirmDelete(property, roomCount) }
-        })
-        return row
+            .setPositiveButton("Start scan") { _, _ ->
+                val text = label.text.toString().trim().ifEmpty { "Room ${existing + 1}" }
+                val intent = Intent(this, CaptureActivity::class.java)
+                    .putExtra(PropertyStore.EXTRA_PROPERTY_ID, property.id)
+                    .putExtra(PropertyStore.EXTRA_ROOM_LABEL, text)
+                if (existingRooms.isNotEmpty()) {
+                    val lastRoom = existingRooms.last()
+                    AlertDialog.Builder(this)
+                        .setTitle("Align with previous room?")
+                        .setMessage("Align this room with the doorway of \"${lastRoom.label}\"?")
+                        .setPositiveButton("Align (Recommended)") { _, _ ->
+                            intent.putExtra(CaptureActivity.EXTRA_ALIGN_TO_SCAN_FOLDER, lastRoom.scanFolder)
+                            intent.putExtra(CaptureActivity.EXTRA_ALIGN_TO_SESSION, lastRoom.sessionName)
+                            startActivity(intent)
+                        }
+                        .setNegativeButton("Start fresh") { _, _ ->
+                            startActivity(intent)
+                        }
+                        .show()
+                } else {
+                    startActivity(intent)
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun confirmDelete(property: PropertyStore.Property, roomCount: Int) {

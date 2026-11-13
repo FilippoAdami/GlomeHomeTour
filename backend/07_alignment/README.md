@@ -99,7 +99,8 @@ All 3D assets, scan models, and statistical manifests are exported inside `<work
 | `scans/<scan_name>/gaussian_splat/*.ply` | That scan's aligned Gaussian splats. |
 | `scans/<scan_name>/trajectory.csv`, `transforms.json`, `sparse/0/*` | Aligned ARCore trajectory, NeRF/3DGS poses, and COLMAP reconstruction/poses. |
 | `stats/aligned_scans_transforms.json` | Solved $4 \times 4$ $\mathrm{SE}(3)$ transform for each scan; retained so `--skip-scans` can reuse the alignment. |
+| `stats/multi_room_alignment_report.json` | Alignment metrics and the structured trajectory-derived door pair identities. With `--skip-scans`, pairings are reused only when the saved transforms and pairing inputs match; otherwise their status is `not_computed`. |
 
-Multi-scan registration uses the exact union of Phase 06 floor triangles to reject any positive-area overlap between room footprints. Candidate wall planes are snapped even along doorway tangent axes when their aligned surface spans remain disjoint and the paired door openings still overlap. Alignment reports and visual diagnostics are temporary and removed after successful publication.
+Multi-scan registration uses the exact union of Phase 06 floor triangles to reject any positive-area overlap between room footprints. Candidate wall planes are snapped even along doorway tangent axes when their aligned surface spans remain disjoint and the paired door openings still overlap. The alignment report is retained; temporary plane-snap reports and visual diagnostics are removed after successful publication.
 
 The merged and per-scan Gaussian clouds omit centers enclosed by another scan's aligned Phase 04 sealed mesh. Source scan assets are backed up in each scan's `.raw_unaligned/` before in-place alignment. The runner does not produce `aligned_scene_with_objects.ply`; the sealed meshes and objects remain available as separate outputs.

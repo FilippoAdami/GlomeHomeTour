@@ -10,11 +10,13 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ViewFlipper
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.FileProvider
 import java.io.File
@@ -82,7 +84,11 @@ class ScanGalleryActivity : AppCompatActivity() {
         listContainer.removeAllViews()
         emptyText.setVisible(entries.isEmpty() && roomsBySession.isEmpty())
 
-        val byProperty = entries.groupBy { roomsBySession[it.sessionName]?.propertyId }
+        val roomEntries = entries.flatMap { entry ->
+            val rooms = roomsBySession[entry.sessionName].orEmpty()
+            if (rooms.isEmpty()) listOf(entry to null) else rooms.map { entry to it }
+        }
+        val byProperty = roomEntries.groupBy { it.second?.propertyId }
         for (property in store.properties()) {
             val owned = byProperty[property.id].orEmpty()
             val missing = store.rooms(property.id).filter { room ->
@@ -90,14 +96,14 @@ class ScanGalleryActivity : AppCompatActivity() {
             }
             if (owned.isEmpty() && missing.isEmpty()) continue
             listContainer.addView(buildHeader(property.address, owned.size + missing.size))
-            for (entry in owned) listContainer.addView(buildRow(entry, roomsBySession[entry.sessionName]))
+            for ((entry, room) in owned) listContainer.addView(buildRow(entry, room))
             for (room in missing) listContainer.addView(buildMissingRow(room))
         }
 
         val unassigned = byProperty[null].orEmpty()
         if (unassigned.isNotEmpty()) {
             listContainer.addView(buildHeader("Unassigned", unassigned.size))
-            for (entry in unassigned) listContainer.addView(buildRow(entry, null))
+            for ((entry, _) in unassigned) listContainer.addView(buildRow(entry, null))
         }
     }
 
@@ -139,7 +145,7 @@ class ScanGalleryActivity : AppCompatActivity() {
             setTextColor(color(R.color.danger))
             textSize = 13f
             setOnClickListener {
-                store.deleteRoomScan(room.sessionName)
+                store.deleteRoomScan(room.sessionName, room.scanFolder)
                 reload()
             }
         })
@@ -157,13 +163,15 @@ class ScanGalleryActivity : AppCompatActivity() {
         return entry.fallbackZipFile?.inputStream()
     }
 
-    private fun openFirstFrame(entry: ScanEntry): InputStream? {
+    private fun openFirstFrame(entry: ScanEntry, scanFolder: String): InputStream? {
         val zipStream = openZip(entry)
         if (zipStream != null) return zipStream
         entry.legacyFallbackDir?.let { dir ->
-            val imgFile = File(dir, "images/frame_00000.jpg")
+            val imgFile = File(dir, "$scanFolder/images/frame_00000.jpg")
             if (imgFile.isFile) return imgFile.inputStream()
-            val anyImg = dir.walkTopDown().firstOrNull { it.isFile && it.name.endsWith(".jpg") }
+            val anyImg = dir.walkTopDown().firstOrNull {
+                it.isFile && it.name.endsWith(".jpg") && it.relativeTo(dir).invariantSeparatorsPath.startsWith("$scanFolder/images/")
+            }
             if (anyImg != null) return anyImg.inputStream()
         }
         if (entry.legacyFlatMediaSession) {
@@ -205,8 +213,8 @@ class ScanGalleryActivity : AppCompatActivity() {
         contentResolver.query(
             MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
             projection,
-            "${MediaStore.Files.FileColumns.RELATIVE_PATH} LIKE ?",
-            arrayOf("$albumPrefix%"),
+            "${MediaStore.Files.FileColumns.RELATIVE_PATH} LIKE ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ? OR ${MediaStore.Files.FileColumns.RELATIVE_PATH} = ?",
+            arrayOf("$albumPrefix%", albumPrefix, albumPrefix.removeSuffix("/")),
             null,
         )?.use { cursor ->
             val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
@@ -218,7 +226,8 @@ class ScanGalleryActivity : AppCompatActivity() {
                 val relPath = cursor.getString(pathCol) ?: continue
                 val size = cursor.getLong(sizeCol)
                 val modifiedMs = cursor.getLong(dateCol) * 1000L
-                if (relPath == albumPrefix) {
+                val normalizedRelPath = if (relPath.endsWith("/")) relPath else "$relPath/"
+                if (normalizedRelPath == albumPrefix) {
                     val displayName = cursor.getString(nameCol) ?: continue
                     val flatMatch = FLAT_SESSION_FILE.matchEntire(displayName)
                     when {
@@ -276,162 +285,179 @@ class ScanGalleryActivity : AppCompatActivity() {
         }
     }
 
-    private fun buildRow(entry: ScanEntry, room: PropertyStore.RoomScan?): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(12), dp(12), dp(12), dp(12))
-            background = getDrawable(R.drawable.card)
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { bottomMargin = dp(8) }
+    private fun showProcessConfirmationDialog(sessionName: String, scanFolder: String, label: String, onProceed: () -> Unit) {
+        val dialogView = layoutInflater.inflate(R.layout.dialog_process_confirmation, null)
+        val dialog = AlertDialog.Builder(this)
+            .setView(dialogView)
+            .create()
+
+        dialogView.findViewById<TextView>(R.id.dialogTitle).text = "Quality Check & Processing"
+        dialogView.findViewById<TextView>(R.id.dialogScanSubtitle).text = "$label ($sessionName)"
+
+        dialogView.findViewById<TextView>(R.id.btnDialogInspect3d).setOnClickListener {
+            dialog.dismiss()
+            PointCloudViewerActivity.start(this, sessionName, scanFolder, label)
         }
 
-        // Legacy loose-file sessions (captured before finish() zipped, or crashed mid-capture)
-        // have no zip to read a frame out of; show no thumbnail rather than an empty grey box
-        // that reads as a failed load.
-        val thumbnail = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(color(R.color.action_disabled))
-            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) }
+        dialogView.findViewById<TextView>(R.id.btnDialogProceed).setOnClickListener {
+            dialog.dismiss()
+            onProceed()
         }
-        row.addView(thumbnail)
-        ThumbnailFetcher.load(entry.sessionName, thumbnail) { openFirstFrame(entry) }
 
-        val info = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        dialogView.findViewById<TextView>(R.id.btnDialogCancel).setOnClickListener {
+            dialog.dismiss()
         }
-        info.addView(TextView(this).apply {
-            text = room?.label ?: entry.sessionName
-            setTextColor(color(R.color.text_primary))
-            textSize = 14f
-        })
-        info.addView(TextView(this).apply {
-            val coverage = room?.coveragePercent?.let { "${it.toInt()}% · " } ?: ""
-            text = "$coverage${formatDate(entry.lastModifiedMs)} · ${formatSize(entry.sizeBytes)}"
-            setTextColor(color(R.color.text_faint))
-            textSize = 12f
-        })
-        row.addView(info)
+
+        dialog.show()
+    }
+
+    private fun buildRow(entry: ScanEntry, room: PropertyStore.RoomScan?): android.view.View {
+        val card = layoutInflater.inflate(R.layout.item_scan_card, listContainer, false)
+        val thumbnailContainer = card.findViewById<View>(R.id.thumbnailContainer)
+        val thumbnailFlipper = card.findViewById<ViewFlipper>(R.id.thumbnailFlipper)
+        val thumbnailView = card.findViewById<ImageView>(R.id.scanThumbnail)
+        val pcPreviewView = card.findViewById<ImageView>(R.id.scanPointcloudPreview)
+        val thumbnailBadge = card.findViewById<TextView>(R.id.thumbnailBadge)
+        val labelView = card.findViewById<TextView>(R.id.scanLabel)
+        val statusBadge = card.findViewById<TextView>(R.id.scanStatusBadge)
+        val subtitleView = card.findViewById<TextView>(R.id.scanSubtitle)
+        val metricCoverage = card.findViewById<TextView>(R.id.metricCoverage)
+        val metricFrames = card.findViewById<TextView>(R.id.metricFrames)
+        val metricPoints = card.findViewById<TextView>(R.id.metricPoints)
+
+        val progressLayout = card.findViewById<LinearLayout>(R.id.scanProgressLayout)
+        val progressBar = card.findViewById<ProgressBar>(R.id.scanProgressBar)
+        val progressText = card.findViewById<TextView>(R.id.scanProgressText)
+        val actionsLayout = card.findViewById<LinearLayout>(R.id.scanActionsLayout)
+
+        val btnInspect3d = card.findViewById<TextView>(R.id.btnInspect3d)
+        val btnAddCoverage = card.findViewById<TextView>(R.id.btnAddCoverage)
+        val btnProcess = card.findViewById<TextView>(R.id.btnProcess)
+        val btnDelete = card.findViewById<TextView>(R.id.btnDelete)
+
+        val displayName = room?.label ?: entry.sessionName
+        val scanFolder = room?.scanFolder?.takeIf { it.isNotBlank() } ?: "scan_0"
+        labelView.text = displayName
+        subtitleView.text = "${formatDate(entry.lastModifiedMs)} · ${formatSize(entry.sizeBytes)}"
+
+        val covInt = room?.coveragePercent?.toInt()
+        metricCoverage.text = if (covInt != null) "$covInt% Coverage" else "Coverage --"
+        metricFrames.text = formatSize(entry.sizeBytes)
+        metricPoints.text = "3D Cloud"
+
+        ScanPreviewLoader.bindScanCardPreview(
+            this,
+            entry.sessionName,
+            thumbnailContainer,
+            thumbnailFlipper,
+            thumbnailView,
+            pcPreviewView,
+            thumbnailBadge,
+            customPhotoStreamProvider = { openFirstFrame(entry, scanFolder) },
+            scanFolder = scanFolder,
+        )
 
         val isProcessed = entry.mediaZipId != null || entry.fallbackZipFile != null
 
-        val actionArea = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            )
-        }
-
-        val processLabel = TextView(this).apply {
-            text = when {
-                isProcessed -> "Processed"
-                entry.hasCheckpoint -> "Resume"
-                else -> "Process"
+        fun updateStatusUi() {
+            when {
+                isProcessed -> {
+                    statusBadge.text = "PROCESSED"
+                    statusBadge.setTextColor(color(R.color.action_ready))
+                    btnProcess.text = "Share"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_secondary)
+                    btnAddCoverage.isEnabled = false
+                    btnAddCoverage.alpha = 0.4f
+                    btnAddCoverage.text = "Locked"
+                }
+                entry.hasCheckpoint -> {
+                    statusBadge.text = "RESUME"
+                    statusBadge.setTextColor(color(R.color.warn))
+                    btnProcess.text = "Resume"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_action)
+                    btnAddCoverage.isEnabled = room != null
+                    btnAddCoverage.alpha = if (room != null) 1.0f else 0.4f
+                    btnAddCoverage.text = "＋ Add Coverage"
+                }
+                else -> {
+                    statusBadge.text = "READY"
+                    statusBadge.setTextColor(color(R.color.action))
+                    btnProcess.text = "⚙ Process"
+                    btnProcess.setBackgroundResource(R.drawable.btn_card_action)
+                    btnAddCoverage.isEnabled = room != null
+                    btnAddCoverage.alpha = if (room != null) 1.0f else 0.4f
+                    btnAddCoverage.text = "＋ Add Coverage"
+                }
             }
-            setTextColor(color(if (isProcessed) R.color.action_ready else R.color.action))
-            textSize = 13f
-            isClickable = !isProcessed
-            isEnabled = !isProcessed
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { rightMargin = dp(14) }
+        }
+        updateStatusUi()
+
+        btnInspect3d.setOnClickListener {
+            PointCloudViewerActivity.start(this, entry.sessionName, scanFolder, displayName)
         }
 
-        val shareLabel = TextView(this).apply {
-            text = "Share"
-            setTextColor(color(R.color.action))
-            textSize = 13f
-            visibility = if (isProcessed) android.view.View.VISIBLE else android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
-            ).apply { rightMargin = dp(14) }
-            setOnClickListener { shareScan(entry) }
-        }
-
-        val deleteLabel = TextView(this).apply {
-            text = "Delete"
-            setTextColor(color(R.color.danger))
-            textSize = 13f
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
+        btnAddCoverage.setOnClickListener {
+            if (isProcessed) {
+                Toast.makeText(this, "Processed scans cannot be extended.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (room == null) {
+                Toast.makeText(this, "Unassigned scans cannot add coverage.", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            startActivity(
+                Intent(this, CaptureActivity::class.java)
+                    .putExtra(PropertyStore.EXTRA_PROPERTY_ID, room.propertyId)
+                    .putExtra(PropertyStore.EXTRA_ROOM_LABEL, room.label)
+                    .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SCAN_FOLDER, room.scanFolder)
+                    .putExtra(CaptureActivity.EXTRA_ALIGN_TO_SESSION, room.sessionName)
             )
         }
 
-        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            visibility = android.view.View.GONE
-            layoutParams = LinearLayout.LayoutParams(dp(110), LinearLayout.LayoutParams.WRAP_CONTENT)
-        }
-
-        val progressText = TextView(this).apply {
-            setTextColor(color(R.color.text_faint))
-            textSize = 11f
-            visibility = android.view.View.GONE
-            setPadding(dp(6), 0, 0, 0)
-        }
-
-        actionArea.addView(processLabel)
-        actionArea.addView(shareLabel)
-        actionArea.addView(deleteLabel)
-        actionArea.addView(progressBar)
-        actionArea.addView(progressText)
-
-        processLabel.setOnClickListener {
-            if (isProcessed) return@setOnClickListener
-            processLabel.visibility = android.view.View.GONE
-            shareLabel.visibility = android.view.View.GONE
-            deleteLabel.visibility = android.view.View.GONE
-            progressBar.visibility = android.view.View.VISIBLE
-            progressText.visibility = android.view.View.VISIBLE
+        fun runProcessing() {
+            actionsLayout.visibility = android.view.View.GONE
+            progressLayout.visibility = android.view.View.VISIBLE
 
             processScan(entry, { percent ->
                 progressBar.progress = percent
                 progressText.text = "$percent%"
             }) { success ->
-                progressBar.visibility = android.view.View.GONE
-                progressText.visibility = android.view.View.GONE
+                progressLayout.visibility = android.view.View.GONE
+                actionsLayout.visibility = android.view.View.VISIBLE
                 if (success) {
                     ScanProcessor.markProcessed(entry.sessionName)
-                    processLabel.text = "Processed"
-                    processLabel.setTextColor(color(R.color.action_ready))
-                    processLabel.isClickable = false
-                    processLabel.isEnabled = false
-                    processLabel.visibility = android.view.View.VISIBLE
-                    shareLabel.visibility = android.view.View.VISIBLE
-                    deleteLabel.visibility = android.view.View.VISIBLE
+                    reload()
                     Toast.makeText(this, "Processing complete!", Toast.LENGTH_SHORT).show()
                 } else {
                     entry.hasCheckpoint = true
-                    processLabel.text = "Resume"
-                    processLabel.setTextColor(color(R.color.action))
-                    processLabel.isClickable = true
-                    processLabel.isEnabled = true
-                    processLabel.visibility = android.view.View.VISIBLE
-                    deleteLabel.visibility = android.view.View.VISIBLE
+                    updateStatusUi()
                     Toast.makeText(this, "Processing interrupted. Tap Resume to continue.", Toast.LENGTH_LONG).show()
                 }
             }
         }
 
-        deleteLabel.setOnClickListener {
+        btnProcess.setOnClickListener {
+            if (isProcessed) {
+                shareScan(entry)
+                return@setOnClickListener
+            }
+            showProcessConfirmationDialog(entry.sessionName, scanFolder, displayName) {
+                runProcessing()
+            }
+        }
+
+        btnDelete.setOnClickListener {
             confirmDelete(entry) {
-                processLabel.visibility = android.view.View.GONE
-                shareLabel.visibility = android.view.View.GONE
-                deleteLabel.visibility = android.view.View.GONE
-                progressBar.visibility = android.view.View.VISIBLE
-                progressText.visibility = android.view.View.VISIBLE
+                actionsLayout.visibility = android.view.View.GONE
+                progressLayout.visibility = android.view.View.VISIBLE
                 deleteScan(entry) { percent ->
                     progressBar.progress = percent
                     progressText.text = "$percent%"
                 }
             }
         }
-        row.addView(actionArea)
 
-        return row
+        return card
     }
 
     private fun shareScan(entry: ScanEntry) {

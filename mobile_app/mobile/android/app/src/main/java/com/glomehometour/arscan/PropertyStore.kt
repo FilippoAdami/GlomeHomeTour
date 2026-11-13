@@ -41,6 +41,7 @@ class PropertyStore(context: Context) {
         val propertyId: String,
         var label: String,
         var sessionName: String,
+        var scanFolder: String = "scan_0",
         var coveragePercent: Float? = null,
         val capturedAtMs: Long = System.currentTimeMillis(),
         var status: ScanStatus = ScanStatus.CAPTURING,
@@ -56,8 +57,11 @@ class PropertyStore(context: Context) {
     fun rooms(propertyId: String): List<RoomScan> =
         read().second.filter { it.propertyId == propertyId }.sortedBy { it.capturedAtMs }
 
-    /** Session name -> room, for the gallery's file-first listing to look rows up against. */
-    fun roomsBySession(): Map<String, RoomScan> = read().second.associateBy { it.sessionName }
+    /** Session name -> all room rows, since legacy archives can contain several rooms. */
+    fun roomsBySession(): Map<String, List<RoomScan>> = read().second.groupBy { it.sessionName }
+
+    fun roomScan(sessionName: String, scanFolder: String): RoomScan? =
+        read().second.firstOrNull { it.sessionName == sessionName && it.scanFolder == scanFolder }
 
     fun isPropertyProcessed(context: Context, propertyId: String): Boolean {
         val property = property(propertyId) ?: return false
@@ -83,9 +87,17 @@ class PropertyStore(context: Context) {
     }
 
     /** Called when a capture finishes; upserts on session name so a retried write can't duplicate. */
-    fun recordRoomScan(propertyId: String, label: String, sessionName: String, coveragePercent: Float?) =
+    fun recordRoomScan(
+        propertyId: String,
+        label: String,
+        sessionName: String,
+        coveragePercent: Float?,
+        scanFolder: String = "scan_0",
+    ) =
         mutate { _, rooms ->
-            val existing = rooms.firstOrNull { it.sessionName == sessionName }
+            val existing = rooms.firstOrNull {
+                it.propertyId == propertyId && it.sessionName == sessionName && it.scanFolder == scanFolder
+            }
             if (existing != null) {
                 existing.label = label
                 existing.coveragePercent = coveragePercent
@@ -96,6 +108,7 @@ class PropertyStore(context: Context) {
                         propertyId = propertyId,
                         label = label,
                         sessionName = sessionName,
+                        scanFolder = scanFolder,
                         coveragePercent = coveragePercent,
                         status = ScanStatus.DONE,
                     )
@@ -103,8 +116,47 @@ class PropertyStore(context: Context) {
             }
         }
 
-    fun deleteRoomScan(sessionName: String) = mutate { _, rooms ->
-        rooms.removeAll { it.sessionName == sessionName }
+    fun deleteRoomScan(sessionName: String, scanFolder: String? = null) = mutate { _, rooms ->
+        rooms.removeAll { it.sessionName == sessionName && (scanFolder == null || it.scanFolder == scanFolder) }
+    }
+
+    /** Expands the pre-folder-aware single index row when its archive contains several rooms. */
+    fun expandLegacyRooms(propertyId: String, sessionName: String, scanFolders: List<String>) = mutate { _, rooms ->
+        val matching = rooms.filter { it.propertyId == propertyId && it.sessionName == sessionName }
+        val legacy = matching.singleOrNull()?.takeIf { it.scanFolder.isBlank() } ?: return@mutate
+        val folders = scanFolders.distinct().sortedBy { folder ->
+            folder.removePrefix("scan_").toIntOrNull() ?: Int.MAX_VALUE
+        }
+        if (folders.isEmpty()) return@mutate
+
+        rooms.remove(legacy)
+        val lastIndex = folders.lastIndex
+        for ((index, folder) in folders.withIndex()) {
+            val numericIndex = folder.removePrefix("scan_").toIntOrNull() ?: index
+            rooms.add(
+                if (index == lastIndex) legacy.copy(scanFolder = folder)
+                else RoomScan(
+                    propertyId = propertyId,
+                    label = "Room ${numericIndex + 1}",
+                    sessionName = sessionName,
+                    scanFolder = folder,
+                    capturedAtMs = legacy.capturedAtMs - (lastIndex - index),
+                    status = ScanStatus.DONE,
+                )
+            )
+        }
+    }
+
+    fun expandLegacyRoomFolders(context: Context, propertyId: String) {
+        for (room in rooms(propertyId).filter { it.scanFolder.isBlank() }.distinctBy { it.sessionName }) {
+            val folders = try {
+                ScanProcessor.listScanFolders(context, room.sessionName)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not expand room folders for ${room.sessionName}", e)
+                emptyList()
+            }
+            expandLegacyRooms(propertyId, room.sessionName, folders)
+        }
     }
 
     fun updateProperty(property: Property) = mutate { props, _ ->
@@ -145,6 +197,7 @@ class PropertyStore(context: Context) {
                     propertyId = o.getString("property_id"),
                     label = o.getString("label"),
                     sessionName = o.getString("session_name"),
+                    scanFolder = if (o.has("scan_folder")) o.optString("scan_folder", "scan_0") else "",
                     coveragePercent = if (o.isNull("coverage_percent")) null
                         else o.getDouble("coverage_percent").toFloat(),
                     capturedAtMs = o.optLong("captured_at_ms"),
@@ -179,6 +232,7 @@ class PropertyStore(context: Context) {
                 put("property_id", r.propertyId)
                 put("label", r.label)
                 put("session_name", r.sessionName)
+                put("scan_folder", r.scanFolder)
                 put("coverage_percent", r.coveragePercent ?: JSONObject.NULL)
                 put("captured_at_ms", r.capturedAtMs)
                 put("status", r.status.name)
@@ -186,7 +240,10 @@ class PropertyStore(context: Context) {
         })
         val tmp = File(file.parentFile, "$FILE_NAME.tmp")
         tmp.writeText(root.toString())
-        tmp.renameTo(file)
+        if (!tmp.renameTo(file)) {
+            tmp.delete()
+            throw IllegalStateException("Could not commit the property index")
+        }
     }
 
     private inline fun <T> JSONArray?.mapObjects(f: (JSONObject) -> T): List<T> {

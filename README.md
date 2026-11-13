@@ -186,6 +186,18 @@ Standardizing on a guided video walkthrough allows clear feature separation base
   - Real-time 2D Bird's-Eye Mini-Map tracks user location, orientation, and room coverage footprint.
 - **Enforced Loop Closure:** Requires returning to the starting doorway anchor ($< 1.0\text{m}$) to seal loop closure before export.
 
+### On-Device Quality Verification & 3D Point Cloud Viewer (`mobile_app/`) (2026-11)
+- **Standalone 3D Point Cloud Inspection Viewer (`PointCloudViewerActivity` & `PointCloudRenderer`):**
+  - Ultra-optimized OpenGL ES 2.0 viewer rendering spatial hash voxel-deduplicated point clouds and VIO trajectory paths directly on an opaque dark canvas (`#0B0E14`).
+  - **3 Navigation Modes:** 3D Orbit (touch rotation, pinch-to-zoom, pan), Top-Down (bird's-eye floorplan orthographic view), and Immersive Gyro Walk (1:1 physical look-around via `Sensor.TYPE_GAME_ROTATION_VECTOR` with closed-form $Z$-to-$Y$ axis remap, touch drag walking along look heading, and room boundary clamping).
+  - **Cohesive Surface Shading:** Solid-core anti-aliasing discs with dynamic high-DPI scaling (`⚪ Thick`, `⚪ Max`, `⚪ Fine` presets) and toggleable subtle translucent amber trajectory thread (`🛤 Track`).
+  - **Height-Based Color Ramp:** Turbo 5-stop gradient mapping vertical elevation from navy floor to coral ceiling.
+- **Card-Based UI/UX Overhaul & Scan Integration:**
+  - Redesigned `HomeActivity`, `PropertyDetailActivity`, and `ScanGalleryActivity` with clean property and room scan cards, real-time status badges (`PROCESSED`), and direct action buttons (`Inspect 3D`, `Add Geometry`, `Process`, `Delete`).
+  - **Scan Integration:** Viewfinder semi-transparent overlay of the previous scan's final keyframe allows users to align seamlessly and integrate additional geometry into existing scans.
+  - **Non-Reversible Pre-Processing Warning Modal:** Warning modal prompts users to inspect scan quality in 3D before irreversible processing.
+- **Detailed Documentation:** Complete mobile architecture, data schemas, and build instructions documented in [`mobile_app/README.md`](file:///home/monday/Desktop/GlomeHomeTour/mobile_app/README.md).
+
 ### Backend Reconstruction & Metric Priors Engine (`backend/`) (2026-09-10/11)
 - **Commercial Depth Anything 3 (`DA3-BASE`, Apache 2.0):**
   - Integrated and validated `depth-anything/DA3-BASE` (0.12B parameters, commercially unrestricted under Apache 2.0), replacing non-commercial CC BY-NC models.
@@ -202,6 +214,26 @@ Standardizing on a guided video walkthrough allows clear feature separation base
   - Initialized directly from the refined DA3 dense surfel cloud (`points3D_depth.ply` $\to$ `sparse/0/points3D.ply`).
 - **Export & Verification:**
   - Fully verified on real-world capture packages: exports clean, colored 3D Gaussian Splatting models and surfels into standard interchange formats with 100% compliant shared schema contracts.
+
+### Continuous Cinematic Flythrough & Paired Rendering Engine (`backend/08_artifacts_generation/`) (2026-11)
+- **F1 Curvature-Aware Velocity Scheduling & Kinematic Trajectory (`generate_cinematic_flythrough.py`):**
+  - Continuous 6-DoF flight through all numbered checkpoints with pinned photo poses (exact matches within $10^{-6}$ atol) and zero roll wobble ($0.0^\circ$ open-flight roll).
+  - Two-pass DP curvature-constrained velocity schedule: peak cruise speed of **$1.25\text{ m/s}$**, corner apex speed $v_{\text{apex}} = \min(v_{\text{max}}, \sqrt{a_{\text{lat}} / \max(\kappa, 10^{-8})})$, asymmetric braking ($a_{\text{brake}} = 1.10\text{ m/s}^2$) establishing crisp corner entry braking zones, and acceleration ($a_{\text{accel}} = 0.95\text{ m/s}^2$) powering smoothly out of apexes.
+  - Doorway passages centered through door openings with fallback safety offsets; snappy door transits ($\le 0.5\text{ s}$) at up to $1.25\text{ m/s}$ with quintic Slerp orientation transitions.
+  - Continuous panorama viewpoints receiving $\ge 240^\circ$ sweeps paced down to $\le 0.35\text{ m/s}$ ($0.22\text{ m/s}$ on floor transitions), smoothly continuing into the terminal overhead ceiling ascent ($+60^\circ$).
+  - Strict physical bounds verified: inside acceleration $\le 1.21\text{ m/s}^2$ (measured $1.1929\text{ m/s}^2$), turn angular speed $\le 65.1^\circ/\text{s}$ (measured $64.72^\circ/\text{s}$), cruise angular speed $\le 37.6^\circ/\text{s}$ (measured $14.44^\circ/\text{s}$), and non-door clearance $\ge 0.08\text{ m}$ (measured $0.0935\text{ m}$).
+- **Native GPU Hardware MSAA & Fast SE(3) Inversion:**
+  - Configured Open3D Filament with native $4\times$ multisample antialiasing (MSAA), rendering directly at target preview and final resolutions and completely eliminating CPU-side supersampling and `cv2.resize` downscaling ($3.59\text{ ms/frame}$, a **$3.05\times$ speedup**).
+  - Replaced $O(N^3)$ LU matrix inversions with closed-form Euclidean camera pose transpositions ($R^T$ and $-R^T t$), with cached CUDA intrinsic and background tensors.
+  - Direct in-place slice composition in `compose_minimap()` avoiding redundant full-frame image allocations.
+- **Asynchronous Video Encoding & Dual-Pass In-Memory Caching (`--mode both`):**
+  - Decoupled ffmpeg pipe I/O from GPU rendering using background worker threads (`AsyncVideoWriter` with bounded queue), slashing encoding pipe latency to $0.12\text{ s}$ preview / $0.58\text{ s}$ final (down from ~11 s).
+  - Shared in-memory caching of preloaded GLB mesh geometry and the PyTorch `GaussianRenderer` across preview and final passes, reducing pass-to-pass asset reload overhead from $12.36\text{ s}$ to $0.62\text{ s}$ (**$19.9\times$ faster**).
+- **Benchmark Performance (`current_scene`):**
+  - Preview ($270\times 480$): **52.89 s** (Input validation & setup: 0.9s, Planning & retiming: 9.3s, Model loading: 11.9s, Mesh: 19.87s, Gaussian: 9.35s, Minimap: 0.38s, Async Encoding IO: 0.12s).
+  - Final ($540\times 960$): **47.49 s** (Verification: 0.7s, In-memory model reuse: 0.62s, Mesh: 34.59s, Gaussian: 9.51s, Minimap: 0.81s, Async Encoding IO: 0.58s).
+  - Combined Active Wall Time: **100.38 s** (~1 min 40 s) for 3,822 frames (7,644 total video frames across mesh and Gaussian channels), delivering a **33.82 s (25%) speedup** over baseline.
+  - Complete logging streamed to `generate_cinematic_flythrough.log` and structured atomic timers published in `generate_cinematic_flythrough_manifest.json`. All 68 cinematic unit tests pass.
 
 ---
 

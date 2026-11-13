@@ -1001,3 +1001,24 @@ defaults-match-constants invariant and the settings clamp), installed and driven
 Still unverified: the SCANNING and DONE screens, i.e. whether a finished capture actually writes
 its `RoomScan` row back to the property -- that needs a person walking a lit room, per
 [[arcore-pointcloud-not-a-tracking-gate]].
+
+## 2026-11-13: Room-by-room persistence and 3D scan cleanup
+`Next room` now finalizes the current `DatasetWriter` session and records its own property row in
+the write-completion callback; the next capture uses a fresh session with its own `scan_0`. This
+matches the property/gallery model,
+which identifies a room by session name and reads its thumbnail/cloud from `scan_0`; the old
+single-session multi-folder path indexed only the final room and made its label/photo disagree.
+Capture now writes a deduplicated ARCore feature cloud to each session, clips it against the
+camera-path bounds (4 m distance, 3 m vertical limit), and ignores implausible pose
+jumps when collecting points and estimating room bounds. Tracking recovery reanchors the motion
+path and clears its alignment warning three seconds after tracking returns. The viewer and preview
+apply the same clipping before calculating scale/colors; top-down uses a vertical camera with
+orthographic projection. Autofocus is tap-triggered, with camera preview taps delivered by the GL
+surface; speed/turn warnings use looser thresholds than keyframe blur rejection and stale queued
+warnings are dropped. The transition screen allows naming the upcoming room before preflight/capture.
+Verified: Android unit suite and `assembleDebug` pass. Device checks remain open because `adb` is
+available only inside the configured SDK and the rebuilt APK was not installed. Read-only phone
+inspection confirmed the latest property has one `Room 4` index row while its old session still
+contains `scan_0` through `scan_3`, each with images, transforms, and a point cloud; the capture
+data exists, but the legacy property row hides the other folders. AF and ARCore relocalization
+still need validation on rosemary.

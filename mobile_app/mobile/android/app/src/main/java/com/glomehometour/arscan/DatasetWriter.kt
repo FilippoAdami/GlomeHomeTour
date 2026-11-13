@@ -95,6 +95,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
     private val thread = HandlerThread("dataset-writer").apply { start() }
     private val handler = Handler(thread.looper)
     private val queued = AtomicInteger()
+    private val writeFailures = AtomicInteger()
 
     val written = AtomicInteger()
     val droppedQueue = AtomicInteger()
@@ -112,6 +113,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         var height: Int = 0,
         var k1: Float? = null,
         var k2: Float? = null,
+        var pointCloudPly: ByteArray? = null,
     ) {
         val folderName: String get() = "scan_$roomIndex"
     }
@@ -205,19 +207,30 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         )
         val folder = activeRoom.folderName
         queued.incrementAndGet()
-        handler.post {
+        val accepted = handler.post {
             try {
                 Nv21.interleave(y, u, v, width, height, uvRowStride, uvPixelStride, out)
-                openOutput("$folder/images", name, "image/jpeg")?.use { o ->
-                    YuvImage(out, ImageFormat.NV21, width, height, null)
-                        .compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, o)
+                val output = openOutput("$folder/images", name, "image/jpeg")
+                    ?: throw IllegalStateException("Could not open $folder/images/$name")
+                output.use { o ->
+                    if (!YuvImage(out, ImageFormat.NV21, width, height, null)
+                            .compressToJpeg(Rect(0, 0, width, height), JPEG_QUALITY, o)
+                    ) throw IllegalStateException("JPEG encoder rejected $name")
                 }
                 written.incrementAndGet()
             } catch (e: Exception) {
+                writeFailures.incrementAndGet()
                 Log.w(TAG, "keyframe write failed", e)
             } finally {
                 queued.decrementAndGet()
             }
+        }
+        if (!accepted) {
+            queued.decrementAndGet()
+            writeFailures.incrementAndGet()
+            droppedQueue.incrementAndGet()
+            activeRoom.keyframes.removeAt(activeRoom.keyframes.lastIndex)
+            return false
         }
         return true
     }
@@ -226,6 +239,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int,
         summaryJson: String,
         k1: Float? = null, k2: Float? = null,
+        pointCloudPly: ByteArray? = null,
     ) {
         activeRoom.fx = fx
         activeRoom.fy = fy
@@ -236,6 +250,7 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         activeRoom.summaryJson = summaryJson
         activeRoom.k1 = k1
         activeRoom.k2 = k2
+        activeRoom.pointCloudPly = pointCloudPly
     }
 
     fun startNewRoom(roomIndex: Int) {
@@ -287,9 +302,10 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         fx: Float, fy: Float, cx: Float, cy: Float, width: Int, height: Int,
         summaryJson: String,
         k1: Float? = null, k2: Float? = null,
-        onDone: (String) -> Unit,
+        pointCloudPly: ByteArray? = null,
+        onDone: (String, Boolean) -> Unit,
     ) {
-        finishCurrentRoom(fx, fy, cx, cy, width, height, summaryJson, k1, k2)
+        finishCurrentRoom(fx, fy, cx, cy, width, height, summaryJson, k1, k2, pointCloudPly)
         val allRooms = completedRooms + listOf(activeRoom)
         val roomSnapshots = allRooms.map { room ->
             val transforms = DatasetFormat.transformsJson(
@@ -299,18 +315,24 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             val csv = room.trajectory.toString()
             val focusJson = DatasetFormat.focusMetadataJson(room.keyframes)
             val summary = room.summaryJson ?: summaryJson
-            Triple(room.folderName, Triple(transforms, csv, focusJson), summary)
+            val ply = room.pointCloudPly
+            Triple(room.folderName, Triple(transforms, csv, focusJson), Pair(summary, ply))
         }
-        handler.post {
-            for ((folder, manifests, summary) in roomSnapshots) {
+        val accepted = handler.post {
+            for ((folder, manifests, extra) in roomSnapshots) {
                 val (transforms, csv, focusJson) = manifests
+                val (summary, ply) = extra
                 writeText("$folder/transforms.json", "application/json", transforms)
                 writeText("$folder/trajectory.csv", "text/csv", csv)
                 writeText("$folder/coverage_summary.json", "application/json", summary)
                 writeText("$folder/focus_metadata.json", "application/json", focusJson)
+                if (ply != null && ply.isNotEmpty()) {
+                    writeBytes("$folder/pointcloud.ply", "application/octet-stream", ply)
+                }
             }
-            onDone(destination)
+            onDone(destination, writeFailures.get() == 0)
         }
+        if (!accepted) onDone(destination, false)
     }
 
     fun shutdown() {
@@ -330,13 +352,31 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
         }
     }
 
-    private fun writeText(path: String, mime: String, body: String) {
+    private fun writeText(path: String, mime: String, body: String): Boolean {
         try {
             val dir = if (path.contains('/')) path.substringBeforeLast('/') else null
             val name = if (path.contains('/')) path.substringAfterLast('/') else path
-            openOutput(dir, name, mime)?.use { it.write(body.toByteArray()) }
+            val output = openOutput(dir, name, mime) ?: throw IllegalStateException("Could not open $path")
+            output.use { it.write(body.toByteArray()) }
+            return true
         } catch (e: Exception) {
+            writeFailures.incrementAndGet()
             Log.w(TAG, "manifest write failed: $path", e)
+            return false
+        }
+    }
+
+    private fun writeBytes(path: String, mime: String, bytes: ByteArray): Boolean {
+        try {
+            val dir = if (path.contains('/')) path.substringBeforeLast('/') else null
+            val name = if (path.contains('/')) path.substringAfterLast('/') else path
+            val output = openOutput(dir, name, mime) ?: throw IllegalStateException("Could not open $path")
+            output.use { it.write(bytes) }
+            return true
+        } catch (e: Exception) {
+            writeFailures.incrementAndGet()
+            Log.w(TAG, "bytes write failed: $path", e)
+            return false
         }
     }
 
@@ -347,17 +387,31 @@ class DatasetWriter(private val context: Context, val sessionName: String) {
             return FileOutputStream(File(target, name))
         }
         val uri = insert(flatName(dir, name), mime) ?: return null
-        val stream = context.contentResolver.openOutputStream(uri, "wt") ?: return null
+        val stream = try {
+            context.contentResolver.openOutputStream(uri, "wt")
+        } catch (e: Exception) {
+            context.contentResolver.delete(uri, null, null)
+            throw e
+        } ?: run {
+            context.contentResolver.delete(uri, null, null)
+            return null
+        }
         // IS_PENDING keeps half-written files hidden from other apps; clearing it is what
         // publishes them (same lesson as mobile_sphere_capture's GalleryOutput).
         return object : OutputStream() {
             override fun write(b: Int) = stream.write(b)
             override fun write(b: ByteArray, off: Int, len: Int) = stream.write(b, off, len)
             override fun close() {
-                stream.close()
-                context.contentResolver.update(
-                    uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null,
-                )
+                try {
+                    stream.close()
+                    val updated = context.contentResolver.update(
+                        uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null,
+                    )
+                    if (updated == 0) throw IllegalStateException("Could not publish $name")
+                } catch (e: Exception) {
+                    context.contentResolver.delete(uri, null, null)
+                    throw e
+                }
             }
         }
     }

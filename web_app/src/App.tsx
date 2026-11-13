@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './hooks/useAuth';
 
 // Pages
+import AgencyHomePage from './pages/AgencyHomePage';
 import LandingPage from './pages/LandingPage';
 import SignInPage from './pages/SignInPage';
 import SignUpPage from './pages/SignUpPage';
@@ -24,8 +25,8 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-900">
-        <div className="w-8 h-8 border-4 border-glome-blue/30 border-t-glome-blue rounded-full animate-spin" />
+      <div className="min-h-screen flex items-center justify-center bg-glome-cream">
+        <div className="w-8 h-8 border-4 border-glome-orange/30 border-t-glome-orange rounded-full animate-spin" />
       </div>
     );
   }
@@ -33,8 +34,13 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
-        {/* Public */}
-        <Route path="/" element={<LandingPage />} />
+        {/* Glome Agency Master Homepage */}
+        <Route path="/" element={<AgencyHomePage />} />
+
+        {/* Glome Home Tour Product Overview */}
+        <Route path="/home-tour" element={<LandingPage />} />
+
+        {/* Public Authentication */}
         <Route path="/sign-in" element={<SignInPage />} />
         <Route path="/sign-up" element={<SignUpPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />

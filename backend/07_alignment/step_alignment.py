@@ -19,6 +19,7 @@ CLI Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import shutil
@@ -84,13 +85,64 @@ def cleanup_temporary_outputs(output_dir: Path) -> None:
     stats_dir = output_dir / "stats"
     for name in (
         "aligned_objects_manifest.json",
-        "multi_room_alignment_report.json",
         "aligned_scene_all_planes_diagnostic.png",
     ):
         (stats_dir / name).unlink(missing_ok=True)
     if stats_dir.is_dir():
         for report in stats_dir.glob("*_plane_snap_report.json"):
             report.unlink(missing_ok=True)
+
+
+def trajectory_pairing_records(pairings: List[DoorPairing]) -> List[Dict[str, Any]]:
+    """Persist the actual pairing identities without changing the alignment calculation."""
+    def door_record(door):
+        result = {key: None if door.get(key) is None else int(door[key]) for key in
+                  ("source_class_id", "source_instance_id", "instance_idx")}
+        result["description"] = str(door.get("description", ""))
+        return result
+    return [{
+        "scan_from": p.scan_from,
+        "scan_to": p.scan_to,
+        "door_from": door_record(p.door_from),
+        "door_to": door_record(p.door_to),
+        "relative_yaw_deg": float(p.yaw_deg),
+    } for p in pairings]
+
+
+def trajectory_pairing_input_hash(scans: Dict[str, ScanData]) -> str:
+    """Fingerprint the in-memory inputs used by the trajectory pairing calculation."""
+    records = {}
+    for name, scan in sorted(scans.items()):
+        records[name] = {
+            "doors": [{"instance_idx": int(door["instance_idx"]), "center": np.asarray(door["center"]).tolist(),
+                       "normal": np.asarray(door["normal"]).tolist(), "area": float(door.get("area", 1.0)),
+                       "source_class_id": int(door["source_class_id"]) if door.get("source_class_id") is not None else None,
+                       "source_instance_id": int(door["source_instance_id"]) if door.get("source_instance_id") is not None else None,
+                       "description": door["description"]} for door in scan.door_instances],
+            **{key: None if getattr(scan, key) is None else np.asarray(getattr(scan, key)).tolist()
+               for key in ("trajectory_poses", "transition_poses", "active_poses")},
+        }
+    return hashlib.sha256(json.dumps(records, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def reusable_trajectory_pairings(path: Path, transforms: Dict[str, np.ndarray], input_hash: str):
+    if not path.is_file():
+        return None
+    try:
+        previous = json.loads(path.read_text())
+        old_transforms = previous.get("transforms", {})
+        metrics = previous.get("alignment_metrics", {})
+        records = metrics.get("trajectory_door_pairs")
+        if (metrics.get("trajectory_door_pairs_status") in ("computed", "reused")
+                and metrics.get("trajectory_door_pairs_input_sha256") == input_hash
+                and isinstance(records, list) and set(old_transforms) == set(transforms)
+                and all(np.shape(old_transforms[name]) == (4, 4)
+                        and np.allclose(old_transforms[name], transforms[name], atol=1e-8, rtol=0)
+                        for name in transforms)):
+            return records
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def run_phase07_alignment(
@@ -239,7 +291,16 @@ def run_phase07_alignment(
     full_report_metrics = {
         "door_pairings": door_metrics,
         "coplanar_alignment": coplanar_report,
+        "trajectory_door_pairs": trajectory_pairing_records(door_pairings),
+        "trajectory_door_pairs_status": "not_computed" if skip_scans else "computed",
+        "trajectory_door_pairs_input_sha256": trajectory_pairing_input_hash(scans),
     }
+    previous_report_path = output_dir / "stats" / "multi_room_alignment_report.json"
+    previous_pairs = reusable_trajectory_pairings(previous_report_path, transforms_final,
+                                                 full_report_metrics["trajectory_door_pairs_input_sha256"]) if skip_scans else None
+    if previous_pairs is not None:
+        full_report_metrics["trajectory_door_pairs"] = previous_pairs
+        full_report_metrics["trajectory_door_pairs_status"] = "reused"
     exported_assets = timed(
         "step2.multi_asset_synchronization",
         lambda: synchronizer.synchronize_and_export_all(scans, transforms_final, full_report_metrics),
@@ -379,6 +440,7 @@ def run_phase07_alignment(
             "phase07_panel_instances_dir": output_dir / "objects",
             "scans_dir": output_dir / "scans",
             "aligned_scans_transforms": output_dir / "stats" / "aligned_scans_transforms.json",
+            "multi_room_alignment_report": output_dir / "stats" / "multi_room_alignment_report.json",
         }
     step5_elapsed = time.perf_counter() - step5_start
     logger.info("Completed macro step 5/5 (panel replacement and cleanup) in %.2f s", step5_elapsed)
